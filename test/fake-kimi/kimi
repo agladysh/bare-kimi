@@ -1,0 +1,132 @@
+#!/usr/bin/env bun
+// Fake `kimi` binary for bare-kimi's black-box tests. Found via PATH shim.
+// Controlled entirely by env; never talks to a network or a real home.
+//
+//   FAKE_KIMI_EXIT_CODE       exit with this code after emitting output (default 0)
+//   FAKE_KIMI_REPLY           assistant content (default "ok")
+//   FAKE_KIMI_VERSION         version string (default "9.9.9-fake")
+//   FAKE_KIMI_SESSION_ID      fixed session id (default session_<uuid>)
+//   FAKE_KIMI_ENV_OUT         path to write a JSON object of recorded env vars
+//   FAKE_KIMI_ENV_KEYS        comma-separated env names to record into ENV_OUT
+//   FAKE_KIMI_NO_VERSION_LINE omit the system.version line (failure-mode shape)
+//
+// Honors: -p/--prompt, --output-format, --session/--resume/-r/-S, --continue.
+// With KIMI_CODE_HOME set, creates a wire.jsonl per run (or requires one on
+// resume) so preload/custody tests exercise the real file layout.
+
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const VALUE_FLAGS = new Set([
+  '--model',
+  '-m',
+  '--skills-dir',
+  '--add-dir',
+  '--agent',
+  '--agent-file',
+  '--output-format',
+]);
+
+let prompt = '';
+let outputFormat = 'text';
+let resumeId: string | undefined;
+let continueRecent = false;
+
+const argv = process.argv.slice(2);
+for (let i = 0; i < argv.length; i += 1) {
+  const arg = argv[i]!;
+  if (arg === '-p' || arg === '--prompt') {
+    prompt = argv[++i] ?? '';
+  } else if (arg === '--session' || arg === '--resume' || arg === '-r' || arg === '-S') {
+    const next = argv[i + 1];
+    if (next !== undefined && !next.startsWith('-')) {
+      resumeId = next;
+      i += 1;
+    }
+  } else if (arg === '--continue' || arg === '-c') {
+    continueRecent = true;
+  } else if (arg === '--output-format') {
+    outputFormat = argv[++i] ?? 'text';
+  } else if (VALUE_FLAGS.has(arg)) {
+    i += 1;
+  }
+}
+
+function fail(message: string): never {
+  console.error(`fake-kimi: ${message}`);
+  process.exit(1);
+}
+
+const home = process.env['KIMI_CODE_HOME'] ?? '';
+const version = process.env['FAKE_KIMI_VERSION'] ?? '9.9.9-fake';
+const reply = process.env['FAKE_KIMI_REPLY'] ?? 'ok';
+const exitCode = Number(process.env['FAKE_KIMI_EXIT_CODE'] ?? '0');
+
+let sessionId: string | undefined;
+let wire = '';
+let wireContent = '';
+
+if (home.length > 0) {
+  const bucket = join(home, 'sessions', 'wd_fake_000000000000');
+  if (resumeId !== undefined) {
+    wire = join(bucket, resumeId, 'agents', 'main', 'wire.jsonl');
+    if (!existsSync(wire)) fail(`no session ${resumeId}`);
+    sessionId = resumeId;
+  } else if (continueRecent) {
+    if (!existsSync(bucket)) fail('no sessions to continue');
+    const sessions = readdirSync(bucket).sort();
+    const last = sessions[sessions.length - 1];
+    if (last === undefined) fail('no sessions to continue');
+    sessionId = last;
+    wire = join(bucket, last, 'agents', 'main', 'wire.jsonl');
+  } else {
+    sessionId = process.env['FAKE_KIMI_SESSION_ID'] ?? `session_${crypto.randomUUID()}`;
+    wire = join(bucket, sessionId, 'agents', 'main', 'wire.jsonl');
+  }
+  mkdirSync(join(bucket, sessionId, 'agents', 'main'), { recursive: true });
+  if (!existsSync(wire)) {
+    writeFileSync(
+      wire,
+      `${JSON.stringify({ type: 'metadata', protocol_version: '1.5', created_at: new Date().toISOString() })}\n`,
+    );
+  }
+  appendFileSync(wire, `${JSON.stringify({ type: 'turn.prompt', prompt })}\n`);
+  wireContent = readFileSync(wire, 'utf-8');
+}
+
+sessionId = sessionId ?? `session_${crypto.randomUUID()}`;
+
+const envOut = process.env['FAKE_KIMI_ENV_OUT'];
+const envKeys = process.env['FAKE_KIMI_ENV_KEYS'];
+if (envOut !== undefined && envKeys !== undefined) {
+  const recorded: Record<string, string | undefined> = {};
+  for (const key of envKeys.split(',')) {
+    if (key.length > 0) recorded[key] = process.env[key];
+  }
+  writeFileSync(envOut, JSON.stringify(recorded, null, 2));
+}
+
+const hasPreload = wireContent.includes('[preload]');
+const content = hasPreload ? `${reply} [has-preload]` : reply;
+
+if (outputFormat === 'stream-json') {
+  const lines: unknown[] = [];
+  if (process.env['FAKE_KIMI_NO_VERSION_LINE'] === undefined) {
+    lines.push({ role: 'meta', type: 'system.version', version });
+  }
+  lines.push({ role: 'assistant', content });
+  lines.push({
+    role: 'meta',
+    type: 'session.resume_hint',
+    session_id: sessionId,
+    command: `kimi -r ${sessionId}`,
+    content: `To resume this session: kimi -r ${sessionId}`,
+  });
+  for (const line of lines) console.log(JSON.stringify(line));
+} else {
+  process.stdout.write(`• ${content}\n\n`);
+  process.stderr.write(`kimi version ${version}\n`);
+  process.stderr.write(`To resume this session: kimi -r ${sessionId}\n`);
+}
+
+process.exit(exitCode);
