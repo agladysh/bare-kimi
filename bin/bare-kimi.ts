@@ -23,16 +23,23 @@ operator's own login. Library first; this CLI is its worked example.
 Home and auth:
   --home DIR            Use DIR as the run home (kept). Reused as-is when it
                         already holds a config.toml; otherwise assembled from
-                        the source home.
+                        the source home. Refused when it is the source home
+                        under another name.
   --src-home DIR        Assemble/donate from DIR (default:
                         $KIMI_CODE_HOME_SOURCE ?? ~/.kimi-code). Forces
                         re-assembly of --home.
+                        Relative --home/--src-home resolve against the
+                        current directory, not --cwd.
   --auth link|copy      How the run home receives credentials. Default link:
                         credentials/ and oauth/ are directory symlinks into
                         the source home — no token replication, refresh and
                         its cross-process lock stay shared. copy duplicates
-                        token files and forks the refresh lineage.
-  --keep-credentials    Copy mode: keep the donated copy after the run.
+                        token files and forks the refresh lineage. Existing
+                        entries that bare-kimi did not make (including
+                        symlinks pointing elsewhere) are never replaced.
+  --keep-credentials    Copy mode: keep the donated copy after the run. A
+                        copy that no longer matches the source is always
+                        kept, and the run reports an error.
   --keep-home           Keep even an ephemeral (mkdtemp'd) home.
 
 Run shape:
@@ -57,6 +64,8 @@ Run shape:
   --prime TEXT          Primer prompt for --preload (default "Acknowledged.").
   -v, --version         Print bare-kimi version.
   -h, --help            This text.
+
+The prompt may not start with "-": kimi would read it as a flag.
 
 Ambient boundary (measured, not a bug): AGENTS.md files (run home,
 ~/.agents, git-root → cwd walk) and skills still load in print mode. For a

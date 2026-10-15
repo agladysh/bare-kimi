@@ -6,17 +6,20 @@ worked example.
 
 **Status: unfinished.** This repository restores custody of an incomplete
 source tree. It is not a release and is not published to any package
-registry. It has known, unfixed defects in home assembly, authentication
-handling and thinking handling. Recovery has not re-run its tests, typecheck or live smoke. Earlier
-execution attempts are separate from this source-history reconstruction. See [RECOVERY.md](RECOVERY.md) for how the history
-was reconstructed and what is not known.
+registry. The recovered source has known defects in home assembly,
+authentication handling and thinking handling. A repair candidate for them
+is described in [CHANGELOG.md](CHANGELOG.md). Its author did not run its
+typecheck or tests, and no live run against kimi has been made with it.
+See [RECOVERY.md](RECOVERY.md) for how the history was reconstructed, what
+the checks on the recovered tree showed, and what is not known.
 
 ## Contents
 
 - `src/home.ts` — assemble a minimal run home from a source home's
   `config.toml`; give it credentials by directory symlink (`link`, the
   default) or by marker-stamped copy (`copy`); guarded removal of ephemeral
-  homes.
+  homes. Its header comment states who owns which files, what each step
+  changes, and that every refusal happens before the first change.
 - `src/events.ts` — types and guards for `kimi -p --output-format stream-json`
   output.
 - `src/index.ts` — `spawnKimi` / `runKimi`: argv and child environment

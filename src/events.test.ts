@@ -68,7 +68,10 @@ describe('parseStreamJson', () => {
 });
 
 describe('guards reject foreign shapes', () => {
-  test.each([null, 42, 'x', [], {}, { role: 'meta' }, { role: 1, type: 'x' }])(
+  // One-element rows: test.each spreads an array row into arguments, so a
+  // bare `[]` row would call the callback with no value, and the unfilled
+  // parameter would be taken for a done callback.
+  test.each<[unknown]>([[null], [42], ['x'], [[]], [{}], [{ role: 'meta' }], [{ role: 1, type: 'x' }]])(
     'isKimiStreamEvent(%j) is false',
     (value) => {
       expect(isKimiStreamEvent(value)).toBe(false);

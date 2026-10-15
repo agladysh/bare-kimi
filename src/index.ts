@@ -2,6 +2,7 @@ import { mkdirSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
 import {
   assembleHome,
+  assertDistinctHomes,
   ensureAuth,
   isAssembledHome,
   makeEphemeralHome,
@@ -18,6 +19,7 @@ import {
 
 export {
   assembleHome,
+  assertDistinctHomes,
   donateAuth,
   ensureAuth,
   isAssembledHome,
@@ -66,12 +68,14 @@ export interface LaunchOptions {
    * Run home. When omitted, a fresh ephemeral home is mkdtemp'd and removed
    * by dispose(). A caller-supplied home is kept; if it already holds a
    * config.toml it is used as-is (a prepared home is never overwritten),
-   * otherwise it is assembled from the source home.
+   * otherwise it is assembled from the source home. A relative path resolves
+   * against this process's working directory, not against `cwd`.
    */
   readonly home?: string;
   /**
    * Source home to assemble/donate from. Passing it forces re-assembly of a
    * caller-supplied `home`. Default: `KIMI_CODE_HOME_SOURCE` ?? `~/.kimi-code`.
+   * A relative path resolves like `home`.
    */
   readonly srcHome?: string;
   /**
@@ -266,7 +270,7 @@ export interface KimiSubprocess<
 > {
   /** The spawned Bun subprocess. */
   readonly subprocess: Bun.Subprocess<In, Out, Err>;
-  /** The resolved run home (also the child's `KIMI_CODE_HOME`). */
+  /** The resolved, absolute run home (also the child's `KIMI_CODE_HOME`). */
   readonly home: string;
   /** Whether spawnKimi created the home (and dispose will remove it). */
   readonly ephemeral: boolean;
@@ -277,7 +281,9 @@ export interface KimiSubprocess<
    * (guarded by its marker); a kept home assembled in copy mode has its
    * marker-stamped credential copy shredded unless `keepCredentials`.
    * Caller-owned data — a caller-supplied home itself, linked credential
-   * directories' targets, session records — is never touched. Idempotent.
+   * directories' targets, session records — is never touched. A copy that
+   * no longer matches the source home (a refresh may have rotated its
+   * token) is kept, and dispose rejects saying so. Idempotent.
    */
   readonly dispose: () => Promise<void>;
 }
@@ -332,13 +338,13 @@ export function spawnKimi<
 
   const cwd = config.cwd.length > 0 ? config.cwd : (spawnOptions.cwd ?? process.cwd());
   const ephemeral = config.home.length === 0;
-  const home = ephemeral ? makeEphemeralHome() : config.home;
+  // Absolute before anything else sees it: the child runs in `cwd` and would
+  // read a relative KIMI_CODE_HOME against that directory instead.
+  const home = ephemeral ? makeEphemeralHome() : resolvePath(config.home);
 
   try {
-    const src = sourceHome(config.srcHome.length > 0 ? config.srcHome : undefined);
-    if (resolvePath(src) === resolvePath(home)) {
-      throw new Error('run home and source home are the same directory; refusing');
-    }
+    const src = resolvePath(sourceHome(config.srcHome.length > 0 ? config.srcHome : undefined));
+    assertDistinctHomes(src, home);
     if (config.srcHome.length > 0 || !isAssembledHome(home)) {
       assembleHome(src, home, config.authMode);
     } else {
@@ -383,9 +389,9 @@ export function spawnKimi<
           await subprocess.exited.catch(() => {});
         }
         if (ephemeral) {
-          removeHome(home);
+          removeHome(home, src);
         } else if (config.authMode === 'copy' && !config.keepCredentials) {
-          shredCopiedCredentials(home);
+          shredCopiedCredentials(home, src);
         }
       },
     };
@@ -472,7 +478,10 @@ export async function runKimi(launchOptions: LaunchOptions): Promise<KimiRun> {
       signal: null,
       stdout: '',
       stderr: `bare-kimi: ${error.message}`,
-      home: launchOptions.home ?? '',
+      home:
+        launchOptions.home !== undefined && launchOptions.home.length > 0
+          ? resolvePath(launchOptions.home)
+          : '',
       sessionId: undefined,
       events: [],
       unparsed: [],

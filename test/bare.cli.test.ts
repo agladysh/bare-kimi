@@ -1,7 +1,18 @@
 import { afterEach, beforeAll, describe, expect, test } from 'bun:test';
-import { existsSync, lstatSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  readlinkSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import {
   FAKE_TOKEN,
   ensureFakeExecutable,
@@ -110,11 +121,25 @@ describe('plain runs', () => {
   test('a prompt starting with - is refused before any work', async () => {
     const root = temp('bare-kimi-test-');
     const src = makeSourceHome(root);
+    const envOut = join(root, 'env.json');
+    const env = { FAKE_KIMI_ENV_OUT: envOut, FAKE_KIMI_ENV_KEYS: 'KIMI_CODE_HOME' };
+    const before = ephemeralHomes();
 
-    const run = await runCli(['--', '-x'], { srcHome: src });
+    // Piped on stdin, the prompt reaches the library's own check.
+    const piped = await runCli([], { srcHome: src, stdin: '-x\n', env });
+    expect(piped.code).toBe(2);
+    expect(piped.stderr).toContain('starts with "-"');
 
-    expect(run.code).toBe(2);
-    expect(run.stderr).toContain('starts with "-"');
+    // After `--`, the CLI's parser sees `-x` as an option when run as
+    // `bun bin/bare-kimi.ts -- -x` (observed at the recovered baseline) and
+    // refuses it as unknown. Either way nothing runs.
+    const separated = await runCli(['--', '-x'], { srcHome: src, env });
+    expect(separated.code).toBe(2);
+    expect(separated.stderr).toContain("'-x'");
+
+    expect(existsSync(envOut)).toBe(false); // kimi never started
+    expect(ephemeralHomes().filter((dir) => !before.includes(dir))).toEqual([]);
+    expect(existsSync(join(src, 'sessions'))).toBe(false);
   });
 });
 
@@ -150,6 +175,50 @@ describe('home custody', () => {
 
     expect(run.code).toBe(2);
     expect(run.stderr).toContain('same directory');
+  });
+
+  test('--home that is the source home under another name is refused; source untouched', async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    const alias = join(root, 'alias');
+    symlinkSync(src, alias, 'dir');
+    const config = readFileSync(join(src, 'config.toml'), 'utf-8');
+
+    const run = await runCli(['--home', alias, '--', 'x'], { srcHome: src });
+
+    expect(run.code).toBe(2);
+    expect(run.stderr).toContain('same directory');
+    // The child never ran against the source home.
+    expect(existsSync(join(src, 'sessions'))).toBe(false);
+    expect(readFileSync(join(src, 'config.toml'), 'utf-8')).toBe(config);
+  });
+
+  test('relative --home and --src-home resolve against the invoking directory, not --cwd', async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    const work = join(root, 'work');
+    mkdirSync(work);
+    const envOut = join(root, 'env.json');
+
+    const run = await runCli(['--home', 'rel-home', '--src-home', 'src-home', '--cwd', work, '--', 'x'], {
+      srcHome: src,
+      cwd: root,
+      env: { FAKE_KIMI_ENV_OUT: envOut, FAKE_KIMI_ENV_KEYS: 'KIMI_CODE_HOME' },
+    });
+
+    expect(run.code).toBe(0);
+    const home = join(root, 'rel-home');
+    const recorded = JSON.parse(readFileSync(envOut, 'utf-8'));
+    expect(isAbsolute(recorded['KIMI_CODE_HOME'])).toBe(true);
+    expect(realpathSync(recorded['KIMI_CODE_HOME'])).toBe(realpathSync(home));
+    // Sessions land in the home the caller named, not under the child's cwd.
+    expect(existsSync(join(home, 'sessions'))).toBe(true);
+    expect(existsSync(join(work, 'rel-home'))).toBe(false);
+    // The credentials link reaches the real source file from anywhere.
+    expect(isAbsolute(readlinkSync(join(home, 'credentials')))).toBe(true);
+    expect(
+      readFileSync(join(home, 'credentials', 'kimi-code-env-0e4f99c69cc27850.json'), 'utf-8'),
+    ).toContain(FAKE_TOKEN);
   });
 
   test('--keep-home keeps even an ephemeral home', async () => {

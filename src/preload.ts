@@ -1,10 +1,11 @@
 import { randomBytes } from 'node:crypto';
 import { appendFileSync, readdirSync, readFileSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import {
   makeEphemeralHome,
   removeHome,
   runKimi,
+  sourceHome,
   type KimiRun,
   type LaunchOptions,
 } from './index.ts';
@@ -132,16 +133,18 @@ export class PrimerNoSessionError extends Error {
  * `continueRecent` in `options` applies only to the primer-less path — this
  * function always creates a fresh session.
  *
- * When `options.home` is omitted both runs share one ephemeral home, removed
- * before this resolves; pass `home` to keep the preloaded session.
+ * When `options.home` is omitted (or empty) both runs share one ephemeral
+ * home, removed before this resolves; pass `home` to keep the preloaded
+ * session. A relative `home` resolves as {@link LaunchOptions.home} says.
  */
 export async function runPreloaded(
   options: LaunchOptions,
   items: readonly PreloadItem[],
   prime?: string,
 ): Promise<KimiRun> {
-  const ephemeral = options.home === undefined;
-  const home = options.home ?? makeEphemeralHome();
+  const requested = options.home ?? '';
+  const ephemeral = requested.length === 0;
+  const home = ephemeral ? makeEphemeralHome() : resolve(requested);
   try {
     const primer = await runKimi({
       ...options,
@@ -159,7 +162,8 @@ export async function runPreloaded(
   } finally {
     if (ephemeral) {
       try {
-        removeHome(home);
+        // Keeps the home when a credentials copy in it changed during the run.
+        removeHome(home, sourceHome(options.srcHome));
       } catch {
         // best effort; a leftover temp dir is better than masking the run result
       }

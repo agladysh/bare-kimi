@@ -103,8 +103,10 @@ export async function runCli(args: string[], options: CliEnv): Promise<CliRun> {
     stderr: 'pipe',
   });
   if (options.stdin !== undefined) {
-    subprocess.stdin.write(options.stdin);
-    subprocess.stdin.end();
+    const sink = subprocess.stdin;
+    if (sink === undefined) throw new Error('stdin was requested as a pipe but none was opened');
+    sink.write(options.stdin);
+    sink.end();
   }
   const [stdout, stderr] = await Promise.all([
     new Response(subprocess.stdout).text(),
