@@ -1563,6 +1563,32 @@ export const CASES: readonly CaseDef[] = [
       };
     },
   },
+  {
+    id: 'n8d-off-cross',
+    question: 'N8',
+    title: 'Exact support_efforts-list cross: kimi high-only and openai low/high, thinking off without off_effort',
+    dependsOn: ['ctl-kimi', 'ctl-openai'],
+    steps: [
+      {
+        kind: 'native',
+        id: 'kimi-one',
+        purpose: 'kimi type, exact high-only declaration that failed on openai, off without off_effort',
+        config: cfg('kimi', [A(['capabilities = ["thinking"]', 'support_efforts = ["high"]'])], OFF),
+        deadlineMs: TERMINAL_RETRY_DEADLINE_MS,
+      },
+      {
+        kind: 'native',
+        id: 'openai-two',
+        purpose: 'openai type, exact low/high declaration that succeeded on kimi, off without off_effort',
+        config: cfg('openai', [A()], OFF),
+        deadlineMs: TERMINAL_RETRY_DEADLINE_MS,
+      },
+    ],
+    judge: (j) => ({
+      'kimi high-only, no off_effort, off': gate(j, 'ctl-kimi') ?? offAnswer(j.step('kimi-one'), null),
+      'openai low/high, no off_effort, off': gate(j, 'ctl-openai') ?? offAnswer(j.step('openai-two'), null),
+    }),
+  },
 ];
 
 // ---------------------------------------------------------------- step records and judging helpers
