@@ -78,9 +78,15 @@ Model and effort:
   --effort EFFORT       Thinking effort for sessions the run home creates:
                         one of the model's support_efforts, or off. Written
                         into the run home's [thinking] and pinned like the
-                        model. Refused before any effect when kimi would not
-                        run it as asked. A resumed session keeps the effort
-                        it was created with.
+                        model. Refused before any effect when the source
+                        config's declaration of the model excludes it. When
+                        the config declares no efforts for the model (a
+                        managed model's efforts come from the provider's
+                        catalog, which bare-kimi does not read), it is
+                        taken unchecked and a notice says so; kimi decides
+                        at run time. With --preload no notice is printed.
+                        A resumed
+                        session keeps the effort it was created with.
 
 Run shape:
   --cwd DIR             Working directory (default: current). A resume must
@@ -345,6 +351,13 @@ async function main(): Promise<number> {
     console.error(
       `bare-kimi: adopted ${assembled.home} as a run home; its original config.toml and a manifest ` +
         `of its session files are kept in ${ADOPTION_RECORD}/`,
+    );
+  }
+  if (assembled.effort !== null && assembled.effortSupport === 'undeclared') {
+    console.error(
+      `bare-kimi: effort "${assembled.effort}" is unchecked: the source config declares no ` +
+        `thinking efforts for model "${assembled.modelAlias}", so kimi decides at run time whether ` +
+        'it runs as given',
     );
   }
   const forward = (signal: NodeJS.Signals): void => {

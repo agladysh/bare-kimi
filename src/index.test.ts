@@ -1,8 +1,9 @@
 import { afterEach, beforeAll, describe, expect, test } from 'bun:test';
-import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   EMPTY_SKILLS_DIR,
+  HOME_STAMP,
   KimiCustodyError,
   LaunchConfig,
   assertSafePrompt,
@@ -10,8 +11,10 @@ import {
   buildEnv,
   checkLaunchOptions,
   isScrubbedEnvVar,
+  prepareRunHome,
   runKimi,
   sourceHome,
+  spawnKimi,
 } from './index.ts';
 import { checkPreloadOptions, runPreloaded } from './preload.ts';
 import {
@@ -19,9 +22,12 @@ import {
   CREDENTIAL_SLOT,
   FAKE_KIMI,
   FAKE_TOKEN,
+  addSelectableModels,
   assertFakeExecutable,
+  hasFlag,
   makeSourceHome,
   makeTempDir,
+  readSessionReports,
 } from '../test/helpers.ts';
 
 const cleanups: string[] = [];
@@ -320,5 +326,312 @@ describe('runKimi custody', () => {
     );
     expect(readFileSync(join(src, 'credentials', CREDENTIAL_FILE), 'utf-8')).toContain(FAKE_TOKEN);
     expect(readdirSync(join(src, 'oauth'))).toEqual([]);
+  });
+});
+
+/** Rewrite the source home's config.toml through `edit`. */
+function editSourceConfig(src: string, edit: (text: string) => string): void {
+  const configPath = join(src, 'config.toml');
+  writeFileSync(configPath, edit(readFileSync(configPath, 'utf-8')));
+}
+
+const DEFAULT_LINE = 'default_model = "kimi-code/k3"\n';
+
+describe('model and effort through the fake child', () => {
+  test('a selected model and effort reach the child; its new session stores them', async () => {
+    const root = temp('bare-kimi-sdk-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const out = join(root, 'sessions.ndjson');
+
+    const run = await runKimi({
+      prompt: 'x',
+      home: join(root, 'run-home'),
+      srcHome: src,
+      model: 'kimi-code/k3-thinking',
+      effort: 'high',
+      outputFormat: 'stream-json',
+      kimiBin: FAKE_KIMI,
+      extraEnv: { FAKE_KIMI_SESSION_OUT: out },
+    });
+
+    expect(run.code).toBe(0);
+    const reports = readSessionReports(out);
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toMatchObject({
+      sessionId: run.sessionId,
+      resumed: false,
+      model: 'kimi-code/k3-thinking',
+      storedEffort: 'high',
+      effectiveEffort: 'high',
+      configuredEffort: 'high',
+    });
+    expect(hasFlag(reports[0]!.argv, '--model', 'kimi-code/k3-thinking')).toBe(true);
+  });
+
+  test("a resumed session keeps the effort it was created with; the home's configured effort is for new sessions", async () => {
+    const root = temp('bare-kimi-sdk-');
+    const src = makeSourceHome(root);
+    editSourceConfig(src, (text) => text.replace(DEFAULT_LINE, `${DEFAULT_LINE}\n[thinking]\nenabled = true\neffort = "low"\n`));
+    const home = join(root, 'run-home');
+    const out = join(root, 'sessions.ndjson');
+    const options = { home, srcHome: src, kimiBin: FAKE_KIMI, extraEnv: { FAKE_KIMI_SESSION_OUT: out } };
+
+    const first = await runKimi({ ...options, prompt: 'x', outputFormat: 'stream-json' });
+    expect(first.code).toBe(0);
+    expect(first.sessionId).toBeDefined();
+    editSourceConfig(src, (text) => text.replace('effort = "low"', 'effort = "high"'));
+
+    const resumed = spawnKimi(
+      { ...options, prompt: 'y', resume: first.sessionId },
+      { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' },
+    );
+    // bare-kimi followed the source: config.toml now gives a new session "high".
+    expect(resumed.assembled).toMatchObject({ action: 'reuse', effort: null, configuredEffort: 'high' });
+    await resumed.subprocess.exited;
+    await resumed.dispose();
+    expect(resumed.subprocess.exitCode).toBe(0);
+    const later = await runKimi({ ...options, prompt: 'z' });
+    expect(later.code).toBe(0);
+
+    const [created, resume, fresh] = readSessionReports(out);
+    expect(created).toMatchObject({ resumed: false, storedEffort: 'low' });
+    // The resumed session still runs at "low", whatever config.toml now says.
+    expect(resume).toMatchObject({
+      resumed: true,
+      sessionId: first.sessionId,
+      storedEffort: 'low',
+      effectiveEffort: 'low',
+      configuredEffort: 'high',
+    });
+    expect(fresh).toMatchObject({ resumed: false, storedEffort: 'high' });
+  });
+
+  test('a resume after the source default changed still finds its alias in the kept home', async () => {
+    const root = temp('bare-kimi-sdk-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const out = join(root, 'sessions.ndjson');
+    const options = { home: join(root, 'run-home'), srcHome: src, kimiBin: FAKE_KIMI, extraEnv: { FAKE_KIMI_SESSION_OUT: out } };
+    const first = await runKimi({ ...options, prompt: 'x', outputFormat: 'stream-json' });
+    expect(first.code).toBe(0);
+    editSourceConfig(src, (text) => text.replace(DEFAULT_LINE, 'default_model = "kimi-code/k3-thinking"\n'));
+
+    // The fake fails a resume, as kimi does, when the session's alias is not in config.toml.
+    const resumed = await runKimi({ ...options, prompt: 'y', resume: first.sessionId });
+
+    expect(resumed.code).toBe(0);
+    const reports = readSessionReports(out);
+    expect(reports[1]).toMatchObject({ resumed: true, sessionId: first.sessionId, model: 'kimi-code/k3' });
+    expect(reports[1]!.argv).not.toContain('--model');
+  });
+
+  test('an effort beside a forced one in extraEnv or the spawn env is refused before any home or child', async () => {
+    const root = temp('bare-kimi-sdk-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const home = join(root, 'run-home');
+    const out = join(root, 'sessions.ndjson');
+    const options = {
+      prompt: 'x',
+      home,
+      srcHome: src,
+      model: 'kimi-code/k3-thinking',
+      effort: 'high',
+      kimiBin: FAKE_KIMI,
+    };
+
+    await expect(
+      runKimi({ ...options, extraEnv: { KIMI_MODEL_THINKING_EFFORT: 'low', FAKE_KIMI_SESSION_OUT: out } }),
+    ).rejects.toThrow('KIMI_MODEL_THINKING_EFFORT in extraEnv');
+    expect(() =>
+      spawnKimi({ ...options, extraEnv: { FAKE_KIMI_SESSION_OUT: out } }, { env: { KIMI_MODEL_THINKING_EFFORT: 'low' } }),
+    ).toThrow('KIMI_MODEL_THINKING_EFFORT in the spawn env');
+
+    expect(existsSync(home)).toBe(false);
+    expect(readSessionReports(out)).toEqual([]);
+  });
+
+  test('a forced effort is refused on a home pinned to an effort when the launch omits effort, before the child', async () => {
+    const root = temp('bare-kimi-sdk-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const home = join(root, 'run-home');
+    const out = join(root, 'sessions.ndjson');
+    // The model is on a `kimi`-type provider, where the fake (like kimi) applies a forced effort.
+    prepareRunHome(src, home, 'link', { model: 'kimi-code/k3-thinking', effort: 'high' });
+    const config = readFileSync(join(home, 'config.toml'), 'utf-8');
+    const stamp = readFileSync(join(home, HOME_STAMP), 'utf-8');
+    // No effort here: the pin comes from the home's stamp alone.
+    const options = { prompt: 'x', home, srcHome: src, kimiBin: FAKE_KIMI };
+
+    await expect(
+      runKimi({ ...options, extraEnv: { KIMI_MODEL_THINKING_EFFORT: 'max', FAKE_KIMI_SESSION_OUT: out } }),
+    ).rejects.toThrow('pinned to effort "high"; KIMI_MODEL_THINKING_EFFORT in extraEnv');
+    expect(() =>
+      spawnKimi(
+        { ...options, extraEnv: { FAKE_KIMI_SESSION_OUT: out } },
+        { env: { KIMI_MODEL_THINKING_EFFORT: 'max' } },
+      ),
+    ).toThrow('pinned to effort "high"; KIMI_MODEL_THINKING_EFFORT in the spawn env');
+    await expect(
+      runPreloaded(
+        { ...options, extraEnv: { KIMI_MODEL_THINKING_EFFORT: 'max', FAKE_KIMI_SESSION_OUT: out } },
+        [{ path: 'fact.md', content: 'x' }],
+      ),
+    ).rejects.toThrow('pinned to effort "high"');
+
+    expect(readSessionReports(out)).toEqual([]);
+    expect(existsSync(join(home, 'sessions'))).toBe(false);
+    expect(readFileSync(join(home, 'config.toml'), 'utf-8')).toBe(config);
+    expect(readFileSync(join(home, HOME_STAMP), 'utf-8')).toBe(stamp);
+
+    // Controls: without the variable, or with an empty one (kimi reads it as
+    // unset), the pinned effort is the one every request uses.
+    const plain = await runKimi({ ...options, extraEnv: { FAKE_KIMI_SESSION_OUT: out } });
+    const empty = await runKimi({ ...options, extraEnv: { KIMI_MODEL_THINKING_EFFORT: ' ', FAKE_KIMI_SESSION_OUT: out } });
+    expect([plain.code, empty.code]).toEqual([0, 0]);
+    expect(readSessionReports(out).map((report) => report.effectiveEffort)).toEqual(['high', 'high']);
+  });
+
+  test('extraEnv decides the forced effort over the spawn env, as the child sees it', async () => {
+    const root = temp('bare-kimi-sdk-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const home = join(root, 'run-home');
+    const out = join(root, 'sessions.ndjson');
+    prepareRunHome(src, home, 'link', { model: 'kimi-code/k3-thinking', effort: 'high' });
+
+    // An empty extraEnv value replaces the spawn env's, so the child sees none.
+    const launched = spawnKimi(
+      {
+        prompt: 'x',
+        home,
+        srcHome: src,
+        kimiBin: FAKE_KIMI,
+        extraEnv: { KIMI_MODEL_THINKING_EFFORT: '', FAKE_KIMI_SESSION_OUT: out },
+      },
+      { env: { KIMI_MODEL_THINKING_EFFORT: 'max' }, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' },
+    );
+    const code = await launched.subprocess.exited;
+    await launched.dispose();
+
+    expect(code).toBe(0);
+    expect(readSessionReports(out)[0]).toMatchObject({ storedEffort: 'high', effectiveEffort: 'high' });
+  });
+
+  test('a forced effort stays usable on purpose on a kept home that follows the source [thinking]', async () => {
+    const root = temp('bare-kimi-sdk-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const home = join(root, 'run-home');
+    const out = join(root, 'sessions.ndjson');
+    prepareRunHome(src, home, 'link', { model: 'kimi-code/k3-thinking' });
+
+    const run = await runKimi({
+      prompt: 'x',
+      home,
+      srcHome: src,
+      kimiBin: FAKE_KIMI,
+      extraEnv: { KIMI_MODEL_THINKING_EFFORT: 'max', FAKE_KIMI_SESSION_OUT: out },
+    });
+
+    expect(run.code).toBe(0);
+    expect(readSessionReports(out)[0]).toMatchObject({ storedEffort: 'medium', effectiveEffort: 'max' });
+  });
+
+  test("without effort, a forced effort in extraEnv reaches the child on purpose and overrides the session's own", async () => {
+    const root = temp('bare-kimi-sdk-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const out = join(root, 'sessions.ndjson');
+
+    const run = await runKimi({
+      prompt: 'x',
+      home: join(root, 'run-home'),
+      srcHome: src,
+      model: 'kimi-code/k3-thinking',
+      kimiBin: FAKE_KIMI,
+      extraEnv: { KIMI_MODEL_THINKING_EFFORT: 'max', FAKE_KIMI_SESSION_OUT: out },
+    });
+
+    expect(run.code).toBe(0);
+    // No [thinking]: the session stores the model's default; every request is forced.
+    expect(readSessionReports(out)[0]).toMatchObject({
+      configuredEffort: null,
+      storedEffort: 'medium',
+      effectiveEffort: 'max',
+    });
+  });
+});
+
+describe('preload with a model and effort', () => {
+  test("both runs share the pinned home; the resumed session keeps the primer's model and effort", async () => {
+    const root = temp('bare-kimi-sdk-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const home = join(root, 'run-home');
+    const out = join(root, 'sessions.ndjson');
+
+    const run = await runPreloaded(
+      {
+        prompt: 'what is the answer?',
+        home,
+        srcHome: src,
+        model: 'kimi-code/k3-thinking',
+        effort: 'high',
+        outputFormat: 'stream-json',
+        kimiBin: FAKE_KIMI,
+        extraEnv: { FAKE_KIMI_SESSION_OUT: out },
+      },
+      [{ path: 'fact.md', content: 'The answer is synthesized.\n' }],
+    );
+
+    expect(run.code).toBe(0);
+    expect(run.stdout).toContain('[has-preload]');
+    const reports = readSessionReports(out);
+    expect(reports).toHaveLength(2);
+    const [primer, resumed] = reports;
+    expect(primer).toMatchObject({ resumed: false, model: 'kimi-code/k3-thinking', storedEffort: 'high' });
+    expect(resumed).toMatchObject({
+      resumed: true,
+      sessionId: primer!.sessionId,
+      model: 'kimi-code/k3-thinking',
+      storedEffort: 'high',
+      effectiveEffort: 'high',
+    });
+    expect(run.sessionId).toBe(primer!.sessionId);
+    expect(hasFlag(resumed!.argv, '--session', primer!.sessionId)).toBe(true);
+    expect(hasFlag(resumed!.argv, '--model', 'kimi-code/k3-thinking')).toBe(true);
+    expect(JSON.parse(readFileSync(join(home, HOME_STAMP), 'utf-8'))).toMatchObject({
+      model: 'kimi-code/k3-thinking',
+      effort: 'high',
+    });
+  });
+
+  test('a kept home pinned to another model refuses the preload before the primer', async () => {
+    const root = temp('bare-kimi-sdk-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const home = join(root, 'run-home');
+    const out = join(root, 'sessions.ndjson');
+    prepareRunHome(src, home);
+
+    await expect(
+      runPreloaded(
+        {
+          prompt: 'x',
+          home,
+          srcHome: src,
+          model: 'kimi-code/k3-thinking',
+          kimiBin: FAKE_KIMI,
+          extraEnv: { FAKE_KIMI_SESSION_OUT: out },
+        },
+        [{ path: 'fact.md', content: 'x' }],
+      ),
+    ).rejects.toThrow('pinned to model "kimi-code/k3"');
+
+    expect(readSessionReports(out)).toEqual([]);
+    expect(existsSync(join(home, 'sessions'))).toBe(false);
   });
 });

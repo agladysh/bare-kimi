@@ -19,9 +19,12 @@ import {
   CREDENTIAL_SLOT,
   FAKE_BIN_DIR,
   FAKE_TOKEN,
+  addSelectableModels,
   assertFakeExecutable,
+  hasFlag,
   makeSourceHome,
   makeTempDir,
+  readSessionReports,
   runCli,
 } from './helpers.ts';
 
@@ -633,6 +636,145 @@ describe('preload', () => {
     });
 
     expect(run.code).toBe(1);
+  });
+});
+
+describe('model, effort and source identity', () => {
+  test('--model and --effort reach the child, ambient thinking overrides do not; a kept home refuses another effort', async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const home = join(root, 'kept-home');
+    const out = join(root, 'sessions.ndjson');
+    const envOut = join(root, 'env.json');
+
+    const run = await runCli(['--home', home, '--model', 'kimi-code/k3-thinking', '--effort', 'high', '--json', '--', 'x'], {
+      srcHome: src,
+      env: {
+        KIMI_MODEL_THINKING_EFFORT: 'max',
+        KIMI_MODEL_THINKING_KEEP: 'all',
+        FAKE_KIMI_SESSION_OUT: out,
+        FAKE_KIMI_ENV_OUT: envOut,
+        FAKE_KIMI_ENV_KEYS: 'KIMI_MODEL_THINKING_EFFORT,KIMI_MODEL_THINKING_KEEP',
+      },
+    });
+
+    expect(run.code).toBe(0);
+    expect(JSON.parse(readFileSync(envOut, 'utf-8'))).toEqual({});
+    // The model is on a `kimi`-type provider: a leaked override would have forced "max".
+    const [report] = readSessionReports(out);
+    expect(report).toMatchObject({ model: 'kimi-code/k3-thinking', storedEffort: 'high', effectiveEffort: 'high' });
+    expect(hasFlag(report!.argv, '--model', 'kimi-code/k3-thinking')).toBe(true);
+
+    const other = await runCli(['--home', home, '--effort', 'low', '--', 'x'], {
+      srcHome: src,
+      env: { FAKE_KIMI_SESSION_OUT: out },
+    });
+    expect(other.code).toBe(2);
+    expect(other.stderr).toContain('pinned to effort "high"');
+    expect(readSessionReports(out)).toHaveLength(1);
+  });
+
+  test('an effort the model does not list is refused before any home or kimi', async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const home = join(root, 'kept-home');
+    const out = join(root, 'sessions.ndjson');
+
+    const run = await runCli(['--home', home, '--model', 'other/reasoner', '--effort', 'low', '--', 'x'], {
+      srcHome: src,
+      env: { FAKE_KIMI_SESSION_OUT: out },
+    });
+
+    expect(run.code).toBe(2);
+    expect(run.stderr).toContain('support_efforts (minimal, high, max)');
+    expect(existsSync(home)).toBe(false);
+    expect(readSessionReports(out)).toEqual([]);
+  });
+
+  test('--effort on a model that declares no efforts runs, and says it was not checked; a declared one says nothing', async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const out = join(root, 'sessions.ndjson');
+
+    // The managed default declares neither capabilities nor support_efforts.
+    const unchecked = await runCli(['--effort', 'high', '--', 'x'], { srcHome: src, env: { FAKE_KIMI_SESSION_OUT: out } });
+    const checked = await runCli(['--model', 'kimi-code/k3-thinking', '--effort', 'high', '--', 'x'], {
+      srcHome: src,
+      env: { FAKE_KIMI_SESSION_OUT: out },
+    });
+
+    expect([unchecked.code, checked.code]).toEqual([0, 0]);
+    expect(unchecked.stderr).toContain('effort "high" is unchecked');
+    expect(unchecked.stderr).toContain('model "kimi-code/k3"');
+    expect(checked.stderr).not.toContain('unchecked');
+    expect(readSessionReports(out).map((report) => [report.model, report.storedEffort])).toEqual([
+      ['kimi-code/k3', 'high'],
+      ['kimi-code/k3-thinking', 'high'],
+    ]);
+  });
+
+  test('a kept home runs on the source it is stamped with; another source is refused before kimi', async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    const home = join(root, 'kept-home');
+    const first = await runCli(['--home', home, '--src-home', src, '--', 'x'], { srcHome: src });
+    expect(first.code).toBe(0);
+    const decoy = temp('bare-kimi-decoy-');
+    const envOut = join(root, 'env.json');
+
+    // No source named anywhere, and a HOME whose ~/.kimi-code does not exist.
+    const named = await runCli(['--home', home, '--', 'x'], {
+      srcHome: src,
+      env: {
+        KIMI_CODE_HOME_SOURCE: '',
+        HOME: decoy,
+        FAKE_KIMI_ENV_OUT: envOut,
+        FAKE_KIMI_ENV_KEYS: 'KIMI_CODE_HOME_SOURCE',
+      },
+    });
+
+    expect(named.code).toBe(0);
+    expect(JSON.parse(readFileSync(envOut, 'utf-8'))['KIMI_CODE_HOME_SOURCE']).toBe(realpathSync(src));
+    expect(existsSync(join(decoy, '.kimi-code'))).toBe(false);
+
+    const otherSrc = makeSourceHome(temp('bare-kimi-other-'));
+    const refusedOut = join(root, 'refused-env.json');
+    const refused = await runCli(['--home', home, '--', 'x'], {
+      srcHome: src,
+      env: { KIMI_CODE_HOME_SOURCE: otherSrc, FAKE_KIMI_ENV_OUT: refusedOut, FAKE_KIMI_ENV_KEYS: 'KIMI_CODE_HOME' },
+    });
+    expect(refused.code).toBe(2);
+    expect(refused.stderr).toContain('was assembled from');
+    expect(existsSync(refusedOut)).toBe(false);
+  });
+
+  test('--adopt-legacy-home adopts a home kept before 0.2, and says so', async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    const home = join(root, 'kept-home');
+    const first = await runCli(['--home', home, '--', 'x'], { srcHome: src });
+    expect(first.code).toBe(0);
+    // What a home kept before 0.2 looks like: everything but the stamp.
+    rmSync(join(home, '.bare-kimi-home'));
+    const envOut = join(root, 'env.json');
+
+    const refused = await runCli(['--home', home, '--', 'x'], {
+      srcHome: src,
+      env: { FAKE_KIMI_ENV_OUT: envOut, FAKE_KIMI_ENV_KEYS: 'KIMI_CODE_HOME' },
+    });
+    expect(refused.code).toBe(2);
+    expect(refused.stderr).toContain('has no .bare-kimi-home');
+    expect(existsSync(envOut)).toBe(false);
+
+    const adopted = await runCli(['--home', home, '--adopt-legacy-home', '--', 'x'], { srcHome: src });
+
+    expect(adopted.code).toBe(0);
+    expect(adopted.stderr).toContain(`adopted ${home} as a run home`);
+    expect(JSON.parse(readFileSync(join(home, '.bare-kimi-home'), 'utf-8'))).toMatchObject({ version: 2, adopted: true });
+    expect(existsSync(join(home, '.bare-kimi-adopted', 'manifest.json'))).toBe(true);
   });
 });
 

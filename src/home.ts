@@ -110,8 +110,25 @@ export interface AssembledHome {
   /**
    * The thinking effort the home is pinned to: one chosen with `effort`, or
    * null when the home carries the source's own `[thinking]` table (or none).
+   * It is configured for new sessions. A resumed session runs at the effort
+   * it stored when it was created, and kimi may run another one when
+   * {@link AssembledHome.effortSupport} is `undeclared`.
    */
   readonly effort: string | null;
+  /**
+   * How the pinned effort relates to what the source config declares about
+   * the model's thinking (null when no effort is pinned):
+   * - `declared`: the model's table (its `overrides` winning) declares its
+   *   thinking support, and the effort agrees with it;
+   * - `undeclared`: the table declares nothing to check the effort against
+   *   (no `support_efforts`, and for `off` no thinking metadata at all), so
+   *   kimi decides at run time. kimi 2.1.0 sends a non-`kimi` provider the
+   *   string as given. On a `kimi`-type provider it validates the effort
+   *   against model metadata that bare-kimi does not read; for the managed
+   *   provider that comes from the provider's `/models` catalog. It may then
+   *   run the model's default effort or none.
+   */
+  readonly effortSupport: EffortSupport | null;
   /**
    * The effort the home's config.toml gives a new session: the pinned
    * effort, else the source `[thinking]`'s (`off` when it disables
@@ -146,9 +163,11 @@ export interface RunHomeOptions {
   readonly model?: string;
   /**
    * The thinking effort to write into the run home's `[thinking]` and pin:
-   * one of the model's `support_efforts`, or `off`. Omitted: a new home
-   * carries the source's `[thinking]`; a kept home keeps its pin. A kept home
-   * refuses another effort.
+   * one of the model's `support_efforts`, or `off`. When the model declares
+   * no `support_efforts`, any effort name is taken and reported as
+   * `undeclared` (see {@link AssembledHome.effortSupport}). Omitted: a new
+   * home carries the source's `[thinking]`; a kept home keeps its pin. A kept
+   * home refuses another effort.
    */
   readonly effort?: string;
   /**
@@ -344,6 +363,8 @@ interface MinimalConfig {
   readonly modelId: string | undefined;
   /** The selected effort, or null when the source's `[thinking]` is carried. */
   readonly effort: string | null;
+  /** See {@link AssembledHome.effortSupport}. */
+  readonly effortSupport: EffortSupport | null;
   /** See {@link AssembledHome.configuredEffort}. */
   readonly configuredEffort: string | null;
   /** {@link settingsDigest} of `text`. */
@@ -381,48 +402,72 @@ function configuresModel(source: TomlTable, alias: string): boolean {
 
 const EFFORT_NAME = /^[a-z0-9][a-z0-9_-]*$/;
 
+/** See {@link AssembledHome.effortSupport}. */
+export type EffortSupport = 'declared' | 'undeclared';
+
 /**
- * Refuse an effort that kimi 2.1.0 would not run as asked. kimi fixes a new
- * session's effort from `[thinking]` (`enabled = false` is `off`, else
- * `effort`, else the model's default) and stores it with the session. On a
- * provider type with strict thinking validation (in 2.1.0, the `kimi` type)
- * it silently replaces an effort the model does not list with the model's
- * default, and runs a model without a thinking capability with thinking off;
- * other types send the string unchecked. So an effort is accepted only when
- * the model declares thinking and lists it in `support_efforts` (an
- * override's list wins). `off` is accepted unless the model always thinks,
- * in which case kimi would ignore it.
+ * Check a selected effort against what the source config declares about the
+ * model (its `overrides` already applied), refusing what that declaration
+ * contradicts and reporting what it leaves open.
+ *
+ * As read from the installed kimi 2.1.0 bundle: a new session's effort comes
+ * from `[thinking]` (`enabled = false` is `off`, else `effort`, else the
+ * model's default) and is stored with the session. Whether kimi validates
+ * the effort depends on the provider type (`requiresStrictThinkingValidation`;
+ * this library reads only the `kimi` type as strict). A strict type replaces
+ * an effort the model does not list with the model's default, and runs a
+ * model without thinking with thinking off. Other types "receive effort
+ * strings without client-side mapping". kimi's own registry import marks a
+ * model as thinking when it has `reasoning` or a non-empty `support_efforts`
+ * (`capabilitiesFromCustomEntry`), and may leave `support_efforts` out. A
+ * managed model's efforts come from the provider's `/models` catalog
+ * (`parseThinkEfforts`), which this library does not read: it makes no
+ * network or login reads.
+ *
+ * So, on every provider type:
+ * - an effort that is not a lowercase name is refused;
+ * - `off` is refused for a model declared always-thinking;
+ * - another effort is refused for a model whose declaration excludes
+ *   thinking: a `capabilities` list without it and no `support_efforts`;
+ * - an effort missing from a declared `support_efforts` is refused. A strict
+ *   type would silently run another effort, and kimi's provider-error hint
+ *   tells users to choose an effort the model supports;
+ * - anything else the declaration does not settle is accepted as
+ *   `undeclared`, not refused: unknown support is not taken for no support.
  */
-function assertEffortSupported(effort: string, alias: string, model: TomlTable): void {
+function checkEffort(effort: string, alias: string, model: TomlTable): EffortSupport {
   if (!EFFORT_NAME.test(effort)) {
     throw new Error(`effort ${JSON.stringify(effort)} is not a lowercase effort name; refusing`);
   }
   const capabilities = model['capabilities'];
   const listed = stringList(capabilities).map((item) => item.toLowerCase());
+  const efforts = stringList(model['support_efforts']);
   const always = model['always_thinking'] === true || listed.includes('always_thinking');
   const thinks =
     always ||
     model['adaptive_thinking'] === true ||
     listed.includes('thinking') ||
-    (isTable(capabilities) && capabilities['thinking'] === true);
+    (isTable(capabilities) && capabilities['thinking'] === true) ||
+    efforts.length > 0;
+  const declaresThinking =
+    capabilities !== undefined ||
+    efforts.length > 0 ||
+    typeof model['always_thinking'] === 'boolean' ||
+    typeof model['adaptive_thinking'] === 'boolean';
   if (effort === 'off') {
     if (always) throw new Error(`model "${alias}" always thinks, so kimi would ignore effort "off"; refusing`);
-    return;
+    return declaresThinking ? 'declared' : 'undeclared';
   }
-  if (!thinks) {
-    throw new Error(
-      `model "${alias}" declares no thinking capability, so kimi would run effort "${effort}" with thinking off; refusing`,
-    );
+  if (declaresThinking && !thinks) {
+    throw new Error(`model "${alias}" is declared without thinking, so effort "${effort}" would not run as asked; refusing`);
   }
-  const efforts = stringList(model['support_efforts']);
-  if (efforts.length === 0) {
-    throw new Error(`model "${alias}" declares no support_efforts, so effort "${effort}" cannot be checked; refusing`);
-  }
+  if (efforts.length === 0) return 'undeclared';
   if (!efforts.includes(effort)) {
     throw new Error(
       `effort "${effort}" is not one of model "${alias}"'s support_efforts (${efforts.join(', ')}); refusing`,
     );
   }
+  return 'declared';
 }
 
 function tomlKey(key: string): string {
@@ -513,7 +558,7 @@ function minimalConfig(configText: string, source: TomlTable, where: string, sel
   const providerTable = isTable(providers) ? providers[provider] : undefined;
   if (!isTable(providerTable)) throw new Error(`no [providers."${provider}"] in ${where}`);
   const { effort } = selection;
-  if (effort !== null) assertEffortSupported(effort, modelAlias, effectiveModel(model));
+  const effortSupport = effort === null ? null : checkEffort(effort, modelAlias, effectiveModel(model));
 
   const prefixes: (readonly string[])[] = [
     ['providers', provider],
@@ -560,6 +605,7 @@ function minimalConfig(configText: string, source: TomlTable, where: string, sel
     providerType: typeof providerType === 'string' ? providerType : undefined,
     modelId: typeof modelId === 'string' ? modelId : undefined,
     effort,
+    effortSupport,
     configuredEffort: thinkingEffort(expected['thinking']),
     digest: settingsDigest(carried),
   };
@@ -960,17 +1006,19 @@ function planEnsure(src: string, dst: string, mode: AuthMode): Donation | undefi
  * ownership, the canonical source home it was assembled from, the model
  * alias and effort it is pinned to, and the digest of the settings in the
  * config.toml it last wrote. Version 2 since bare-kimi 0.3; a version-1
- * stamp (0.2) is read, taken as pinned to the alias its config.toml holds,
- * and upgraded on the next write. bare-kimi 0.2 refuses a version-2 stamp.
+ * stamp (0.2) is read, taken as pinned to the alias its config.toml holds
+ * (see {@link pinnedSelection} for a missing config.toml), and upgraded on
+ * the next write. bare-kimi 0.2 refuses a version-2 stamp.
  */
 export const HOME_STAMP = '.bare-kimi-home';
 
 /**
  * Directory an adopted home keeps as evidence of what it was before
  * adoption: `config.toml`, byte for byte as found, and `manifest.json` (the
- * source, the model and effort its sessions use, how its credentials were
- * held, and the SHA-256 of every file under `sessions/` at adoption).
- * Adoption never changes `sessions/`.
+ * source, the model alias its sessions are bound to, the effort its
+ * config.toml configured for new sessions, how its credentials were held,
+ * and the SHA-256 of every file under `sessions/` at adoption). Adoption
+ * never changes `sessions/`.
  *
  * A non-empty home without {@link HOME_STAMP} is adopted only when asked
  * (`adoptLegacyHome`) and only when all of this holds:
@@ -985,10 +1033,18 @@ export const HOME_STAMP = '.bare-kimi-home';
  *   bare-kimi's copy marker, with `oauth` absent or a real directory; or, in
  *   copy mode only, absent, as a pre-0.2 copy-mode run left it;
  * - `sessions`, when present, is a real directory;
- * - a model or effort the caller asks for is the one the home's sessions use.
+ * - a model or effort the caller asks for is the one the home is pinned to
+ *   (below).
  *
- * The home is pinned to its `default_model` and, when its `[thinking]`
- * differs from the source's, to the effort that table names.
+ * The home is pinned to its `default_model`: native kimi binds each session
+ * to its alias. When its `[thinking]` differs from the source's, it is also
+ * pinned to the effort that table names, and that effort is checked like a
+ * selected one. That pin is the effort the home's config.toml gave new
+ * sessions when it was found. It says nothing about the effort its existing
+ * sessions ran at: each stored its own when created, perhaps under an
+ * earlier config.toml, and a `kimi`-type provider may have replaced an
+ * effort the model did not list. A resume keeps each session's stored
+ * effort whatever the pin says.
  *
  * Effects, in order: the record is written into a temporary directory and
  * renamed into place; the stamp is written, recording the found settings as
@@ -1075,8 +1131,14 @@ interface AdoptionManifest {
   readonly version: 1;
   readonly at: string;
   readonly source: string;
+  /** The alias the found config.toml names: the one its sessions are bound to. */
   readonly model: string;
-  readonly effort: string | null;
+  /**
+   * The effort the found config.toml configured for new sessions, when it
+   * differs from the source's (else null). Not the effort of any existing
+   * session.
+   */
+  readonly configuredEffort: string | null;
   readonly config: { readonly sha256: string };
   readonly credentials: 'link' | 'copy' | 'absent';
   readonly oauth: 'link' | 'directory' | 'absent';
@@ -1112,23 +1174,79 @@ function describeEffort(effort: string | null): string {
   return effort === null ? "the source's [thinking]" : `effort "${effort}"`;
 }
 
-/** The model and effort a stamped home is pinned to. */
+/** The home holds a `sessions` entry with something in it (or one that is not a directory). */
+function holdsSessions(home: string): boolean {
+  const sessions = join(home, 'sessions');
+  const stat = lstatSync(sessions, { throwIfNoEntry: false });
+  if (stat === undefined) return false;
+  return !stat.isDirectory() || readdirSync(sessions).length > 0;
+}
+
+/**
+ * The alias whose config, as the source yields it now with the source's own
+ * `[thinking]`, has the settings digest `digest`, if any. Each alias yields
+ * its own `default_model`, so at most one matches.
+ */
+function aliasYielding(sourceText: string, source: TomlTable, sourceWhere: string, digest: string): string | undefined {
+  const models = source['models'];
+  if (!isTable(models)) return undefined;
+  for (const alias of Object.keys(models)) {
+    try {
+      if (minimalConfig(sourceText, source, sourceWhere, { model: alias, effort: null }).digest === digest) return alias;
+    } catch {
+      // An alias the source cannot carry yields no config, so no digest.
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The model and effort a stamped home is pinned to. A version-1 stamp (0.2)
+ * pinned nothing: that home followed the source's default_model and carried
+ * the source's `[thinking]`, so its effort pin is null. Its alias is:
+ * - with config.toml present: the default_model there, while it holds what
+ *   0.2 last wrote; otherwise the source's default_model, and an edited file
+ *   is then refused unless it equals what the source yields for that alias;
+ * - with config.toml missing: the alias whose config, as the source yields it
+ *   now, has the stamp's digest. The digest covers the default_model that
+ *   0.2 wrote, so a match proves that alias. That rests on 0.2 and this
+ *   version computing the same digest, which one reuse of a home assembled
+ *   by 0.2 showed. A digest that disagrees proves nothing, and the steps
+ *   below apply. Without a match, the caller's
+ *   `model` is taken. A home without sessions follows the source's
+ *   default_model, since no session is bound to an alias. Anything else is
+ *   refused: the alias its sessions are bound to cannot be read.
+ */
 function pinnedSelection(
   stamp: HomeStamp,
+  home: string,
   current: TomlTable | undefined,
   digest: string | undefined,
+  request: RunHomeOptions,
+  sourceText: string,
   source: TomlTable,
   sourceWhere: string,
 ): { readonly model: string; readonly effort: string | null } {
   if (stamp.model !== undefined) return { model: stamp.model, effort: stamp.effort };
-  // A 0.2 stamp pinned nothing: the home followed the source's default_model.
-  // While its config.toml holds what 0.2 last wrote, the alias there is the
-  // one its sessions are bound to.
-  const written = current?.['default_model'];
-  if (digest === stamp.config && typeof written === 'string') return { model: written, effort: null };
-  const followed = source['default_model'];
-  if (typeof followed !== 'string') throw new Error(`no default_model in the root table of ${sourceWhere}`);
-  return { model: followed, effort: null };
+  const followed = (): { model: string; effort: null } => {
+    const model = source['default_model'];
+    if (typeof model !== 'string') throw new Error(`no default_model in the root table of ${sourceWhere}`);
+    return { model, effort: null };
+  };
+  if (current !== undefined) {
+    const written = current['default_model'];
+    if (digest === stamp.config && typeof written === 'string') return { model: written, effort: null };
+    return followed();
+  }
+  const proven = aliasYielding(sourceText, source, sourceWhere, stamp.config);
+  if (proven !== undefined) return { model: proven, effort: null };
+  if (request.model !== undefined) return { model: request.model, effort: null };
+  if (!holdsSessions(home)) return followed();
+  throw new Error(
+    `run home ${home} has a bare-kimi 0.2 stamp but no config.toml, and the source no longer yields the ` +
+      'settings that stamp records, so the model alias its sessions are bound to is unknown; ' +
+      'name it explicitly (model, CLI --model)',
+  );
 }
 
 /**
@@ -1141,6 +1259,8 @@ function pinnedSelection(
  * - a stamped home from another source;
  * - a model or effort other than the one a stamped home is pinned to, and a
  *   source that no longer configures the pinned model;
+ * - a 0.2-stamped home with sessions but no config.toml, whose alias neither
+ *   the stamp nor the caller establishes (see {@link pinnedSelection});
  * - a config.toml that is not a regular file, or no longer parses;
  * - a config.toml whose settings differ both from what was last written
  *   (it was edited) and from what the source yields now.
@@ -1193,7 +1313,7 @@ function planRunHome(
   if (current !== undefined && !current.isFile()) throw new Error(`refusing to use ${configPath}: not a regular file`);
   const currentTable = current === undefined ? undefined : parseToml(readFileSync(configPath, 'utf-8'), configPath);
   const digest = currentTable === undefined ? undefined : settingsDigest(currentTable);
-  const pinned = pinnedSelection(stamp, currentTable, digest, parsed, sourceWhere);
+  const pinned = pinnedSelection(stamp, home, currentTable, digest, request, sourceText, parsed, sourceWhere);
   if (request.model !== undefined && request.model !== pinned.model) {
     throw new Error(
       `run home ${home} is pinned to model "${pinned.model}", the alias its sessions are bound to; ` +
@@ -1202,8 +1322,8 @@ function planRunHome(
   }
   if (request.effort !== undefined && request.effort !== pinned.effort) {
     throw new Error(
-      `run home ${home} is pinned to ${describeEffort(pinned.effort)}, which its sessions were created with; ` +
-        `refusing effort "${request.effort}" (use another home for it)`,
+      `run home ${home} is pinned to ${describeEffort(pinned.effort)}, the effort it configures for new ` +
+        `sessions; refusing effort "${request.effort}" (use another home for it)`,
     );
   }
   if (!configuresModel(parsed, pinned.model)) {
@@ -1265,8 +1385,9 @@ function planAdoption(
     );
   }
 
-  // An effort the consumer wrote into the home is what its sessions were
-  // created with; one equal to the source's is just the source's.
+  // An effort the consumer wrote into the home is what it configured for new
+  // sessions, and stays so; one equal to the source's is just the source's.
+  // Neither tells what its existing sessions ran at (see ADOPTION_RECORD).
   const effort =
     Object.hasOwn(legacy, 'thinking') && canonicalToml(legacy['thinking']) !== canonicalToml(parsed['thinking'])
       ? thinkingEffort(legacy['thinking'])
@@ -1275,7 +1396,9 @@ function planAdoption(
     throw refusal(`its sessions are bound to model "${model}"; refusing model "${request.model}"`);
   }
   if (request.effort !== undefined && request.effort !== effort) {
-    throw refusal(`its sessions were created with ${describeEffort(effort)}; refusing effort "${request.effort}"`);
+    throw refusal(
+      `its config.toml configures ${describeEffort(effort)} for new sessions; refusing effort "${request.effort}"`,
+    );
   }
   const config = minimalConfig(sourceText, parsed, sourceWhere, { model, effort });
 
@@ -1336,7 +1459,7 @@ function planAdoption(
         at: new Date().toISOString(),
         source,
         model,
-        effort,
+        configuredEffort: effort,
         config: { sha256: sha },
         credentials: held,
         oauth: oauthHeld,
@@ -1428,6 +1551,7 @@ function describeHome(dst: string, source: string, plan: RunHomePlan): Assembled
     providerType: config.providerType,
     modelId: config.modelId,
     effort: config.effort,
+    effortSupport: config.effortSupport,
     configuredEffort: config.configuredEffort,
     source,
     action: plan.action,

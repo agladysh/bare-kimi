@@ -4,6 +4,7 @@ import {
   assertDistinctHomes,
   makeEphemeralHome,
   prepareRunHome,
+  previewRunHome,
   removeHome,
   runSourceHome,
   shredCopiedCredentials,
@@ -35,6 +36,7 @@ export {
   HOME_STAMP,
   type AssembledHome,
   type AuthMode,
+  type EffortSupport,
   type RunHomeOptions,
 } from './home.ts';
 export {
@@ -124,11 +126,14 @@ export interface LaunchOptions {
    *
    * Native semantics (kimi 2.1.0 `-p`): a session's effort is fixed when it
    * is created and stored with it; a resume keeps it, whatever config.toml
-   * says later. Refused before any effect: an effort the model does not
-   * list, a model without a thinking capability, `off` for a model that
-   * always thinks (kimi would silently run another effort or none), and a
-   * `KIMI_MODEL_THINKING_EFFORT` in `extraEnv` or the spawn env (a
-   * per-process override of every request, resumed ones included).
+   * says later. Refused before any effect, on what the source config
+   * declares for the model: an effort missing from its `support_efforts`, a
+   * model declared without thinking, and `off` for a model declared
+   * always-thinking. Also refused: a `KIMI_MODEL_THINKING_EFFORT` in
+   * `extraEnv` or the spawn env, which overrides every request of the
+   * process, resumed ones included. An effort the config declares nothing
+   * about is taken, and the run's `assembled.effortSupport` is `undeclared`.
+   * kimi then decides at run time (see {@link AssembledHome.effortSupport}).
    */
   readonly effort?: string;
   /**
@@ -174,7 +179,9 @@ export interface LaunchOptions {
   /**
    * Extra environment, applied over the inherited layer. May re-add a
    * scrubbed variable explicitly, and may override the telemetry/auto-update
-   * defaults; may NOT override `KIMI_CODE_HOME`.
+   * defaults; may NOT override `KIMI_CODE_HOME`. A non-empty
+   * `KIMI_MODEL_THINKING_EFFORT` (here or in the spawn env) is refused
+   * beside `effort` and on a run home pinned to an effort.
    */
   readonly extraEnv?: Record<string, string>;
   /**
@@ -191,6 +198,27 @@ export type LaunchConfig = Required<Omit<LaunchOptions, 'model' | 'resume' | 'ef
 /** kimi 2.1.0's per-process forced effort (`thinking.forcedEffort`). */
 const FORCED_EFFORT_ENV = 'KIMI_MODEL_THINKING_EFFORT';
 
+/** A forced effort the child would see, and the layer that sets it. */
+interface ForcedEffort {
+  readonly layer: string;
+  readonly value: string;
+}
+
+/**
+ * The forced effort the child's environment will carry, by the layering of
+ * {@link buildEnv}: the inherited value is scrubbed, `extraEnv` wins over the
+ * spawn env, and kimi 2.1.0 trims the value and takes an empty one as unset.
+ */
+function forcedEffort(
+  extraEnv: Record<string, string> | undefined,
+  spawnEnv: Record<string, string | undefined> | undefined,
+): ForcedEffort | undefined {
+  const fromExtra = extraEnv !== undefined && Object.hasOwn(extraEnv, FORCED_EFFORT_ENV);
+  const layer = fromExtra ? 'extraEnv' : 'the spawn env';
+  const value = (fromExtra ? extraEnv?.[FORCED_EFFORT_ENV] : spawnEnv?.[FORCED_EFFORT_ENV])?.trim();
+  return value === undefined || value.length === 0 ? undefined : { layer, value };
+}
+
 function forcedEffortConflict(layer: string): Error {
   return new Error(
     `effort conflicts with ${FORCED_EFFORT_ENV} in ${layer}: that variable forces an effort on every ` +
@@ -204,7 +232,9 @@ export function LaunchConfig(o: LaunchOptions): LaunchConfig {
   }
   if (o.model !== undefined && o.model.length === 0) throw new Error('model must not be empty');
   if (o.effort !== undefined && o.effort.length === 0) throw new Error('effort must not be empty');
-  if (o.effort !== undefined && o.extraEnv?.[FORCED_EFFORT_ENV] !== undefined) throw forcedEffortConflict('extraEnv');
+  if (o.effort !== undefined && forcedEffort(o.extraEnv, undefined) !== undefined) {
+    throw forcedEffortConflict('extraEnv');
+  }
   if ((o.extraArgs ?? []).some((arg) => arg === '--model' || arg === '-m' || arg.startsWith('--model='))) {
     throw new Error('pass the model as the model option, not in extraArgs: the run home must carry it');
   }
@@ -303,8 +333,11 @@ export function buildArgv(config: LaunchConfig, kimiBin: string): string[] {
  * in `extraEnv` instead forces an effort on every request of that process,
  * resumed sessions included, only on provider types that drive thinking
  * through a trait (the `kimi` type does), and not when thinking is off
- * (kimi 2.1.0 `resolveForcedThinkingEffort`); combining it with `effort` is
- * refused.
+ * (kimi 2.1.0 `resolveForcedThinkingEffort`). It stays available on purpose
+ * for a run home that follows the source's `[thinking]`. Beside `effort`, or
+ * on a run home pinned to an effort (whether or not this launch names it),
+ * it would silently override the pin, so it is refused there before any
+ * effect.
  */
 export function isScrubbedEnvVar(name: string): boolean {
   return (
@@ -465,9 +498,10 @@ export class KimiCustodyError extends Error {
  * `spawnOptions` is forwarded to `Bun.spawn` except for the fields this
  * function resolves rather than passes through: `cmd`, `cwd`
  * (`launchOptions.cwd ?? spawnOptions.cwd ?? process.cwd()`), `env` (see
- * {@link buildEnv}), and `stdin` (defaults to `ignore`). A
- * `KIMI_MODEL_THINKING_EFFORT` in `spawnOptions.env` next to `effort` is
- * refused before anything is made.
+ * {@link buildEnv}), and `stdin` (defaults to `ignore`). A non-empty
+ * `KIMI_MODEL_THINKING_EFFORT` that the child would see (from `extraEnv` or
+ * `spawnOptions.env`) is refused beside `effort` before anything is made. On a
+ * run home pinned to an effort it is refused before that home is prepared.
  *
  * @throws {KimiSpawnError} when the binary cannot be executed. Home-assembly
  *   and option errors throw plain Errors before the child starts; a failed
@@ -482,9 +516,8 @@ export function spawnKimi<
   spawnOptions: Bun.Spawn.SpawnOptions<In, Out, Err> = {} as Bun.Spawn.SpawnOptions<In, Out, Err>,
 ): KimiSubprocess<In, Out, Err> {
   const config = checkLaunchOptions(launchOptions); // before any filesystem work
-  if (config.effort !== undefined && spawnOptions.env?.[FORCED_EFFORT_ENV] !== undefined) {
-    throw forcedEffortConflict('the spawn env');
-  }
+  const forced = forcedEffort(config.extraEnv, spawnOptions.env);
+  if (config.effort !== undefined && forced !== undefined) throw forcedEffortConflict(forced.layer);
 
   const cwd = config.cwd.length > 0 ? config.cwd : (spawnOptions.cwd ?? process.cwd());
   const ephemeral = config.home.length === 0;
@@ -497,12 +530,24 @@ export function spawnKimi<
       runSourceHome(ephemeral ? undefined : home, config.srcHome.length > 0 ? config.srcHome : undefined),
     );
     assertDistinctHomes(src, home);
-    const assembled = prepareRunHome(src, home, config.authMode, {
+    const homeOptions = {
       reassemble: config.srcHome.length > 0,
       model: config.model,
       effort: config.effort,
       adoptLegacyHome: config.adoptLegacyHome,
-    });
+    };
+    if (forced !== undefined) {
+      // The pin may come from the home's stamp, not this launch: look before any effect.
+      const pinned = previewRunHome(src, home, config.authMode, homeOptions).effort;
+      if (pinned !== null) {
+        throw new Error(
+          `run home ${home} is pinned to effort "${pinned}"; ${FORCED_EFFORT_ENV} in ${forced.layer} ` +
+            `("${forced.value}") would override it on every request of the process, resumed sessions ` +
+            'included; refusing (drop the variable, or use a home without a pinned effort)',
+        );
+      }
+    }
+    const assembled = prepareRunHome(src, home, config.authMode, homeOptions);
 
     let argvConfig = config;
     if (config.noSkills) {

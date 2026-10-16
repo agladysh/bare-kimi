@@ -19,6 +19,7 @@ import {
 import { basename, dirname, isAbsolute, join } from 'node:path';
 import { parse as parseToml } from 'smol-toml';
 import {
+  ADOPTION_RECORD,
   CREDENTIALS_MARKER,
   HOME_STAMP,
   assembleHome,
@@ -27,14 +28,19 @@ import {
   isAssembledHome,
   makeEphemeralHome,
   prepareRunHome,
+  previewRunHome,
   removeHome,
+  runSourceHome,
   shredCopiedCredentials,
   sourceHome,
+  type RunHomeOptions,
 } from './home.ts';
 import {
   ASSEMBLE_CHILD,
   CREDENTIAL_FILE,
   FAKE_TOKEN,
+  OTHER_PROVIDER_KEY,
+  addSelectableModels,
   makeSourceHome,
   makeTempDir,
   runWithDeadline,
@@ -540,16 +546,21 @@ describe('run-home ownership', () => {
     expect(isAssembledHome(dir)).toBe(false);
   });
 
-  test('a home assembled here is stamped with its canonical source', () => {
+  test('a home assembled here is stamped (version 2) with its canonical source, model and effort', () => {
     const root = temp('bare-kimi-home-');
     const src = makeSourceHome(root);
     const dst = join(root, 'run-home');
     assembleHome(src, dst);
 
-    const stamp = JSON.parse(readFileSync(join(dst, HOME_STAMP), 'utf-8'));
-    expect(stamp.version).toBe(1);
-    expect(stamp.source).toBe(realpathSync(src));
-    expect(stamp.config).toMatch(/^[0-9a-f]{64}$/);
+    // Exactly these fields: no `adopted` for a home assembled from scratch,
+    // and a null effort for one that carries the source's own [thinking].
+    expect(JSON.parse(readFileSync(join(dst, HOME_STAMP), 'utf-8'))).toStrictEqual({
+      version: 2,
+      source: realpathSync(src),
+      model: 'kimi-code/k3',
+      effort: null,
+      config: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
     expect(isAssembledHome(dst)).toBe(true);
   });
 
@@ -627,10 +638,19 @@ describe('run-home ownership', () => {
     const src = makeSourceHome(root);
     const dst = join(root, 'run-home');
     assembleHome(src, dst);
-    writeFileSync(join(dst, HOME_STAMP), '{"version":2}\n');
+    const { source, config } = JSON.parse(readFileSync(join(dst, HOME_STAMP), 'utf-8'));
 
-    expect(() => prepareRunHome(src, dst)).toThrow('is not a stamp');
-    expect(() => isAssembledHome(dst)).toThrow('is not a stamp');
+    for (const stamp of [
+      { version: 2 },
+      // A version-2 stamp always pins a model; one without is not ours.
+      { version: 2, source, config },
+      { version: 2, source, config, model: 'kimi-code/k3', effort: 3 },
+      { version: 3, source, config, model: 'kimi-code/k3', effort: null },
+    ]) {
+      writeFileSync(join(dst, HOME_STAMP), `${JSON.stringify(stamp)}\n`);
+      expect(() => prepareRunHome(src, dst)).toThrow('is not a stamp');
+      expect(() => isAssembledHome(dst)).toThrow('is not a stamp');
+    }
   });
 });
 
@@ -1013,5 +1033,816 @@ describe('ephemeral homes', () => {
     expect(existsSync(home)).toBe(false);
     expect(readFileSync(join(src, 'credentials', CREDENTIAL_FILE), 'utf-8')).toContain(FAKE_TOKEN);
     expect(existsSync(join(src, 'oauth'))).toBe(true);
+  });
+});
+
+/** The home's stamp, parsed. */
+function readStampJson(home: string): Record<string, unknown> {
+  return JSON.parse(readFileSync(join(home, HOME_STAMP), 'utf-8'));
+}
+
+/**
+ * Rewrite a home's stamp in bare-kimi 0.2's shape: version 1, the source and
+ * a settings digest, no model or effort. By default the digest is the one
+ * this candidate computed. These tests do not show that 0.2 computes the same
+ * one. That rests on a separate exercise outside this suite: a home assembled
+ * by the unchanged 0.2 implementation was reused with this candidate, the
+ * same digest was found, and the config bytes were held. Pass `config` to
+ * stamp a digest this candidate did not compute, as from a 0.2 whose digest
+ * disagrees.
+ */
+function downgradeStampToV1(home: string, config?: string): string {
+  const stamp = readStampJson(home);
+  const text = `${JSON.stringify({ version: 1, source: stamp['source'], config: config ?? stamp['config'] })}\n`;
+  writeFileSync(join(home, HOME_STAMP), text);
+  return text;
+}
+
+/** Give a home a session journal, as a run would leave one. */
+function addSession(home: string): void {
+  const wire = join(home, 'sessions', 'wd_kept_000000000000', 'session_kept', 'agents', 'main', 'wire.jsonl');
+  mkdirSync(dirname(wire), { recursive: true });
+  writeFileSync(wire, '{"type":"metadata","protocol_version":"1.5"}\n');
+}
+
+function sha256Hex(data: Uint8Array): string {
+  return createHash('sha256').update(data).digest('hex');
+}
+
+/** Insert a `[thinking]` table right after the source's root default_model line. */
+function withSourceThinking(src: string, body: string): void {
+  editConfig(src, (text) =>
+    text.replace('default_model = "kimi-code/k3"\n', `default_model = "kimi-code/k3"\n\n[thinking]\n${body}`),
+  );
+}
+
+function setSourceDefault(src: string, alias: string): void {
+  editConfig(src, (text) => text.replace('default_model = "kimi-code/k3"\n', `default_model = "${alias}"\n`));
+}
+
+describe('model selection', () => {
+  test('a selected model carries only itself and its provider; other providers and their keys stay behind', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+
+    const selected = prepareRunHome(src, join(root, 'reasoner'), 'link', { model: 'other/reasoner' });
+
+    expect(selected).toMatchObject({
+      modelAlias: 'other/reasoner',
+      provider: 'other',
+      providerType: 'openai',
+      modelId: 'reasoner-1',
+      effort: null,
+      configuredEffort: null,
+      action: 'create',
+      adopted: false,
+    });
+    const text = readFileSync(selected.configPath, 'utf-8');
+    const config = parseToml(text);
+    expect(config['default_model']).toBe('other/reasoner');
+    expect(Object.keys(config['models'] as object)).toEqual(['other/reasoner']);
+    expect(Object.keys(config['providers'] as object)).toEqual(['other']);
+    // Its overrides belong to the model and travel with it.
+    expect(text).toContain('[models."other/reasoner".overrides]');
+    expect(text).not.toContain('oauth_host');
+
+    const byDefault = prepareRunHome(src, join(root, 'default'));
+    expect(byDefault.modelAlias).toBe('kimi-code/k3');
+    const defaultText = readFileSync(byDefault.configPath, 'utf-8');
+    expect(defaultText).not.toContain(OTHER_PROVIDER_KEY);
+    expect(Object.keys(parseToml(defaultText)['models'] as object)).toEqual(['kimi-code/k3']);
+  });
+
+  test('an alias the source does not configure is refused before any effect', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    rmSync(join(src, 'oauth'), { recursive: true });
+    const dst = join(root, 'run-home');
+
+    expect(() => previewRunHome(src, dst, 'link', { model: 'kimi-code/k9' })).toThrow(
+      'model "kimi-code/k9" is not configured',
+    );
+    expect(() => prepareRunHome(src, dst, 'link', { model: 'kimi-code/k9' })).toThrow(
+      'model "kimi-code/k9" is not configured',
+    );
+    expect(existsSync(dst)).toBe(false);
+    expect(existsSync(join(src, 'oauth'))).toBe(false);
+  });
+
+  test('a kept home stays on its alias when the source default changes; a new home takes the new default', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const kept = join(root, 'kept');
+    prepareRunHome(src, kept);
+    const config = readFileSync(join(kept, 'config.toml'), 'utf-8');
+    const stamp = readFileSync(join(kept, HOME_STAMP), 'utf-8');
+    setSourceDefault(src, 'kimi-code/k3-thinking');
+
+    const reused = prepareRunHome(src, kept);
+
+    expect(reused).toMatchObject({ action: 'reuse', modelAlias: 'kimi-code/k3' });
+    // Nothing the home carries changed, so nothing is rewritten.
+    expect(readFileSync(join(kept, 'config.toml'), 'utf-8')).toBe(config);
+    expect(readFileSync(join(kept, HOME_STAMP), 'utf-8')).toBe(stamp);
+    expect(prepareRunHome(src, join(root, 'fresh')).modelAlias).toBe('kimi-code/k3-thinking');
+  });
+
+  test('a kept home refuses another alias, changing nothing; its own alias is accepted', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const kept = join(root, 'kept');
+    prepareRunHome(src, kept);
+    unlinkSync(join(kept, 'oauth'));
+    const config = readFileSync(join(kept, 'config.toml'), 'utf-8');
+    const stamp = readFileSync(join(kept, HOME_STAMP), 'utf-8');
+    const other = { model: 'other/reasoner' };
+
+    expect(() => previewRunHome(src, kept, 'link', other)).toThrow('pinned to model "kimi-code/k3"');
+    expect(() => prepareRunHome(src, kept, 'link', other)).toThrow('pinned to model "kimi-code/k3"');
+    expect(() => assembleHome(src, kept, 'link', other)).toThrow('pinned to model "kimi-code/k3"');
+
+    expect(readFileSync(join(kept, 'config.toml'), 'utf-8')).toBe(config);
+    expect(readFileSync(join(kept, HOME_STAMP), 'utf-8')).toBe(stamp);
+    expect(lstatSync(join(kept, 'oauth'), { throwIfNoEntry: false })).toBeUndefined();
+
+    expect(prepareRunHome(src, kept, 'link', { model: 'kimi-code/k3' }).action).toBe('reuse');
+    expect(readlinkSync(join(kept, 'oauth'))).toBe(join(src, 'oauth'));
+  });
+
+  test('a kept home whose alias the source no longer configures is refused rather than switched', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const kept = join(root, 'kept');
+    prepareRunHome(src, kept, 'link', { model: 'kimi-code/k3-thinking' });
+    const config = readFileSync(join(kept, 'config.toml'), 'utf-8');
+    editConfig(src, (text) => text.replace('[models."kimi-code/k3-thinking"]', '[models."kimi-code/k3-renamed"]'));
+
+    expect(() => prepareRunHome(src, kept)).toThrow('no longer configures');
+    expect(readFileSync(join(kept, 'config.toml'), 'utf-8')).toBe(config);
+  });
+});
+
+describe('effort selection', () => {
+  test('a listed effort is written into [thinking] and pinned in the stamp', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const dst = join(root, 'run-home');
+
+    const assembled = prepareRunHome(src, dst, 'link', { model: 'kimi-code/k3-thinking', effort: 'high' });
+
+    expect(assembled).toMatchObject({ modelAlias: 'kimi-code/k3-thinking', effort: 'high', configuredEffort: 'high' });
+    const text = readFileSync(assembled.configPath, 'utf-8');
+    expect(text).toContain('[thinking]\nenabled = true\neffort = "high"');
+    expect(parseToml(text)['thinking']).toEqual({ enabled: true, effort: 'high' });
+    expect(readStampJson(dst)).toMatchObject({ version: 2, model: 'kimi-code/k3-thinking', effort: 'high' });
+  });
+
+  test('off disables thinking, and is refused for a model that always thinks', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+
+    const off = prepareRunHome(src, join(root, 'off'), 'link', { model: 'kimi-code/k3-thinking', effort: 'off' });
+    expect(off).toMatchObject({ effort: 'off', configuredEffort: 'off' });
+    expect(parseToml(readFileSync(off.configPath, 'utf-8'))['thinking']).toEqual({ enabled: false });
+
+    const always = join(root, 'always');
+    expect(() => prepareRunHome(src, always, 'link', { model: 'kimi-code/k3-always', effort: 'off' })).toThrow(
+      'always thinks',
+    );
+    expect(existsSync(always)).toBe(false);
+    expect(prepareRunHome(src, always, 'link', { model: 'kimi-code/k3-always', effort: 'high' }).configuredEffort).toBe(
+      'high',
+    );
+  });
+
+  test("an override's support_efforts replace the model's own list", () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const low = join(root, 'low');
+
+    expect(prepareRunHome(src, join(root, 'max'), 'link', { model: 'other/reasoner', effort: 'max' }).effort).toBe('max');
+    // `low` is in the model's own list, not in its override's.
+    expect(() => prepareRunHome(src, low, 'link', { model: 'other/reasoner', effort: 'low' })).toThrow(
+      'support_efforts (minimal, high, max)',
+    );
+    expect(existsSync(low)).toBe(false);
+  });
+
+  test.each([
+    ['an effort the model does not list', 'max', 'is not one of model "kimi-code/k3-thinking"'],
+    ['an effort that is not a lowercase name', 'High', 'not a lowercase effort name'],
+    ['an effort with surrounding space', ' high', 'not a lowercase effort name'],
+  ])('refuses %s before any effect', (_label, effort, message) => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    rmSync(join(src, 'oauth'), { recursive: true });
+    const dst = join(root, 'run-home');
+
+    expect(() => prepareRunHome(src, dst, 'link', { model: 'kimi-code/k3-thinking', effort })).toThrow(message);
+    expect(existsSync(dst)).toBe(false);
+    expect(existsSync(join(src, 'oauth'))).toBe(false);
+  });
+
+  test('[thinking] beside a selected effort: keep is carried; forced_effort and non-scalar keys are refused', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const configPath = join(src, 'config.toml');
+    const original = readFileSync(configPath, 'utf-8');
+    const selection = { model: 'kimi-code/k3-thinking', effort: 'high' };
+    const sourceThinking = (body: string): void => {
+      writeFileSync(configPath, original);
+      withSourceThinking(src, body);
+    };
+
+    sourceThinking('enabled = true\neffort = "low"\nkeep = "all"\n');
+    const kept = prepareRunHome(src, join(root, 'keep'), 'link', selection);
+    expect(parseToml(readFileSync(kept.configPath, 'utf-8'))['thinking']).toEqual({
+      enabled: true,
+      effort: 'high',
+      keep: 'all',
+    });
+
+    sourceThinking('forced_effort = "max"\n');
+    expect(() => prepareRunHome(src, join(root, 'forced'), 'link', selection)).toThrow(
+      'would override the selected effort',
+    );
+    sourceThinking('budget = 1024\n');
+    expect(() => prepareRunHome(src, join(root, 'budget'), 'link', selection)).toThrow(
+      'cannot be carried beside a selected effort',
+    );
+    expect(existsSync(join(root, 'forced'))).toBe(false);
+    expect(existsSync(join(root, 'budget'))).toBe(false);
+  });
+
+  test("a kept home keeps its pinned effort while the source's [thinking] changes, and refuses another", () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const kept = join(root, 'kept');
+    prepareRunHome(src, kept, 'link', { model: 'kimi-code/k3-thinking', effort: 'high' });
+    withSourceThinking(src, 'enabled = true\neffort = "low"\nkeep = "all"\n');
+
+    const reused = prepareRunHome(src, kept);
+
+    expect(reused).toMatchObject({
+      action: 'reuse',
+      modelAlias: 'kimi-code/k3-thinking',
+      effort: 'high',
+      configuredEffort: 'high',
+    });
+    // The source's other [thinking] keys follow it; its effort does not.
+    const configPath = join(kept, 'config.toml');
+    expect(parseToml(readFileSync(configPath, 'utf-8'))['thinking']).toEqual({ enabled: true, effort: 'high', keep: 'all' });
+    const config = readFileSync(configPath, 'utf-8');
+    expect(() => prepareRunHome(src, kept, 'link', { effort: 'low' })).toThrow('pinned to effort "high"');
+    expect(() => prepareRunHome(src, kept, 'link', { effort: 'off' })).toThrow('pinned to effort "high"');
+    expect(readFileSync(configPath, 'utf-8')).toBe(config);
+    expect(prepareRunHome(src, kept, 'link', { effort: 'high' }).action).toBe('reuse');
+  });
+
+  test("a home made without an effort gives new sessions the source's [thinking], and refuses any explicit effort", () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    withSourceThinking(src, 'enabled = true\neffort = "low"\n');
+    const kept = join(root, 'kept');
+
+    expect(prepareRunHome(src, kept)).toMatchObject({ effort: null, configuredEffort: 'low' });
+    editConfig(src, (text) => text.replace('effort = "low"', 'effort = "high"'));
+
+    // What config.toml gives a NEW session moved with the source; the pin did
+    // not. Sessions created earlier keep "low" (see src/index.test.ts).
+    expect(prepareRunHome(src, kept)).toMatchObject({ action: 'reuse', effort: null, configuredEffort: 'high' });
+    expect(readStampJson(kept)['effort']).toBeNull();
+    // Even the effort config.toml now names: earlier sessions were created with another.
+    expect(() => prepareRunHome(src, kept, 'link', { effort: 'high' })).toThrow("pinned to the source's [thinking]");
+  });
+});
+
+/**
+ * Model declarations that kimi 2.1.0 itself writes or accepts, with only part
+ * of the thinking metadata. Evidence, from the installed 2.1.0 bundle
+ * (bounded excerpts):
+ * - custom-registry models are written with `capabilities` derived from
+ *   `reasoning` or a non-empty `support_efforts` (capabilitiesFromCustomEntry),
+ *   and with `supportEfforts: model.support_efforts`, which may be absent;
+ * - "Non-Kimi providers receive effort strings without client-side mapping"
+ *   (appendThinkingEffortConfigHint); strict thinking validation depends on
+ *   the provider type (requiresStrictThinkingValidation);
+ * - a managed model's efforts come from the provider's /models catalog
+ *   (parseThinkEfforts), which bare-kimi does not read.
+ * What the declaration excludes is refused; what it leaves open is taken and
+ * reported as `undeclared`, never refused as if unsupported.
+ */
+describe('effort selection: partial model declarations', () => {
+  function registrySource(root: string, declaration: string): string {
+    const src = makeSourceHome(root);
+    editConfig(
+      src,
+      (text) => `${text}
+[providers."registry"]
+type = "openai"
+base_url = "https://registry.example/v1"
+api_key = ""
+
+[models."registry/reasoner"]
+provider = "registry"
+model = "reasoner"
+max_context_size = 131072
+${declaration}
+`,
+    );
+    return src;
+  }
+
+  test('an openai-type model declaring thinking without support_efforts takes a selected effort, reported undeclared', () => {
+    // As native writes a registry model with `reasoning: true` and no efforts.
+    const root = temp('bare-kimi-home-');
+    const src = registrySource(root, 'capabilities = ["thinking"]');
+    const dst = join(root, 'run-home');
+
+    const assembled = prepareRunHome(src, dst, 'link', { model: 'registry/reasoner', effort: 'high' });
+
+    expect(assembled).toMatchObject({ effort: 'high', configuredEffort: 'high', effortSupport: 'undeclared' });
+    expect(parseToml(readFileSync(assembled.configPath, 'utf-8'))['thinking']).toEqual({ enabled: true, effort: 'high' });
+    expect(readStampJson(dst)).toMatchObject({ model: 'registry/reasoner', effort: 'high' });
+  });
+
+  test('an openai-type model listing support_efforts without capabilities takes a listed effort and refuses another', () => {
+    // Native derives the thinking capability from a non-empty support_efforts.
+    const root = temp('bare-kimi-home-');
+    const src = registrySource(root, 'support_efforts = ["low", "high"]');
+    const max = join(root, 'max');
+
+    const assembled = prepareRunHome(src, join(root, 'run-home'), 'link', { model: 'registry/reasoner', effort: 'high' });
+
+    expect(assembled).toMatchObject({ configuredEffort: 'high', effortSupport: 'declared' });
+    expect(() => prepareRunHome(src, max, 'link', { model: 'registry/reasoner', effort: 'max' })).toThrow(
+      'support_efforts (low, high)',
+    );
+    expect(existsSync(max)).toBe(false);
+  });
+
+  test('a model declared without thinking refuses an effort before any effect, but takes off', () => {
+    // As native writes a registry model whose rich fields omit reasoning and efforts.
+    const root = temp('bare-kimi-home-');
+    const src = registrySource(root, 'capabilities = ["tool_use", "image_in"]');
+    const dst = join(root, 'run-home');
+
+    expect(() => prepareRunHome(src, dst, 'link', { model: 'registry/reasoner', effort: 'high' })).toThrow(
+      'declared without thinking',
+    );
+    expect(existsSync(dst)).toBe(false);
+    expect(prepareRunHome(src, dst, 'link', { model: 'registry/reasoner', effort: 'off' })).toMatchObject({
+      effort: 'off',
+      effortSupport: 'declared',
+    });
+  });
+
+  test('an openai-type model declaring nothing about thinking takes an effort, reported undeclared', () => {
+    const root = temp('bare-kimi-home-');
+    const src = registrySource(root, '');
+
+    expect(
+      prepareRunHome(src, join(root, 'run-home'), 'link', { model: 'registry/reasoner', effort: 'max' }),
+    ).toMatchObject({ effort: 'max', effortSupport: 'undeclared' });
+  });
+
+  test('the managed default model, declared without capabilities or support_efforts, takes an effort, reported undeclared', () => {
+    // Its efforts are the provider catalog's, which bare-kimi does not read
+    // (no network or login reads): neither refused nor claimed as checked.
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    const dst = join(root, 'run-home');
+
+    const assembled = prepareRunHome(src, dst, 'link', { effort: 'high' });
+
+    expect(assembled).toMatchObject({
+      modelAlias: 'kimi-code/k3',
+      providerType: 'kimi',
+      effort: 'high',
+      configuredEffort: 'high',
+      effortSupport: 'undeclared',
+    });
+    expect(readStampJson(dst)).toMatchObject({ model: 'kimi-code/k3', effort: 'high' });
+    expect(prepareRunHome(src, join(root, 'off'), 'link', { effort: 'off' }).effortSupport).toBe('undeclared');
+    // Still a lowercase effort name, like any other.
+    expect(() => prepareRunHome(src, join(root, 'bad'), 'link', { effort: 'High' })).toThrow('lowercase effort name');
+  });
+
+  test('a fully declared model reports its effort as declared; no effort reports none', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+
+    expect(
+      prepareRunHome(src, join(root, 'high'), 'link', { model: 'kimi-code/k3-thinking', effort: 'high' }).effortSupport,
+    ).toBe('declared');
+    expect(prepareRunHome(src, join(root, 'none'), 'link', { model: 'kimi-code/k3-thinking' }).effortSupport).toBeNull();
+  });
+});
+
+describe('version-1 stamps (bare-kimi 0.2)', () => {
+  test('an unchanged 0.2 home is reused on its alias; its stamp is upgraded, its config.toml kept byte for byte', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    const kept = join(root, 'kept');
+    prepareRunHome(src, kept);
+    const digest = readStampJson(kept)['config'];
+    downgradeStampToV1(kept);
+    const config = readFileSync(join(kept, 'config.toml'), 'utf-8');
+    expect(isAssembledHome(kept)).toBe(true);
+    expect(runSourceHome(kept, undefined, {})).toBe(realpathSync(src));
+
+    const reused = prepareRunHome(src, kept);
+
+    expect(reused).toMatchObject({ action: 'reuse', modelAlias: 'kimi-code/k3', effort: null, adopted: false });
+    expect(readFileSync(join(kept, 'config.toml'), 'utf-8')).toBe(config);
+    expect(readStampJson(kept)).toStrictEqual({
+      version: 2,
+      source: realpathSync(src),
+      model: 'kimi-code/k3',
+      effort: null,
+      config: digest,
+    });
+  });
+
+  test('a 0.2 home stays on the alias its config.toml holds when the source default changed', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const kept = join(root, 'kept');
+    prepareRunHome(src, kept);
+    downgradeStampToV1(kept);
+    setSourceDefault(src, 'kimi-code/k3-thinking');
+
+    expect(prepareRunHome(src, kept).modelAlias).toBe('kimi-code/k3');
+
+    expect(parseToml(readFileSync(join(kept, 'config.toml'), 'utf-8'))['default_model']).toBe('kimi-code/k3');
+    expect(readStampJson(kept)).toMatchObject({ version: 2, model: 'kimi-code/k3', effort: null });
+  });
+
+  test('a 0.2 home refuses another alias, an effort, and a source that dropped its alias; its stamp stays version 1', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const kept = join(root, 'kept');
+    prepareRunHome(src, kept);
+    const v1 = downgradeStampToV1(kept);
+
+    expect(() => prepareRunHome(src, kept, 'link', { model: 'kimi-code/k3-thinking' })).toThrow(
+      'pinned to model "kimi-code/k3"',
+    );
+    expect(() => prepareRunHome(src, kept, 'link', { effort: 'off' })).toThrow("pinned to the source's [thinking]");
+    setSourceDefault(src, 'kimi-code/k3-thinking');
+    editConfig(src, (text) => text.replace('[models."kimi-code/k3"]', '[models."kimi-code/k3-retired"]'));
+    expect(() => prepareRunHome(src, kept)).toThrow('no longer configures');
+
+    expect(readFileSync(join(kept, HOME_STAMP), 'utf-8')).toBe(v1);
+  });
+
+  test('a 0.2 home whose config.toml was edited is refused, as a version-2 home is', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    const kept = join(root, 'kept');
+    prepareRunHome(src, kept);
+    const v1 = downgradeStampToV1(kept);
+    const configPath = join(kept, 'config.toml');
+    writeFileSync(configPath, readFileSync(configPath, 'utf-8').replace('max_context_size = 262144', 'max_context_size = 1'));
+
+    expect(() => prepareRunHome(src, kept)).toThrow('edited since bare-kimi wrote it');
+    expect(readFileSync(join(kept, HOME_STAMP), 'utf-8')).toBe(v1);
+  });
+
+  test('a 0.2 digest that disagrees with this one fails safe: kept while the source agrees, refused rather than switched', () => {
+    // Independent of whether 0.2 and this candidate compute the same digest.
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const kept = join(root, 'kept');
+    prepareRunHome(src, kept);
+    const config = readFileSync(join(kept, 'config.toml'), 'utf-8');
+    downgradeStampToV1(kept, 'f'.repeat(64));
+
+    expect(previewRunHome(src, kept)).toMatchObject({ action: 'reuse', modelAlias: 'kimi-code/k3' });
+    setSourceDefault(src, 'kimi-code/k3-thinking');
+    expect(() => prepareRunHome(src, kept)).toThrow('edited since bare-kimi wrote it');
+    expect(readFileSync(join(kept, 'config.toml'), 'utf-8')).toBe(config);
+    expect(readStampJson(kept)).toMatchObject({ version: 1 });
+  });
+
+  test('a 0.2 home without config.toml stays on the alias its stamp proves, even after the source default changed', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const kept = join(root, 'kept');
+    prepareRunHome(src, kept);
+    addSession(kept);
+    downgradeStampToV1(kept);
+    rmSync(join(kept, 'config.toml'));
+    setSourceDefault(src, 'kimi-code/k3-thinking');
+
+    const reused = prepareRunHome(src, kept);
+
+    // The stamp's digest covers the default_model 0.2 wrote; only k3's config reproduces it.
+    expect(reused).toMatchObject({ action: 'reuse', modelAlias: 'kimi-code/k3', effort: null });
+    expect(parseToml(readFileSync(join(kept, 'config.toml'), 'utf-8'))['default_model']).toBe('kimi-code/k3');
+    expect(readStampJson(kept)).toMatchObject({ version: 2, model: 'kimi-code/k3', effort: null });
+  });
+
+  test('a 0.2 home without config.toml whose alias cannot be proven: refused with sessions unless named; followed without', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const withSessions = join(root, 'with-sessions');
+    const withoutSessions = join(root, 'without-sessions');
+    for (const home of [withSessions, withoutSessions]) prepareRunHome(src, home);
+    addSession(withSessions);
+    const v1 = downgradeStampToV1(withSessions);
+    downgradeStampToV1(withoutSessions);
+    rmSync(join(withSessions, 'config.toml'));
+    rmSync(join(withoutSessions, 'config.toml'));
+    // A carried table changed since: no alias reproduces the stamp's digest.
+    editConfig(src, (text) => `${text}\n[[permission.rules]]\ndecision = "deny"\npattern = "Bash(rm *)"\n`);
+    setSourceDefault(src, 'kimi-code/k3-thinking');
+
+    expect(() => prepareRunHome(src, withSessions)).toThrow('the model alias its sessions are bound to is unknown');
+    expect(existsSync(join(withSessions, 'config.toml'))).toBe(false);
+    expect(readFileSync(join(withSessions, HOME_STAMP), 'utf-8')).toBe(v1);
+    expect(prepareRunHome(src, withSessions, 'link', { model: 'kimi-code/k3' })).toMatchObject({
+      action: 'reuse',
+      modelAlias: 'kimi-code/k3',
+    });
+    expect(readStampJson(withSessions)).toMatchObject({ version: 2, model: 'kimi-code/k3' });
+
+    // No session is bound to any alias: the home follows the source's default.
+    expect(prepareRunHome(src, withoutSessions).modelAlias).toBe('kimi-code/k3-thinking');
+  });
+});
+
+describe('source-home identity', () => {
+  test('a kept home names its own source; an explicit or environment source still wins', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    const kept = join(root, 'kept');
+    prepareRunHome(src, kept);
+
+    expect(runSourceHome(kept, undefined, { HOME: '/nonexistent-home' })).toBe(realpathSync(src));
+    expect(runSourceHome(kept, '/explicit', {})).toBe('/explicit');
+    expect(runSourceHome(kept, undefined, { KIMI_CODE_HOME_SOURCE: '/from-env' })).toBe('/from-env');
+    // A missing (or unstamped) home names none: the ~/.kimi-code fallback, with its refusal.
+    const missing = join(root, 'missing');
+    expect(runSourceHome(missing, undefined, { HOME: '/h' })).toBe('/h/.kimi-code');
+    expect(() => runSourceHome(missing, undefined, { HOME: '/h', KIMI_CODE_HOME: '/elsewhere' })).toThrow(
+      'KIMI_CODE_HOME is /elsewhere',
+    );
+  });
+
+  test('the same source through a symlink is the same source; an identical copy elsewhere is not', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    const kept = join(root, 'kept');
+    prepareRunHome(src, kept);
+    const alias = join(root, 'src-alias');
+    symlinkSync(src, alias, 'dir');
+
+    expect(prepareRunHome(alias, kept)).toMatchObject({ action: 'reuse', source: realpathSync(src) });
+    expect(readlinkSync(join(kept, 'credentials'))).toBe(join(src, 'credentials'));
+
+    const twin = makeSourceHome(temp('bare-kimi-other-'));
+    expect(() => prepareRunHome(twin, kept)).toThrow(`was assembled from ${realpathSync(src)}`);
+  });
+});
+
+/** The legacy session journal, relative to `sessions/`. */
+const LEGACY_SESSION = 'wd_legacy_000000000000/session_legacy/agents/main/wire.jsonl';
+
+/** A home as bare-kimi kept it before 0.2: what the assembler writes, a session, and no stamp. */
+function legacyHome(src: string, home: string, options: RunHomeOptions = {}): void {
+  prepareRunHome(src, home, 'link', options);
+  rmSync(join(home, HOME_STAMP));
+  const wire = join(home, 'sessions', LEGACY_SESSION);
+  mkdirSync(dirname(wire), { recursive: true });
+  writeFileSync(wire, '{"type":"metadata","protocol_version":"1.5"}\n');
+}
+
+describe('adopting a home kept before 0.2', () => {
+  test('refused unless asked; adopted with its evidence and sessions untouched, then reused like any stamped home', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    const home = join(root, 'legacy');
+    legacyHome(src, home);
+    const preimage = readFileSync(join(home, 'config.toml'));
+    const wire = readFileSync(join(home, 'sessions', LEGACY_SESSION));
+    editConfig(src, (text) => `${text}\n[[permission.rules]]\ndecision = "deny"\npattern = "Bash(rm *)"\n`);
+
+    expect(() => prepareRunHome(src, home)).toThrow('adoptLegacyHome');
+    expect(previewRunHome(src, home, 'link', { adoptLegacyHome: true })).toMatchObject({
+      action: 'adopt',
+      adopted: true,
+      modelAlias: 'kimi-code/k3',
+    });
+    expect(existsSync(join(home, HOME_STAMP))).toBe(false);
+    expect(existsSync(join(home, ADOPTION_RECORD))).toBe(false);
+
+    const adopted = prepareRunHome(src, home, 'link', { adoptLegacyHome: true });
+
+    expect(adopted).toMatchObject({ action: 'adopt', adopted: true, modelAlias: 'kimi-code/k3', effort: null });
+    expect(readFileSync(join(home, ADOPTION_RECORD, 'config.toml'))).toEqual(preimage);
+    const manifest = JSON.parse(readFileSync(join(home, ADOPTION_RECORD, 'manifest.json'), 'utf-8'));
+    expect(manifest).toMatchObject({
+      version: 1,
+      source: realpathSync(src),
+      model: 'kimi-code/k3',
+      configuredEffort: null,
+      config: { sha256: sha256Hex(preimage) },
+      credentials: 'link',
+      oauth: 'link',
+    });
+    // The record claims no effort for the sessions themselves.
+    expect(manifest).not.toHaveProperty('effort');
+    expect(manifest.sessions).toEqual({ [LEGACY_SESSION]: `sha256:${sha256Hex(wire)}` });
+    expect(readStampJson(home)).toStrictEqual({
+      version: 2,
+      source: realpathSync(src),
+      model: 'kimi-code/k3',
+      effort: null,
+      config: expect.stringMatching(/^[0-9a-f]{64}$/),
+      adopted: true,
+    });
+    // config.toml now follows the source, so its newer policy applies.
+    expect(readFileSync(join(home, 'config.toml'), 'utf-8')).toContain('pattern = "Bash(rm *)"');
+    expect(readFileSync(join(home, 'sessions', LEGACY_SESSION))).toEqual(wire);
+    expect(readlinkSync(join(home, 'credentials'))).toBe(join(src, 'credentials'));
+
+    expect(prepareRunHome(src, home)).toMatchObject({ action: 'reuse', adopted: true });
+  });
+
+  test("the home's own [thinking], unlike the source's, names the effort it configures for new sessions and is pinned to", () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const home = join(root, 'legacy');
+    legacyHome(src, home, { model: 'kimi-code/k3-thinking', effort: 'low' });
+
+    expect(() => prepareRunHome(src, home, 'link', { adoptLegacyHome: true, effort: 'high' })).toThrow(
+      'its config.toml configures effort "low" for new sessions',
+    );
+    expect(() => prepareRunHome(src, home, 'link', { adoptLegacyHome: true, model: 'kimi-code/k3' })).toThrow(
+      'its sessions are bound to model "kimi-code/k3-thinking"',
+    );
+    expect(existsSync(join(home, HOME_STAMP))).toBe(false);
+
+    expect(prepareRunHome(src, home, 'link', { adoptLegacyHome: true })).toMatchObject({
+      modelAlias: 'kimi-code/k3-thinking',
+      effort: 'low',
+      configuredEffort: 'low',
+    });
+    expect(readStampJson(home)).toMatchObject({ model: 'kimi-code/k3-thinking', effort: 'low', adopted: true });
+    expect(JSON.parse(readFileSync(join(home, ADOPTION_RECORD, 'manifest.json'), 'utf-8'))['configuredEffort']).toBe(
+      'low',
+    );
+    expect(() => prepareRunHome(src, home, 'link', { effort: 'high' })).toThrow('pinned to effort "low"');
+  });
+
+  test("a home on the managed default with its own effort is adopted; the pin is reported undeclared, not checked", () => {
+    // The managed default declares no efforts (its catalog does), so nothing
+    // offline shows what kimi ran its sessions at; adoption does not refuse it
+    // and does not claim it either.
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    const home = join(root, 'legacy');
+    legacyHome(src, home, { effort: 'high' });
+    const wire = readFileSync(join(home, 'sessions', LEGACY_SESSION));
+
+    const adopted = prepareRunHome(src, home, 'link', { adoptLegacyHome: true });
+
+    expect(adopted).toMatchObject({
+      action: 'adopt',
+      modelAlias: 'kimi-code/k3',
+      effort: 'high',
+      effortSupport: 'undeclared',
+      configuredEffort: 'high',
+    });
+    expect(JSON.parse(readFileSync(join(home, ADOPTION_RECORD, 'manifest.json'), 'utf-8'))).toMatchObject({
+      model: 'kimi-code/k3',
+      configuredEffort: 'high',
+    });
+    expect(readFileSync(join(home, 'sessions', LEGACY_SESSION))).toEqual(wire);
+  });
+
+  test.each<[string, (home: string, root: string) => void, string]>([
+    [
+      'credentials linked into another source',
+      (home, root) => {
+        const other = makeSourceHome(join(root, 'other'));
+        unlinkSync(join(home, 'credentials'));
+        symlinkSync(join(other, 'credentials'), join(home, 'credentials'), 'dir');
+      },
+      'its credentials link points at',
+    ],
+    [
+      "a provider table unlike the source's",
+      (home) => {
+        const configPath = join(home, 'config.toml');
+        writeFileSync(
+          configPath,
+          readFileSync(configPath, 'utf-8').replace('https://api.kimi.ai/coding/v1', 'https://elsewhere.example/v1'),
+        );
+      },
+      'differs from the one in',
+    ],
+    [
+      'a model the source does not configure',
+      (home) => {
+        const configPath = join(home, 'config.toml');
+        writeFileSync(configPath, readFileSync(configPath, 'utf-8').replaceAll('kimi-code/k3', 'kimi-code/k2'));
+      },
+      'does not configure',
+    ],
+    [
+      'a sessions entry that is not a directory',
+      (home) => {
+        rmSync(join(home, 'sessions'), { recursive: true });
+        writeFileSync(join(home, 'sessions'), 'not a directory\n');
+      },
+      'its sessions entry is not a directory',
+    ],
+    [
+      'an adoption record that does not record its config.toml',
+      (home) => {
+        mkdirSync(join(home, ADOPTION_RECORD));
+        writeFileSync(join(home, ADOPTION_RECORD, 'config.toml'), 'default_model = "other"\n');
+      },
+      "does not record this home's config.toml",
+    ],
+  ])('refuses to adopt a home with %s, leaving it as found', (_label, shape, message) => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    const home = join(root, 'legacy');
+    legacyHome(src, home);
+    shape(home, root);
+    const entries = readdirSync(home).sort();
+    const config = readFileSync(join(home, 'config.toml'), 'utf-8');
+
+    expect(() => prepareRunHome(src, home, 'link', { adoptLegacyHome: true })).toThrow(message);
+    expect(readdirSync(home).sort()).toEqual(entries);
+    expect(readFileSync(join(home, 'config.toml'), 'utf-8')).toBe(config);
+  });
+
+  test('a home named through a symlink is refused; the directory itself is adopted', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    const home = join(root, 'legacy');
+    legacyHome(src, home);
+    const alias = join(root, 'legacy-alias');
+    symlinkSync(home, alias, 'dir');
+
+    expect(() => prepareRunHome(src, alias, 'link', { adoptLegacyHome: true })).toThrow('the run-home path is a symlink');
+    expect(existsSync(join(home, HOME_STAMP))).toBe(false);
+    expect(prepareRunHome(src, home, 'link', { adoptLegacyHome: true }).action).toBe('adopt');
+  });
+
+  test('a home without credentials is adopted in copy mode only, and given a marked copy', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    const home = join(root, 'legacy');
+    legacyHome(src, home);
+    unlinkSync(join(home, 'credentials'));
+    unlinkSync(join(home, 'oauth'));
+
+    expect(() => prepareRunHome(src, home, 'link', { adoptLegacyHome: true })).toThrow('only a copy-mode home');
+    expect(existsSync(join(home, HOME_STAMP))).toBe(false);
+
+    expect(prepareRunHome(src, home, 'copy', { adoptLegacyHome: true }).action).toBe('adopt');
+    expect(JSON.parse(readFileSync(join(home, ADOPTION_RECORD, 'manifest.json'), 'utf-8'))).toMatchObject({
+      credentials: 'absent',
+      oauth: 'absent',
+    });
+    expect(existsSync(join(home, 'credentials', CREDENTIALS_MARKER))).toBe(true);
+  });
+
+  test('an interrupted adoption is completed by the next one; its record is kept, not rewritten', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    const home = join(root, 'legacy');
+    legacyHome(src, home);
+    prepareRunHome(src, home, 'link', { adoptLegacyHome: true });
+    const manifestPath = join(home, ADOPTION_RECORD, 'manifest.json');
+    const manifest = readFileSync(manifestPath, 'utf-8');
+    // As if interrupted after the record was renamed into place, before the stamp.
+    rmSync(join(home, HOME_STAMP));
+
+    expect(prepareRunHome(src, home, 'link', { adoptLegacyHome: true }).action).toBe('adopt');
+    expect(readFileSync(manifestPath, 'utf-8')).toBe(manifest);
+    expect(readStampJson(home)['adopted']).toBe(true);
   });
 });

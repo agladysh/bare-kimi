@@ -1,4 +1,4 @@
-import { accessSync, constants, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -63,6 +63,81 @@ keep = "me"
     { mode: 0o600 },
   );
   return src;
+}
+
+/** The API key of the second provider in {@link SELECTABLE_MODELS}; no run on another provider may carry it. */
+export const OTHER_PROVIDER_KEY = 'sk-other-provider-secret-0123456789';
+
+/**
+ * Models a run can select, appended to a synthetic source config: a thinking
+ * model on the managed provider, one that always thinks, and a reasoner on a
+ * second, `openai`-type provider whose table holds an API key. The
+ * reasoner's override list leaves out `low`, so an effort its own list
+ * offers is refused when the override wins.
+ */
+export const SELECTABLE_MODELS = `
+[models."kimi-code/k3-thinking"]
+provider = "managed:kimi-code"
+model = "k3-thinking"
+max_context_size = 262144
+capabilities = ["thinking", "image_in"]
+support_efforts = ["low", "medium", "high"]
+default_effort = "medium"
+
+[models."kimi-code/k3-always"]
+provider = "managed:kimi-code"
+model = "k3-always"
+max_context_size = 262144
+capabilities = ["always_thinking"]
+support_efforts = ["high"]
+
+[providers."other"]
+type = "openai"
+base_url = "https://other.example/v1"
+api_key = "${OTHER_PROVIDER_KEY}"
+
+[models."other/reasoner"]
+provider = "other"
+model = "reasoner-1"
+max_context_size = 131072
+capabilities = ["thinking"]
+support_efforts = ["low", "high"]
+
+[models."other/reasoner".overrides]
+support_efforts = ["minimal", "high", "max"]
+`;
+
+/** Append {@link SELECTABLE_MODELS} to the source home's config.toml. */
+export function addSelectableModels(src: string): void {
+  writeFileSync(join(src, 'config.toml'), SELECTABLE_MODELS, { flag: 'a' });
+}
+
+/** One run of the fake child, as written to FAKE_KIMI_SESSION_OUT. */
+export interface SessionReport {
+  readonly argv: string[];
+  readonly sessionId: string;
+  readonly resumed: boolean;
+  readonly model: string;
+  /** The effort stored with the session when it was created. */
+  readonly storedEffort: string;
+  /** The effort the run's requests use: the stored one, unless forced. */
+  readonly effectiveEffort: string;
+  /** What the run home's config.toml gives a new session at this run. */
+  readonly configuredEffort: string | null;
+}
+
+/** Every run the fake child reported to `path`, in order; empty when none ran. */
+export function readSessionReports(path: string): SessionReport[] {
+  if (!existsSync(path)) return [];
+  return readFileSync(path, 'utf-8')
+    .split('\n')
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line) as SessionReport);
+}
+
+/** `argv` holds `flag` immediately followed by `value`. */
+export function hasFlag(argv: readonly string[], flag: string, value: string): boolean {
+  return argv.some((arg, index) => arg === flag && argv[index + 1] === value);
 }
 
 export interface CliRun {
