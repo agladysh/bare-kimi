@@ -7,7 +7,7 @@ import {
   makeEphemeralHome,
   removeHome,
   runKimi,
-  sourceHome,
+  runSourceHome,
   KimiCustodyError,
   type KimiRun,
   type LaunchOptions,
@@ -148,7 +148,10 @@ export function checkPreloadOptions(options: LaunchOptions, prime?: string): voi
 /**
  * Run `options.prompt` with `items` already in context: primer run (default
  * prompt {@link DEFAULT_PRIME}) creates the session in a shared home, the
- * items are appended to its wire, and the call to action resumes it.
+ * items are appended to its wire, and the call to action resumes it. Both
+ * runs use the same run home, so they share its model and effort; the
+ * primer's options (model, effort, adoption) prepare it and the resume finds
+ * it pinned to them.
  *
  * Refuses, before any home or primer work, what {@link checkPreloadOptions}
  * refuses. If the primer fails, its KimiRun is returned as-is (nonzero code,
@@ -168,7 +171,7 @@ export async function runPreloaded(
   prime?: string,
 ): Promise<KimiRun> {
   checkPreloadOptions(options, prime);
-  const src = resolve(sourceHome(options.srcHome));
+  const src = resolve(runSourceHome(options.home, options.srcHome));
   const requested = options.home ?? '';
   const ephemeral = requested.length === 0;
   const home = ephemeral ? makeEphemeralHome() : resolve(requested);

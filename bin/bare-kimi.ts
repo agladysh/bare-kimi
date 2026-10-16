@@ -2,6 +2,7 @@
 import { readdirSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import {
+  ADOPTION_RECORD,
   checkLaunchOptions,
   EPHEMERAL_MARKER,
   exitCodeOf,
@@ -30,15 +31,25 @@ Home and auth:
   --home DIR            Use DIR as the run home (kept). DIR must be missing,
                         empty, or a home bare-kimi assembled from the same
                         source (it carries .bare-kimi-home); anything else
-                        is refused, even with a config.toml in it. An
-                        existing DIR keeps its permissions. Its config.toml
-                        follows the source: kept as is (comments too) while
-                        the settings agree, rewritten when the source
-                        changed, refused when edited to something else.
-                        Refused when it is, contains or lies inside the
-                        source home.
+                        is refused, even with a config.toml in it (but see
+                        --adopt-legacy-home). An existing DIR keeps its
+                        permissions. Its config.toml follows the source:
+                        kept as is (comments too) while the settings agree,
+                        rewritten when the source changed, refused when
+                        edited to something else. Refused when it is,
+                        contains or lies inside the source home.
+  --adopt-legacy-home   Adopt --home DIR when it is a home kept by bare-kimi
+                        before 0.2 (no .bare-kimi-home), and only when its
+                        config.toml, its credentials (links into the source,
+                        or a bare-kimi copy) and its sessions/ show it was
+                        assembled from the source. Its sessions are not
+                        changed; its original config.toml and a manifest of
+                        its session files are kept in .bare-kimi-adopted/.
+                        Its config.toml is then rewritten from the source,
+                        so the source's [permission] and [[hooks]] apply.
   --src-home DIR        Assemble/donate from DIR (default:
-                        $KIMI_CODE_HOME_SOURCE ?? ~/.kimi-code, refused when
+                        $KIMI_CODE_HOME_SOURCE, else the source a kept --home
+                        was assembled from, else ~/.kimi-code, refused when
                         KIMI_CODE_HOME names another home). Also re-donates
                         credentials in full.
                         Relative --home/--src-home resolve against the
@@ -56,11 +67,25 @@ Home and auth:
                         kept, and the run exits 4.
   --keep-home           Keep even an ephemeral (mkdtemp'd) home.
 
+Model and effort:
+  -m, --model ALIAS     Model alias the run home carries (default: the
+                        source's default_model); it must be configured in
+                        the source. Only it and its provider are carried,
+                        never the source's other models or providers. A
+                        kept --home is pinned to its model: it stays on it
+                        when the source's default changes, and refuses
+                        another, since its sessions are bound to it.
+  --effort EFFORT       Thinking effort for sessions the run home creates:
+                        one of the model's support_efforts, or off. Written
+                        into the run home's [thinking] and pinned like the
+                        model. Refused before any effect when kimi would not
+                        run it as asked. A resumed session keeps the effort
+                        it was created with.
+
 Run shape:
   --cwd DIR             Working directory (default: current). A resume must
                         happen in the session's own cwd — kimi refuses
                         cross-cwd resume.
-  -m, --model ALIAS     Model alias (default: the assembled default_model).
   --resume ID           Resume a session.
   --continue            Resume the most recent session for this cwd.
   --json                stream-json on stdout (NDJSON events).
@@ -72,7 +97,8 @@ Run shape:
   --kimi-bin PATH       kimi binary (default: $KIMI_BIN ?? kimi on PATH).
                         A relative PATH resolves against the current
                         directory.
-  --kimi-arg ARG        Forward ARG verbatim to kimi (repeatable).
+  --kimi-arg ARG        Forward ARG verbatim to kimi (repeatable; not
+                        --model or -m, which -m replaces).
                         --skills-dir, --add-dir and --kimi-arg go to kimi
                         verbatim; kimi resolves relative paths in --cwd.
   --no-process-env      Do not inherit the parent environment.
@@ -95,11 +121,11 @@ fully bare run use a cwd with no AGENTS.md up its git root.
 Environment: the child inherits this environment (unless --no-process-env)
 minus KIMI_CODE_BASE_URL, KIMI_CODE_OAUTH_HOST, KIMI_OAUTH_HOST,
 KIMI_DISABLE_OAUTH_LOCK, every KIMI_MODEL_* variable (including the
-thinking-effort overrides) and any KIMI_CODE_HOME. bare-kimi then sets
-KIMI_CODE_HOME to the run home and KIMI_CODE_HOME_SOURCE to the source home,
-and KIMI_DISABLE_TELEMETRY=1 and KIMI_CODE_NO_AUTO_UPDATE=1 unless already
-set. A dropped variable cannot be restored from the CLI (the library's
-extraEnv can, except KIMI_CODE_HOME).
+thinking-effort overrides; use --effort) and any KIMI_CODE_HOME. bare-kimi
+then sets KIMI_CODE_HOME to the run home and KIMI_CODE_HOME_SOURCE to the
+source home, and KIMI_DISABLE_TELEMETRY=1 and KIMI_CODE_NO_AUTO_UPDATE=1
+unless already set. A dropped variable cannot be restored from the CLI (the
+library's extraEnv can, except KIMI_CODE_HOME).
 
 Permissions: -p forces kimi's native auto permission mode; -y/--yolo,
 --auto and --plan conflict with -p and cannot be used. bare-kimi passes no
@@ -141,12 +167,14 @@ function parseCli(argv: string[]): Cli {
       json: { type: 'boolean', default: false },
       'output-format': { type: 'string' },
       home: { type: 'string' },
+      'adopt-legacy-home': { type: 'boolean', default: false },
       'src-home': { type: 'string' },
       auth: { type: 'string', default: 'link' },
       'keep-credentials': { type: 'boolean', default: false },
       'keep-home': { type: 'boolean', default: false },
       cwd: { type: 'string' },
       model: { type: 'string', short: 'm' },
+      effort: { type: 'string' },
       resume: { type: 'string' },
       continue: { type: 'boolean', default: false },
       'skills-dir': { type: 'string', multiple: true, default: [] },
@@ -180,10 +208,12 @@ function parseCli(argv: string[]): Cli {
       prompt: positionals.join(' '),
       cwd: values.cwd,
       home: values.home,
+      adoptLegacyHome: values['adopt-legacy-home'],
       srcHome: values['src-home'],
       authMode: auth,
       keepCredentials: values['keep-credentials'],
       model: values.model,
+      effort: values.effort,
       resume: values.resume,
       continueRecent: values.continue,
       outputFormat,
@@ -310,7 +340,13 @@ async function main(): Promise<number> {
     discardUnusedHome(madeHome);
     return error instanceof KimiSpawnError ? 127 : 2;
   }
-  const { subprocess, dispose } = launched;
+  const { subprocess, dispose, assembled } = launched;
+  if (assembled.action === 'adopt') {
+    console.error(
+      `bare-kimi: adopted ${assembled.home} as a run home; its original config.toml and a manifest ` +
+        `of its session files are kept in ${ADOPTION_RECORD}/`,
+    );
+  }
   const forward = (signal: NodeJS.Signals): void => {
     subprocess.kill(signal);
   };

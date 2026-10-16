@@ -5,8 +5,9 @@ import {
   makeEphemeralHome,
   prepareRunHome,
   removeHome,
+  runSourceHome,
   shredCopiedCredentials,
-  sourceHome,
+  type AssembledHome,
   type AuthMode,
 } from './home.ts';
 import {
@@ -16,6 +17,7 @@ import {
 } from './events.ts';
 
 export {
+  ADOPTION_RECORD,
   assembleHome,
   assertDistinctHomes,
   donateAuth,
@@ -23,7 +25,9 @@ export {
   isAssembledHome,
   makeEphemeralHome,
   prepareRunHome,
+  previewRunHome,
   removeHome,
+  runSourceHome,
   shredCopiedCredentials,
   sourceHome,
   CREDENTIALS_MARKER,
@@ -31,6 +35,7 @@ export {
   HOME_STAMP,
   type AssembledHome,
   type AuthMode,
+  type RunHomeOptions,
 } from './home.ts';
 export {
   parseStreamJson,
@@ -67,20 +72,22 @@ export interface LaunchOptions {
    * Run home. When omitted, a fresh ephemeral home is mkdtemp'd and removed
    * by dispose(). A caller-supplied home is kept. It must be missing, empty,
    * or a home bare-kimi assembled from the same source (it carries
-   * {@link HOME_STAMP}); anything else is refused before any effect. Its
+   * {@link HOME_STAMP}), or, with {@link adoptLegacyHome}, a home bare-kimi
+   * kept before 0.2; anything else is refused before any effect. Its
    * config.toml follows the source's settings: kept byte for byte (comments
    * included) while they agree, rewritten when the source changed, refused
-   * when it was edited to something else. See {@link prepareRunHome}. A
-   * relative path resolves against this process's working directory, not
-   * against `cwd`.
+   * when it was edited to something else. A kept home stays on the model and
+   * effort it is pinned to. See {@link prepareRunHome}. A relative path
+   * resolves against this process's working directory, not against `cwd`.
    */
   readonly home?: string;
   /**
    * Source home to assemble/donate from. Passing it also re-donates
    * authentication in full (an unchanged bare-kimi credential copy may be
-   * replaced). Default: `KIMI_CODE_HOME_SOURCE` ?? `~/.kimi-code`, the latter
-   * refused when an ambient `KIMI_CODE_HOME` names another home (see
-   * {@link sourceHome}). A relative path resolves like `home`.
+   * replaced). Default: `KIMI_CODE_HOME_SOURCE`, else the source a stamped
+   * `home` was assembled from, else `~/.kimi-code`, the latter refused when
+   * an ambient `KIMI_CODE_HOME` names another home (see {@link runSourceHome}).
+   * A relative path resolves like `home`.
    */
   readonly srcHome?: string;
   /**
@@ -94,8 +101,44 @@ export interface LaunchOptions {
   readonly authMode?: AuthMode;
   /** Copy mode only: keep the donated credential copy after the run (e.g. to drive the home with native `kimi` directly). */
   readonly keepCredentials?: boolean;
-  /** Model alias (`-m`). Defaults to the assembled config's default_model. */
+  /**
+   * Model alias the run home carries, and kimi's `--model`. It must be
+   * configured in the source config (`[models."<alias>"]`); only it and its
+   * provider are carried, never the source's other models or providers,
+   * whose tables may hold keys. Omitted: the alias a kept home is pinned to,
+   * else the source's default_model. A kept home is pinned to the alias it
+   * was first assembled with, because native kimi binds every session to its
+   * alias and looks the alias up again on resume: the home stays on it when
+   * the source's default_model changes, and a different alias is refused
+   * before any effect (use another home).
+   */
   readonly model?: string;
+  /**
+   * Thinking effort for the sessions this run home creates: one of the
+   * selected model's `support_efforts` (a `[models."…".overrides]` list
+   * wins, as in kimi), or `off`. Written into the run home's `[thinking]`
+   * (`enabled`, `effort`; the source's other `[thinking]` keys, such as
+   * `keep`, are kept) and recorded in its stamp; a kept home is pinned to it
+   * like the model. Omitted: a new home carries the source's `[thinking]`, a
+   * kept home keeps its pin.
+   *
+   * Native semantics (kimi 2.1.0 `-p`): a session's effort is fixed when it
+   * is created and stored with it; a resume keeps it, whatever config.toml
+   * says later. Refused before any effect: an effort the model does not
+   * list, a model without a thinking capability, `off` for a model that
+   * always thinks (kimi would silently run another effort or none), and a
+   * `KIMI_MODEL_THINKING_EFFORT` in `extraEnv` or the spawn env (a
+   * per-process override of every request, resumed ones included).
+   */
+  readonly effort?: string;
+  /**
+   * Allow `home` to be adopted when it is an unstamped home kept by
+   * bare-kimi before 0.2 and its shape shows it was assembled from the
+   * source. Its sessions are never changed; its original config.toml is
+   * kept in {@link ADOPTION_RECORD}. See {@link prepareRunHome}. Requires a
+   * caller-supplied `home`.
+   */
+  readonly adoptLegacyHome?: boolean;
   /**
    * Session id to resume (`--session`). The native CLI refuses a cross-cwd
    * resume, so `cwd` must match the session's own cwd.
@@ -134,16 +177,39 @@ export interface LaunchOptions {
    * defaults; may NOT override `KIMI_CODE_HOME`.
    */
   readonly extraEnv?: Record<string, string>;
-  /** Extra arguments forwarded verbatim to kimi, just before `-p`. */
+  /**
+   * Extra arguments forwarded verbatim to kimi, just before `-p`. They may
+   * not select a model (`--model`, `-m`): use `model`, so the run home
+   * carries it.
+   */
   readonly extraArgs?: string[];
 }
 
-export type LaunchConfig = Required<Omit<LaunchOptions, 'model' | 'resume'>> &
-  Pick<LaunchOptions, 'model' | 'resume'>;
+export type LaunchConfig = Required<Omit<LaunchOptions, 'model' | 'resume' | 'effort'>> &
+  Pick<LaunchOptions, 'model' | 'resume' | 'effort'>;
+
+/** kimi 2.1.0's per-process forced effort (`thinking.forcedEffort`). */
+const FORCED_EFFORT_ENV = 'KIMI_MODEL_THINKING_EFFORT';
+
+function forcedEffortConflict(layer: string): Error {
+  return new Error(
+    `effort conflicts with ${FORCED_EFFORT_ENV} in ${layer}: that variable forces an effort on every ` +
+      'request of the process, resumed sessions included; choose one',
+  );
+}
 
 export function LaunchConfig(o: LaunchOptions): LaunchConfig {
   if (o.resume !== undefined && o.continueRecent === true) {
     throw new Error('resume and continueRecent are mutually exclusive');
+  }
+  if (o.model !== undefined && o.model.length === 0) throw new Error('model must not be empty');
+  if (o.effort !== undefined && o.effort.length === 0) throw new Error('effort must not be empty');
+  if (o.effort !== undefined && o.extraEnv?.[FORCED_EFFORT_ENV] !== undefined) throw forcedEffortConflict('extraEnv');
+  if ((o.extraArgs ?? []).some((arg) => arg === '--model' || arg === '-m' || arg.startsWith('--model='))) {
+    throw new Error('pass the model as the model option, not in extraArgs: the run home must carry it');
+  }
+  if (o.adoptLegacyHome === true && (o.home === undefined || o.home.length === 0)) {
+    throw new Error('adoptLegacyHome needs a caller-supplied home');
   }
   return {
     prompt: o.prompt,
@@ -153,6 +219,8 @@ export function LaunchConfig(o: LaunchOptions): LaunchConfig {
     authMode: o.authMode ?? 'link',
     keepCredentials: o.keepCredentials ?? false,
     model: o.model,
+    effort: o.effort,
+    adoptLegacyHome: o.adoptLegacyHome ?? false,
     resume: o.resume,
     continueRecent: o.continueRecent ?? false,
     outputFormat: o.outputFormat ?? 'text',
@@ -179,9 +247,12 @@ export function assertSafePrompt(prompt: string): void {
 }
 
 /**
- * Every check on launch options that needs no filesystem: prompt shape and
- * option conflicts. spawnKimi runs it first; a caller that does its own setup
- * (the CLI's --keep-home) runs it before that setup.
+ * Every check on launch options that needs no filesystem: prompt shape,
+ * option conflicts, and the selection checks that need no config (an empty
+ * model or effort, an effort beside a forced one in `extraEnv`, a model in
+ * `extraArgs`, adoption without a home). spawnKimi runs it first; a caller
+ * that does its own setup (the CLI's --keep-home) runs it before that setup.
+ * Checks against the source config are {@link previewRunHome}'s.
  */
 export function checkLaunchOptions(options: LaunchOptions): LaunchConfig {
   assertSafePrompt(options.prompt);
@@ -224,11 +295,16 @@ export function buildArgv(config: LaunchConfig, kimiBin: string): string[] {
  *   covers `KIMI_MODEL_THINKING_EFFORT` and `KIMI_MODEL_THINKING_KEEP`
  *   (kimi 2.1.0 env-only overrides of the thinking effort and keep), so an
  *   ambient value cannot silently replace the `[thinking]` table the run
- *   home carries from the source config.
+ *   home carries.
  *
- * All of these can be re-added deliberately via {@link LaunchOptions.extraEnv}
- * — e.g. `{ KIMI_MODEL_THINKING_EFFORT: 'high' }` to choose an effort for one
- * run.
+ * All of these can be re-added deliberately via {@link LaunchOptions.extraEnv}.
+ * To choose an effort, use {@link LaunchOptions.effort}: it is written into
+ * the run home and stored with each new session. `KIMI_MODEL_THINKING_EFFORT`
+ * in `extraEnv` instead forces an effort on every request of that process,
+ * resumed sessions included, only on provider types that drive thinking
+ * through a trait (the `kimi` type does), and not when thinking is off
+ * (kimi 2.1.0 `resolveForcedThinkingEffort`); combining it with `effort` is
+ * refused.
  */
 export function isScrubbedEnvVar(name: string): boolean {
   return (
@@ -314,6 +390,8 @@ export interface KimiSubprocess<
   readonly subprocess: Bun.Subprocess<In, Out, Err>;
   /** The resolved, absolute run home (also the child's `KIMI_CODE_HOME`). */
   readonly home: string;
+  /** The run home as prepared: its model, effort, source, and whether it was created, reused or adopted. */
+  readonly assembled: AssembledHome;
   /** Whether spawnKimi created the home (and dispose will remove it). */
   readonly ephemeral: boolean;
   /** Working directory the child runs in. */
@@ -380,12 +458,16 @@ export class KimiCustodyError extends Error {
  *
  * The construction is factored out into {@link buildArgv} and {@link
  * buildEnv}, which are pure and individually testable; this function resolves
- * the config, prepares the home (assemble or re-donate auth) and spawns.
+ * the config and the source home (see {@link runSourceHome}), prepares the
+ * home on the selected or pinned model and effort (assemble, reuse, adopt,
+ * re-donate auth; see {@link prepareRunHome}) and spawns.
  *
  * `spawnOptions` is forwarded to `Bun.spawn` except for the fields this
  * function resolves rather than passes through: `cmd`, `cwd`
  * (`launchOptions.cwd ?? spawnOptions.cwd ?? process.cwd()`), `env` (see
- * {@link buildEnv}), and `stdin` (defaults to `ignore`).
+ * {@link buildEnv}), and `stdin` (defaults to `ignore`). A
+ * `KIMI_MODEL_THINKING_EFFORT` in `spawnOptions.env` next to `effort` is
+ * refused before anything is made.
  *
  * @throws {KimiSpawnError} when the binary cannot be executed. Home-assembly
  *   and option errors throw plain Errors before the child starts; a failed
@@ -400,6 +482,9 @@ export function spawnKimi<
   spawnOptions: Bun.Spawn.SpawnOptions<In, Out, Err> = {} as Bun.Spawn.SpawnOptions<In, Out, Err>,
 ): KimiSubprocess<In, Out, Err> {
   const config = checkLaunchOptions(launchOptions); // before any filesystem work
+  if (config.effort !== undefined && spawnOptions.env?.[FORCED_EFFORT_ENV] !== undefined) {
+    throw forcedEffortConflict('the spawn env');
+  }
 
   const cwd = config.cwd.length > 0 ? config.cwd : (spawnOptions.cwd ?? process.cwd());
   const ephemeral = config.home.length === 0;
@@ -408,9 +493,16 @@ export function spawnKimi<
   const home = ephemeral ? makeEphemeralHome() : resolvePath(config.home);
 
   try {
-    const src = resolvePath(sourceHome(config.srcHome.length > 0 ? config.srcHome : undefined));
+    const src = resolvePath(
+      runSourceHome(ephemeral ? undefined : home, config.srcHome.length > 0 ? config.srcHome : undefined),
+    );
     assertDistinctHomes(src, home);
-    prepareRunHome(src, home, config.authMode, { reassemble: config.srcHome.length > 0 });
+    const assembled = prepareRunHome(src, home, config.authMode, {
+      reassemble: config.srcHome.length > 0,
+      model: config.model,
+      effort: config.effort,
+      adoptLegacyHome: config.adoptLegacyHome,
+    });
 
     let argvConfig = config;
     if (config.noSkills) {
@@ -440,6 +532,7 @@ export function spawnKimi<
     return {
       subprocess,
       home,
+      assembled,
       ephemeral,
       cwd,
       dispose: async () => {
