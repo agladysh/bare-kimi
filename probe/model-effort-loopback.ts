@@ -69,20 +69,38 @@
  * How:
  * - A loopback HTTP server stands in for an OpenAI-compatible provider. Each
  *   case's provider lives under `/s/<case>/v1`; a request is attributed to
- *   its case by path and to the step running at the time. Steps never
- *   overlap: one ends, and its process group is shown empty, before the next
- *   starts. A request outside its case's steps makes that case `unknown`.
- *   Every request is answered with plain text and appended, with the reply,
- *   to `evidence/requests.jsonl` as it arrives.
+ *   its case by path and to the step running at the time. Steps run one at
+ *   a time: the next starts only after the step's own process group reads
+ *   empty. That group is not every descendant: one that started a session of
+ *   its own would be outside it, and a late request from it would be
+ *   attributed to the next step of the same case. A request outside its
+ *   case's steps makes that case `unknown`. Every request is answered with
+ *   plain text and appended, with the reply, to `evidence/requests.jsonl` as
+ *   it arrives. Credential-shaped headers are never stored verbatim: the
+ *   probe's dummy key is logged as `dummy`, anything else as `other:<8 hex of
+ *   its SHA-256>`, and anything else stops dispatch. The device-name header
+ *   is logged as a hash.
  * - Effort is read from the request kimi sent: every value outside
  *   `messages` and `tools` under a key matching /effort|think|reason/i (the
- *   kimi type sends `thinking: { type, effort, keep }`).
- * - Isolation is the contract of probe/native-loopback.ts: macOS
- *   `sandbox-exec` allows outbound network only to the provider port and
- *   writes only under `<custody>/root`, and denies reads of the `--deny-read`
- *   paths and of a synthetic decoy home. Paired preflight runs (unsandboxed,
- *   sandboxed, unsandboxed) must show it before kimi starts, or the probe
- *   refuses.
+ *   kimi type sends `thinking: { type, effort, keep }`). The step's own turn
+ *   is the request carrying the probe's prompt; several that disagree, or
+ *   an effort value outside the known names, make the answer `unknown`.
+ * - A step cannot answer for kimi (its answers are `unknown`) when it was
+ *   stopped (deadline, signal, or members left in its group), when kimi
+ *   reported a dropped config section, when a request of it could not be
+ *   logged or carried an unexpected credential, when it fetched the model
+ *   catalog (`/models`), when a config.toml it was given changed during it,
+ *   or when kimi exited without a request with a sandbox-like error.
+ * - Isolation (probe/isolation.ts) extends the contract of
+ *   probe/native-loopback.ts: macOS `sandbox-exec` allows outbound network
+ *   only to the provider port and writes only under `<custody>/root`, denies
+ *   reads of the `--deny-read` paths and of a synthetic decoy home, and here
+ *   also denies executing `/usr/bin/open`, `/usr/bin/security` and
+ *   `/usr/bin/osascript` and looking up the LaunchServices and SecurityServer
+ *   Mach services. Paired preflight runs (unsandboxed, sandboxed,
+ *   unsandboxed) must show the network, write, read and exec denials before
+ *   kimi starts, or the probe refuses. The Mach denial is in the profile but
+ *   not shown by the preflight.
  * - Process groups: every child leads its own group and is supervised and
  *   stopped through bare-claude's published lifecycle module
  *   (`superviseSignals`, `stopClaude`, `readProcessGroup`), which bare-kimi
@@ -90,7 +108,9 @@
  *   the verified bytes are written into custody and imported from there. A
  *   group's state is `empty`, `occupied` or `not-permitted` as that module
  *   reads it, or `unknown` when it could not be read. Anything but `empty`
- *   stops all further dispatch.
+ *   stops all further dispatch, as does a child that does not lead its own
+ *   group. Each child's pid is appended to `evidence/progress.jsonl` as soon
+ *   as it is spawned, so a probe killed outright still names what it left.
  *
  * Custody: everything the probe and the runs write lives under `--custody`,
  * which must be an existing, empty directory of the caller's, outside every
@@ -105,7 +125,7 @@
  *   verified lifecycle copy.
  * Nothing is removed except what bare-kimi's own dispose removes (the
  * ephemeral homes it made in `root/tmp`). `--max-custody-mib` is a budget for
- * the whole run: the custody tree is measured before each case, and at or
+ * the whole run: the custody tree is measured before each step, and at or
  * over it (or unmeasurable) dispatch stops. Free space is the owner's to
  * check before running. Expected allocation is small: session files,
  * request bodies of tens of KiB each, runtime caches.
@@ -119,8 +139,9 @@
  *   2  refused before kimi was launched (options, custody, lifecycle,
  *      isolation preflight)
  *   3  kimi's `--version` did not show --expect-version; no case dispatched
- *   4  dispatch stopped: a process group not shown empty, or the custody
- *      budget reached or unmeasurable
+ *   4  dispatch stopped: a process group not shown empty or not led by its
+ *      child, an unexpected credential in a request, a progress-log write
+ *      failure, or the custody budget reached or unmeasurable
  *   5  the probe failed after kimi was launched
  *   128+n  interrupted by signal n; cases not reached are `not-run`
  *
@@ -149,6 +170,7 @@ import {
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { parseArgs } from 'node:util';
 import { isMetaSessionResumeHint, isMetaSystemVersion, parseStreamJson } from '../src/events.ts';
+import { DELEGATION_EXEC, DELEGATION_MACH, EXEC_CONTROL, PREFLIGHT, droppedSections, judgeIsolation, sandboxProfile } from './isolation.ts';
 
 const SCHEMA = 'bare-kimi/model-effort-loopback/1';
 const SANDBOX_EXEC = '/usr/bin/sandbox-exec';
@@ -157,6 +179,7 @@ const BARE_KIMI_INDEX = join(SOURCE_ROOT, 'src', 'index.ts');
 /** Hashed into the report, so root can tie the run to the source it inspected. */
 const SOURCE_FILES = [
   'probe/model-effort-loopback.ts',
+  'probe/isolation.ts',
   'src/index.ts',
   'src/home.ts',
   'src/events.ts',
@@ -347,6 +370,24 @@ function groupStateNow(lc: Lifecycle, pgid: number): GroupState | 'unknown' {
 /** Runs this probe started whose group it has not yet seen empty. */
 const owned = new Map<number, StoppableRun>();
 
+/** `evidence/progress.jsonl`: spawns and finished steps, appended as they happen. Set once custody exists. */
+let progressPath = '';
+/** Progress lines that could not be written. Any stops dispatch: a spawn would go unrecorded. */
+const progressFailures: string[] = [];
+
+function logProgress(entry: Json): void {
+  const what = `${String(entry['event'])} ${String(entry['label'] ?? entry['case'] ?? '')}`;
+  if (progressPath === '') {
+    progressFailures.push(`${what}: no progress log yet`);
+    return;
+  }
+  try {
+    appendFileSync(progressPath, `${JSON.stringify(entry)}\n`);
+  } catch (error) {
+    progressFailures.push(`${what}: ${message(error)}`);
+  }
+}
+
 const SIGNAL_NUMBERS = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 } as const;
 type StopSignal = keyof typeof SIGNAL_NUMBERS;
 const interruption: { signal: StopSignal | null } = { signal: null };
@@ -364,11 +405,19 @@ function watchInterrupts(): void {
   }
 }
 
-interface ProcessRecord {
+export interface ProcessRecord {
   readonly spawnError: string | null;
   readonly pid: number | null;
   /** The group's state just after spawn, as evidence that the child leads it. */
   readonly initialGroupState: GroupState | 'unknown' | null;
+  /**
+   * `led`: the group read occupied just after spawn. `not-led`: it read
+   * empty while the child had not exited, so the child does not lead it.
+   * `exited-before-check`: it read empty and the child had already exited.
+   * Otherwise the reading itself. Anything but `led` or
+   * `exited-before-check` stops dispatch.
+   */
+  readonly leader: 'led' | 'not-led' | 'exited-before-check' | 'not-permitted' | 'unknown' | null;
   readonly deadlineHit: boolean;
   readonly exitCode: number | null;
   readonly signalCode: number | string | null;
@@ -402,6 +451,7 @@ function spawnDetached(cmd: string[], env: Record<string, string>, cwd: string, 
  */
 async function runOwned(
   lc: Lifecycle,
+  label: string,
   cmd: string[],
   env: Record<string, string>,
   cwd: string,
@@ -419,6 +469,7 @@ async function runOwned(
       spawnError: message(error),
       pid: null,
       initialGroupState: null,
+      leader: null,
       deadlineHit: false,
       exitCode: null,
       signalCode: null,
@@ -433,6 +484,15 @@ async function runOwned(
   const pid = run.subprocess.pid;
   owned.set(pid, run);
   const initialGroupState = groupStateNow(lc, pid);
+  const leader =
+    initialGroupState === 'occupied'
+      ? 'led'
+      : initialGroupState === 'empty'
+        ? run.subprocess.exitCode === null && run.subprocess.signalCode === null
+          ? 'not-led'
+          : 'exited-before-check'
+        : initialGroupState;
+  logProgress({ event: 'spawned', label, pid, initialGroupState, leader, at: now() });
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<'deadline'>((done) => {
@@ -469,6 +529,7 @@ async function runOwned(
     spawnError: null,
     pid,
     initialGroupState,
+    leader,
     deadlineHit: first === 'deadline',
     exitCode: run.subprocess.exitCode,
     signalCode: run.subprocess.signalCode,
@@ -478,6 +539,26 @@ async function runOwned(
     groupObservations: final.observations,
     groupError: groupError ?? final.error,
   };
+}
+
+/** The child led its own process group, or had already exited when that was checked. */
+function leads(run: ProcessRecord): boolean {
+  return run.leader === 'led' || run.leader === 'exited-before-check';
+}
+
+/** Where `name` first resolves on this process's PATH, for the record (nothing is run). Null when not found. */
+function onPath(name: string): string | null {
+  for (const dir of (process.env['PATH'] ?? '').split(':')) {
+    if (dir.length === 0) continue;
+    try {
+      const candidate = join(dir, name);
+      accessSync(candidate, constants.X_OK);
+      return realpathSync(candidate);
+    } catch {
+      // not in this directory
+    }
+  }
+  return null;
 }
 
 /** On the way out: stop whatever owned group still reads occupied, and say what is left. */
@@ -505,13 +586,13 @@ async function releaseOwned(lc: Lifecycle | undefined): Promise<Json[]> {
 
 // ---------------------------------------------------------------- loopback provider
 
-interface Field {
+export interface Field {
   readonly path: string;
   readonly value: unknown;
 }
 
 /** What a chat request showed, kept in memory; the full request is in requests.jsonl. */
-interface ChatSummary {
+export interface ChatSummary {
   readonly seq: number;
   readonly path: string;
   readonly model: string | null;
@@ -521,15 +602,60 @@ interface ChatSummary {
   readonly fields: readonly Field[];
 }
 
+export type RequestKind = 'chat' | 'models' | 'health' | 'not-found';
+
 interface Attributed {
+  readonly seq: number;
   readonly caseId: string;
   readonly step: string;
+  readonly kind: RequestKind;
   readonly chat: ChatSummary | null;
+  /** Credential-shaped headers that did not carry the probe's dummy key. */
+  readonly unexpectedCredentials: readonly string[];
+}
+
+interface LogFailure {
+  readonly seq: number;
+  readonly caseId: string;
+  readonly step: string;
+  readonly error: string;
 }
 
 const knownCases = new Set<string>();
 const attributed: Attributed[] = [];
-const logFailures: string[] = [];
+const logFailures: LogFailure[] = [];
+
+/** Header names that may carry a credential; their values are never stored. */
+const CREDENTIAL_HEADER = /^(authorization|proxy-authorization|cookie|set-cookie)$|api[-_]?key|token|secret|password|auth/i;
+/** Header names whose values identify the machine; stored as a hash. */
+const PRIVATE_HEADER = /^x-msh-device-name$/i;
+
+/**
+ * Headers as stored in the request log. A credential-shaped header becomes
+ * `dummy` when it is the probe's dummy key (bare or as a bearer token) and
+ * `other:<first 8 hex of its SHA-256>` otherwise; every `other` is returned
+ * in `unexpected`, and the probe stops dispatch on any. A private header
+ * becomes `sha256:<first 8 hex>`. Everything else is kept as sent.
+ */
+export function redactHeaders(headers: Readonly<Record<string, string>>): { headers: Record<string, string>; unexpected: string[] } {
+  const out: Record<string, string> = {};
+  const unexpected: string[] = [];
+  for (const [name, value] of Object.entries(headers)) {
+    if (CREDENTIAL_HEADER.test(name)) {
+      if (value === DUMMY_KEY || value === `Bearer ${DUMMY_KEY}`) {
+        out[name] = 'dummy';
+      } else {
+        out[name] = `other:${sha256(value).slice(0, 8)}`;
+        unexpected.push(name);
+      }
+    } else if (PRIVATE_HEADER.test(name)) {
+      out[name] = `sha256:${sha256(value).slice(0, 8)}`;
+    } else {
+      out[name] = value;
+    }
+  }
+  return { headers: out, unexpected };
+}
 let requestLog = '';
 let sequence = 0;
 let active: { caseId: string; stepId: string } | null = null;
@@ -592,10 +718,12 @@ async function handle(request: Request): Promise<Response> {
 
   let response: Response;
   let reply: Json;
+  let kind: RequestKind;
   let chat: ChatSummary | null = null;
   if (known && request.method === 'POST' && url.pathname.endsWith('/chat/completions')) {
+    kind = 'chat';
     response = chatResponse(body);
-    reply = { status: 200, kind: 'chat', streamed: isRecord(body) && body['stream'] === true, content: REPLY };
+    reply = { status: 200, kind, streamed: isRecord(body) && body['stream'] === true, content: REPLY };
     chat = {
       seq,
       path: url.pathname,
@@ -604,155 +732,32 @@ async function handle(request: Request): Promise<Response> {
       fields: thinkingFields(body),
     };
   } else if (url.pathname === '/health') {
+    kind = 'health';
     response = new Response('ok');
-    reply = { status: 200, kind: 'health' };
+    reply = { status: 200, kind };
   } else if (known && url.pathname.endsWith('/models')) {
+    // A catalog fetch: answered, and it makes the step unusable (see usable()).
+    kind = 'models';
     const data = ['probe-model-a', 'probe-model-b', ENV_MODEL].map((id) => ({ id, object: 'model', owned_by: 'probe' }));
     response = Response.json({ object: 'list', data });
-    reply = { status: 200, kind: 'models', ids: data.map((item) => item.id) };
+    reply = { status: 200, kind, ids: data.map((item) => item.id) };
   } else {
+    kind = 'not-found';
     response = new Response('not found', { status: 404 });
-    reply = { status: 404, kind: 'not-found' };
+    reply = { status: 404, kind };
   }
-  attributed.push({ caseId, step, chat });
-  const entry = {
-    seq,
-    at: now(),
-    case: caseId,
-    step,
-    method: request.method,
-    path: url.pathname,
-    headers: Object.fromEntries(request.headers),
-    body,
-    reply,
-  };
+  const { headers, unexpected } = redactHeaders(Object.fromEntries(request.headers));
+  attributed.push({ seq, caseId, step, kind, chat, unexpectedCredentials: unexpected });
+  const entry = { seq, at: now(), case: caseId, step, method: request.method, path: url.pathname, headers, body, reply };
   try {
     appendFileSync(requestLog, `${JSON.stringify(entry)}\n`);
   } catch (error) {
-    logFailures.push(`request ${seq}: ${message(error)}`);
+    logFailures.push({ seq, caseId, step, error: message(error) });
   }
   return response;
 }
 
-// ---------------------------------------------------------------- isolation (native-loopback.ts contract)
-
-function sandboxProfile(root: string, port: number, deniedReads: readonly string[]): string {
-  return [
-    '(version 1)',
-    '(allow default)',
-    '(deny network-outbound)',
-    `(allow network-outbound (remote ip "localhost:${port}"))`,
-    '(deny file-write*)',
-    `(allow file-write* (subpath ${JSON.stringify(root)})`,
-    '  (literal "/dev/null") (literal "/dev/zero") (literal "/dev/dtracehelper")',
-    '  (regex #"^/dev/tty") (regex #"^/dev/fd/"))',
-    ...deniedReads.map((path) => `(deny file-read* (subpath ${JSON.stringify(path)}))`),
-  ].join('\n');
-}
-
-/** The same isolation check as probe/native-loopback.ts, run unsandboxed, sandboxed, unsandboxed. */
-const PREFLIGHT = `
-const { connect } = await import('node:net');
-const { readFileSync, writeFileSync, rmSync } = await import('node:fs');
-const attempt = (host, port) => new Promise((done) => {
-  const started = Date.now();
-  const finish = (result) => done({ result, ms: Date.now() - started });
-  const socket = connect({ host, port });
-  const timer = setTimeout(() => { socket.destroy(); finish('timeout'); }, 3000);
-  socket.on('connect', () => { clearTimeout(timer); socket.destroy(); finish('connected'); });
-  socket.on('error', (error) => { clearTimeout(timer); finish(error.code ?? String(error)); });
-});
-const sandboxed = process.env.PROBE_MODE === 'sandboxed';
-const out = { mode: process.env.PROBE_MODE };
-try {
-  const response = await fetch('http://127.0.0.1:' + process.env.PROBE_PORT + '/health');
-  out.provider = (await response.text()) === 'ok';
-} catch (error) {
-  out.provider = false;
-  out.providerError = String(error);
-}
-out.providerTcp = await attempt('127.0.0.1', Number(process.env.PROBE_PORT));
-out.otherLoopback = await attempt('127.0.0.1', Number(process.env.PROBE_DECOY_PORT));
-if (sandboxed) out.egress = await attempt('192.0.2.1', 80);
-try {
-  writeFileSync(process.env.PROBE_WRITE_TARGET, 'x');
-  rmSync(process.env.PROBE_WRITE_TARGET, { force: true });
-  out.write = 'allowed';
-} catch (error) {
-  out.write = error.code ?? String(error);
-}
-try {
-  readFileSync(process.env.PROBE_DECOY_FILE);
-  out.decoyRead = 'allowed';
-} catch (error) {
-  out.decoyRead = error.code ?? String(error);
-}
-console.log(JSON.stringify(out));
-`;
-
-const DENIED = new Set(['EPERM', 'EACCES']);
-
-function connectResult(report: Json, key: string): string | undefined {
-  const value = report[key];
-  return isRecord(value) && typeof value['result'] === 'string' ? value['result'] : undefined;
-}
-
-interface IsolationVerdict {
-  readonly failures: readonly string[];
-  readonly networkDenial: string | undefined;
-  readonly networkDenialBasis: 'errno' | 'contrast' | undefined;
-}
-
-/**
- * As in probe/native-loopback.ts: the controls must reach both listeners,
- * write in the write-check directory and read the decoy; sandboxed, the
- * provider must answer, the write and the read must fail with EPERM/EACCES,
- * the decoy listener must be refused (ECONNREFUSED only through the contrast
- * with the controls), and TEST-NET-1 must fail with EPERM/EACCES or the
- * decoy's code.
- */
-function judgeIsolation(before: unknown, sandboxed: unknown, after: unknown): IsolationVerdict {
-  const failures: string[] = [];
-  for (const [label, control] of [
-    ['control before', before],
-    ['control after', after],
-  ] as const) {
-    if (!isRecord(control)) {
-      failures.push(`${label}: no report`);
-      continue;
-    }
-    if (control['provider'] !== true) failures.push(`${label}: provider did not answer`);
-    if (connectResult(control, 'providerTcp') !== 'connected') failures.push(`${label}: provider port did not connect`);
-    if (connectResult(control, 'otherLoopback') !== 'connected') failures.push(`${label}: decoy listener did not connect`);
-    if (control['write'] !== 'allowed') failures.push(`${label}: could not write in the write-check directory`);
-    if (control['decoyRead'] !== 'allowed') failures.push(`${label}: could not read the decoy file`);
-  }
-  if (!isRecord(sandboxed)) {
-    return { failures: [...failures, 'sandboxed: no report'], networkDenial: undefined, networkDenialBasis: undefined };
-  }
-  if (sandboxed['provider'] !== true) failures.push('sandboxed: provider did not answer');
-  if (connectResult(sandboxed, 'providerTcp') !== 'connected') failures.push('sandboxed: provider port did not connect');
-  if (!DENIED.has(String(sandboxed['write']))) failures.push(`sandboxed: write outside the root gave ${String(sandboxed['write'])}`);
-  if (!DENIED.has(String(sandboxed['decoyRead']))) failures.push(`sandboxed: decoy read gave ${String(sandboxed['decoyRead'])}`);
-  const controlsHeld = failures.length === 0;
-  const decoy = connectResult(sandboxed, 'otherLoopback');
-  let networkDenial: string | undefined;
-  let networkDenialBasis: 'errno' | 'contrast' | undefined;
-  if (decoy !== undefined && DENIED.has(decoy)) {
-    networkDenial = decoy;
-    networkDenialBasis = 'errno';
-  } else if (decoy === 'ECONNREFUSED' && controlsHeld) {
-    networkDenial = decoy;
-    networkDenialBasis = 'contrast';
-  } else {
-    failures.push(`sandboxed: decoy listener gave ${String(decoy)}, not shown to be a sandbox denial`);
-  }
-  const egress = connectResult(sandboxed, 'egress');
-  if (egress === undefined || !(DENIED.has(egress) || (networkDenial !== undefined && egress === networkDenial))) {
-    failures.push(`sandboxed: TEST-NET-1 gave ${String(egress)}, not the sandbox's shown denial`);
-  }
-  return { failures, networkDenial, networkDenialBasis };
-}
+// ---------------------------------------------------------------- ambient instructions
 
 /** No AGENTS.md or Git repository above `dir` (kimi would load them). An unreadable entry refuses too. */
 function assertNoAmbientInstructions(dir: string): void {
@@ -860,7 +865,7 @@ interface LibraryStep extends StepBase {
 
 type Step = NativeStep | LibraryStep;
 
-interface CaseDef {
+export interface CaseDef {
   readonly id: string;
   readonly question: string;
   readonly title: string;
@@ -886,7 +891,7 @@ const FORCED_VALUES: readonly (readonly [string, string])[] = [
 const N8_BASE = ['capabilities = ["thinking"]', 'support_efforts = ["high"]'];
 const N5_HOME = cfg('openai', [A()], effortOn('high'));
 
-const CASES: readonly CaseDef[] = [
+export const CASES: readonly CaseDef[] = [
   {
     id: 'n0-options',
     question: 'N0',
@@ -1231,19 +1236,23 @@ const CASES: readonly CaseDef[] = [
       if (!control.startsWith('inactive')) {
         return { 'control (no KIMI_MODEL_*)': control.startsWith('unknown') ? control : U(`control was ${control}`) };
       }
+      // The env provider is kimi-typed: an answer that may rest on it needs the kimi-type control.
+      const g = gate(j, 'ctl-kimi');
       return {
         'control (no KIMI_MODEL_*)': control,
-        'KIMI_MODEL_NAME + _API_KEY + _BASE_URL': activation(j.step('full')),
-        'KIMI_MODEL_NAME empty': activation(j.step('name-empty')),
-        'KIMI_MODEL_NAME whitespace': activation(j.step('name-space')),
-        'KIMI_MODEL_NAME without KIMI_MODEL_API_KEY': activation(j.step('no-key')),
+        'KIMI_MODEL_NAME + _API_KEY + _BASE_URL': g ?? activation(j.step('full')),
+        'KIMI_MODEL_NAME empty': g ?? activation(j.step('name-empty')),
+        'KIMI_MODEL_NAME whitespace': g ?? activation(j.step('name-space')),
+        'KIMI_MODEL_NAME without KIMI_MODEL_API_KEY': g ?? activation(j.step('no-key')),
         'KIMI_MODEL_THINKING_KEEP alone: model': activation(j.step('keep')),
-        'KIMI_MODEL_THINKING_KEEP alone: on the kimi-type wire': gate(j, 'ctl-kimi') ?? keepAnswer(j.step('keep')),
-        'model run with the overlay and --model probe/a': modelAnswer(j.step('full-model'), {
-          'probe-model-a': '--model wins (probe/a)',
-          [ENV_MODEL]: `overlay wins (${ENV_MODEL})`,
-        }),
-        'the overlay through bare-kimi (ephemeral, no model)': activation(j.step('w-full')),
+        'KIMI_MODEL_THINKING_KEEP alone: on the kimi-type wire': g ?? keepAnswer(j.step('keep')),
+        'model run with the overlay and --model probe/a':
+          g ??
+          modelAnswer(j.step('full-model'), {
+            'probe-model-a': '--model wins (probe/a)',
+            [ENV_MODEL]: `overlay wins (${ENV_MODEL})`,
+          }),
+        'the overlay through bare-kimi (ephemeral, no model)': g ?? activation(j.step('w-full')),
       };
     },
   },
@@ -1351,13 +1360,13 @@ const CASES: readonly CaseDef[] = [
 
 type MarkerState = 'found' | 'not-found' | 'unreadable';
 
-interface MarkerSearch {
+export interface MarkerSearch {
   readonly state: MarkerState;
   readonly where: readonly string[];
   readonly errors: readonly string[];
 }
 
-interface WrapperResult {
+export interface WrapperResult {
   readonly phase: 'refused' | 'spawn-error' | 'spawned' | 'exited' | 'no-result' | 'unreadable';
   readonly name?: unknown;
   readonly message?: string;
@@ -1366,9 +1375,12 @@ interface WrapperResult {
   readonly exitCode?: number | null;
   readonly signalCode?: unknown;
   readonly cleanup?: unknown;
+  /** SHA-256 of the run home's config.toml just after spawnKimi returned, and after kimi exited. */
+  readonly configBefore?: unknown;
+  readonly configAfter?: unknown;
 }
 
-interface StepRecord {
+export interface StepRecord {
   readonly id: string;
   readonly via: 'native' | 'library';
   readonly purpose: string;
@@ -1388,17 +1400,27 @@ interface StepRecord {
   sessionId?: string;
   systemVersion?: string;
   chats: ChatSummary[];
+  /** `/models` requests during the step: a catalog refresh may have changed what the config declares. */
+  catalogRequests: number;
+  /** Requests of the step that could not be written to the request log. */
+  logFaults: number;
+  /** Requests of the step with a credential-shaped header that was not the dummy key. */
+  credentialFaults: number;
+  /** How a config.toml the step depends on changed during it; null when none did. */
+  configChange: string | null;
   droppedSections: string[];
   markers?: Record<string, MarkerSearch>;
   helpFlags: string[];
   dir?: string;
   stdoutTail?: string;
   stderrTail?: string;
+  /** Library steps: the driver's own stderr, beside kimi's. */
+  driverStderrTail?: string;
 }
 
-type Outcome = 'observed' | 'unknown' | 'failed' | 'not-run';
+export type Outcome = 'observed' | 'unknown' | 'failed' | 'not-run';
 
-interface CaseResult {
+export interface CaseResult {
   readonly id: string;
   readonly question: string;
   readonly title: string;
@@ -1410,19 +1432,27 @@ interface CaseResult {
   readonly steps: StepRecord[];
 }
 
-interface Judging {
+export interface Judging {
   step(id: string): StepRecord;
   control(caseId: string): CaseResult | undefined;
 }
 
-const U = (why: string): string => `unknown: ${why}`;
+export const U = (why: string): string => `unknown: ${why}`;
 
 /** Why `s` cannot answer a question about kimi's turn, or undefined when it can. */
-function usable(s: StepRecord): string | undefined {
+export function usable(s: StepRecord): string | undefined {
   if (s.status === 'not-run') return `${s.id} not run: ${s.notRunReason ?? 'no reason recorded'}`;
   if (s.status === 'failed') return `${s.id} failed: ${s.failure ?? 'no reason recorded'}`;
   if (s.process?.deadlineHit === true) return `${s.id} hit its deadline`;
+  if (s.process !== undefined && s.process.stop !== null && s.process.stop !== undefined) {
+    return `${s.id} was stopped (by ${String(s.process.stoppedBy ?? 'the deadline or members left in its group')})`;
+  }
   if (s.via === 'library' && s.wrapper?.phase === 'refused') return `${s.id}: bare-kimi refused, kimi did not run`;
+  if (s.droppedSections.length > 0) return `${s.id}: kimi dropped config section(s) ${s.droppedSections.join(', ')}`;
+  if (s.logFaults > 0) return `${s.id}: ${s.logFaults} request(s) could not be logged`;
+  if (s.credentialFaults > 0) return `${s.id}: ${s.credentialFaults} request(s) carried an unexpected credential`;
+  if (s.catalogRequests > 0) return `${s.id}: ${s.catalogRequests} catalog request(s); a refresh may have changed the declared thinking`;
+  if (s.configChange !== null) return `${s.id}: ${s.configChange}`;
   return undefined;
 }
 
@@ -1431,32 +1461,78 @@ function childExit(s: StepRecord): number | null {
   return s.via === 'native' ? (s.process?.exitCode ?? null) : (s.wrapper?.exitCode ?? null);
 }
 
-function mainChat(s: StepRecord): ChatSummary | undefined {
-  return s.chats.find((chat) => chat.main);
+const SANDBOX_LIKE = /EPERM|operation not permitted|sandbox/i;
+
+/** Why a failing exit may be the sandbox's doing rather than kimi's, from the step's stderr; else undefined. */
+function sandboxLike(s: StepRecord): string | undefined {
+  const lines = `${s.stderrTail ?? ''}\n${s.driverStderrTail ?? ''}`.split('\n').filter((line) => SANDBOX_LIKE.test(line));
+  return lines.length === 0 ? undefined : `${s.id}: the exit may be the sandbox's (stderr: ${short(lines.at(-1), 240)})`;
+}
+
+export function fieldsText(fields: readonly Field[]): string {
+  return fields.length === 0 ? 'none' : fields.map((field) => `${field.path}=${JSON.stringify(field.value)}`).join(', ');
+}
+
+/** The step's own turn: the requests carrying the prompt, when they all agree on model and thinking fields. */
+export type Turn = { readonly chat: ChatSummary; readonly agreeing: number } | { readonly none: true } | { readonly why: string };
+
+export function turnOf(s: StepRecord): Turn {
+  const bad = usable(s);
+  if (bad !== undefined) return { why: bad };
+  const prompted = s.chats.filter((chat) => chat.main);
+  const first = prompted[0];
+  if (first === undefined) return { none: true };
+  const signature = (chat: ChatSummary): string => `model ${String(chat.model)}, ${fieldsText(chat.fields)}`;
+  if (prompted.some((chat) => signature(chat) !== signature(first))) {
+    const each = prompted.map((chat) => `#${chat.seq} ${signature(chat)}`).join('; ');
+    return { why: `${s.id}: ${prompted.length} prompt-bearing requests disagree (${each})` };
+  }
+  return { chat: first, agreeing: prompted.length };
+}
+
+export function mainChat(s: StepRecord): ChatSummary | undefined {
+  const turn = turnOf(s);
+  return 'chat' in turn ? turn.chat : undefined;
+}
+
+type NoTurn = { readonly exited: number; readonly stderr: string } | { readonly why: string };
+
+/** A step that ran without a turn: kimi's own failing exit, or why that is not known to be kimi's. */
+function noTurn(s: StepRecord): NoTurn {
+  const exit = childExit(s);
+  if (exit === null || exit === 0) return { why: `${s.id}: no request carrying the prompt (kimi exit ${String(exit)})` };
+  const sandbox = sandboxLike(s);
+  if (sandbox !== undefined) return { why: sandbox };
+  return { exited: exit, stderr: lastLine(s.stderrTail) };
 }
 
 function isEffortField(field: Field): boolean {
   return typeof field.value === 'string' && (EFFORT_NAMES.has(field.value) || field.value.trim().length === 0);
 }
 
-function fieldsText(fields: readonly Field[]): string {
-  return fields.length === 0 ? 'none' : fields.map((field) => `${field.path}=${JSON.stringify(field.value)}`).join(', ');
+/** The field's own key: the last path segment, without array indexes. */
+function lastSegment(path: string): string {
+  return path.replaceAll(/\[\d+\]/g, '').split('.').at(-1) ?? '';
 }
 
-type EffortRead = { readonly fields: readonly Field[] } | { readonly exited: number; readonly stderr: string } | { readonly why: string };
+export type EffortRead = { readonly fields: readonly Field[] } | NoTurn;
 
-/** The effort values of the step's own turn; or kimi's failing exit without one; or why neither is known. */
-function effortRead(s: StepRecord): EffortRead {
-  const bad = usable(s);
-  if (bad !== undefined) return { why: bad };
-  const chat = mainChat(s);
-  if (chat !== undefined) return { fields: chat.fields.filter(isEffortField) };
-  const exit = childExit(s);
-  if (exit !== null && exit !== 0) return { exited: exit, stderr: lastLine(s.stderrTail) };
-  return { why: `${s.id}: no request carrying the prompt (kimi exit ${String(exit)})` };
+/**
+ * The effort values of the step's own turn; or kimi's failing exit without
+ * one; or why neither is known. A value under an effort key that is not a
+ * known effort name (nor blank) is not taken as "not sent": what it means is
+ * not established, so the answer is unknown.
+ */
+export function effortRead(s: StepRecord): EffortRead {
+  const turn = turnOf(s);
+  if ('why' in turn) return turn;
+  if ('none' in turn) return noTurn(s);
+  const strange = turn.chat.fields.filter((field) => /effort/i.test(lastSegment(field.path)) && !isEffortField(field));
+  if (strange.length > 0) return { why: `${s.id}: unrecognized effort value ${fieldsText(strange)}` };
+  return { fields: turn.chat.fields.filter(isEffortField) };
 }
 
-function effortAnswer(s: StepRecord): string {
+export function effortAnswer(s: StepRecord): string {
   const read = effortRead(s);
   if ('why' in read) return U(read.why);
   if ('exited' in read) return `no request; kimi exited ${read.exited}: ${read.stderr}`;
@@ -1465,7 +1541,7 @@ function effortAnswer(s: StepRecord): string {
 }
 
 /** Undefined when `s` sent `effort`; otherwise why the step cannot serve as that control. */
-function requireEffort(s: StepRecord, effort: string): string | undefined {
+export function requireEffort(s: StepRecord, effort: string): string | undefined {
   const read = effortRead(s);
   if ('why' in read) return U(read.why);
   if ('exited' in read) return U(`${s.id}: kimi exited ${read.exited}`);
@@ -1473,7 +1549,7 @@ function requireEffort(s: StepRecord, effort: string): string | undefined {
 }
 
 /** Name the effort the turn sent by `labels` (key '' for none sent). */
-function effortChoice(s: StepRecord, labels: Record<string, string>): string {
+export function effortChoice(s: StepRecord, labels: Record<string, string>): string {
   const read = effortRead(s);
   if ('why' in read) return U(read.why);
   if ('exited' in read) return `no request; kimi exited ${read.exited}: ${read.stderr}`;
@@ -1484,13 +1560,12 @@ function effortChoice(s: StepRecord, labels: Record<string, string>): string {
 }
 
 /** Whether the step's turn carried the keep value, anywhere among its thinking fields. */
-function keepAnswer(s: StepRecord): string {
-  const bad = usable(s);
-  if (bad !== undefined) return U(bad);
-  const chat = mainChat(s);
-  if (chat === undefined) return U(`${s.id}: no request carrying the prompt (kimi exit ${String(childExit(s))})`);
-  const kept = chat.fields.filter((field) => field.value === KEEP_VALUE);
-  return kept.length > 0 ? `sent ${fieldsText(kept)}` : `not sent (thinking fields: ${fieldsText(chat.fields)})`;
+export function keepAnswer(s: StepRecord): string {
+  const turn = turnOf(s);
+  if ('why' in turn) return U(turn.why);
+  if ('none' in turn) return U(`${s.id}: no request carrying the prompt (kimi exit ${String(childExit(s))})`);
+  const kept = turn.chat.fields.filter((field) => field.value === KEEP_VALUE);
+  return kept.length > 0 ? `sent ${fieldsText(kept)}` : `not sent (thinking fields: ${fieldsText(turn.chat.fields)})`;
 }
 
 function controlFacts(j: Judging, effort: string): Record<string, string> {
@@ -1503,7 +1578,7 @@ function controlFacts(j: Judging, effort: string): Record<string, string> {
   return { 'effort visible, through bare-kimi': show('wrapper'), 'effort visible, kimi direct': show('native') };
 }
 
-function gate(j: Judging, controlId: string): string | undefined {
+export function gate(j: Judging, controlId: string): string | undefined {
   const control = j.control(controlId);
   if (control === undefined) return U(`control ${controlId} was not part of this run`);
   return control.outcome === 'observed' ? undefined : U(`control ${controlId} is ${control.outcome}`);
@@ -1523,16 +1598,13 @@ function resumeEffort(
   return effortChoice(j.step(resumed), { [stored]: `stored effort ("${stored}")`, [configured]: `configured effort ("${configured}")` });
 }
 
-type ModelRead = { readonly model: string | null } | { readonly exited: number; readonly stderr: string } | { readonly why: string };
+type ModelRead = { readonly model: string | null } | NoTurn;
 
 function modelRead(s: StepRecord): ModelRead {
-  const bad = usable(s);
-  if (bad !== undefined) return { why: bad };
-  const chat = mainChat(s);
-  if (chat !== undefined) return { model: chat.model };
-  const exit = childExit(s);
-  if (exit !== null && exit !== 0) return { exited: exit, stderr: lastLine(s.stderrTail) };
-  return { why: `${s.id}: no request carrying the prompt (kimi exit ${String(exit)})` };
+  const turn = turnOf(s);
+  if ('why' in turn) return turn;
+  if ('none' in turn) return noTurn(s);
+  return { model: turn.chat.model };
 }
 
 function requireModel(s: StepRecord, model: string): string | undefined {
@@ -1542,7 +1614,7 @@ function requireModel(s: StepRecord, model: string): string | undefined {
   return read.model === model ? undefined : U(`${s.id} requested ${String(read.model)}, not ${model}`);
 }
 
-function modelAnswer(s: StepRecord, labels: Record<string, string>): string {
+export function modelAnswer(s: StepRecord, labels: Record<string, string>): string {
   const read = modelRead(s);
   if ('why' in read) return U(read.why);
   if ('exited' in read) return `no request; kimi exited ${read.exited}: ${read.stderr}`;
@@ -1564,7 +1636,7 @@ function turnAnswer(s: StepRecord): string {
 }
 
 /** The subject's turn against the control's: model and effort, and the secondary marker. */
-function compareTurns(control: StepRecord, subject: StepRecord): string {
+export function compareTurns(control: StepRecord, subject: StepRecord): string {
   const base = modelRead(control);
   const baseEffort = effortRead(control);
   if ('why' in base) return U(base.why);
@@ -1586,27 +1658,26 @@ function compareTurns(control: StepRecord, subject: StepRecord): string {
   );
 }
 
-/** Whether the env model took effect in a step, from the request and the marker. */
-function activation(s: StepRecord): string {
-  const bad = usable(s);
-  if (bad !== undefined) return U(bad);
+/**
+ * Whether the env model ran in a step, decided by the captured request
+ * alone: the model it asked for. The `__kimi_env_model__` marker is reported
+ * beside it, as corroboration only. Without a captured request the answer is
+ * unknown, whatever the marker or the exit: the env provider is kimi-typed,
+ * and a missing request may be the fixture's, not kimi's.
+ */
+export function activation(s: StepRecord): string {
+  const turn = turnOf(s);
+  if ('why' in turn) return U(turn.why);
   const marker = s.markers?.[ENV_MARKER];
-  const chat = mainChat(s);
-  const model = chat?.model ?? null;
-  if (model === ENV_MODEL || marker?.state === 'found') {
-    const where = marker?.where.length ? ` in ${marker.where.map((path) => relative(s.dir ?? '', path)).join(', ')}` : '';
-    return `active (request model ${String(model)}; ${ENV_MARKER} ${marker?.state ?? 'not searched'}${where})`;
+  const where = marker?.where.length ? ` in ${marker.where.map((path) => relative(s.dir ?? '', path)).join(', ')}` : '';
+  const markerText = `${ENV_MARKER} ${marker?.state ?? 'not searched'}${where}`;
+  if ('none' in turn) {
+    return U(`no request captured (kimi exit ${String(childExit(s))}; ${markerText}; stderr: ${lastLine(s.stderrTail)})`);
   }
-  if (marker === undefined || marker.state === 'unreadable') {
-    return U(`${ENV_MARKER} search ${marker === undefined ? 'not done' : `unreadable: ${marker.errors.join('; ')}`}`);
-  }
-  if (model === 'probe-model-a') return `inactive (request model probe-model-a, no ${ENV_MARKER})`;
-  if (chat === undefined) {
-    const exit = childExit(s);
-    if (exit !== null && exit !== 0) return `no request; kimi exited ${exit}: ${lastLine(s.stderrTail)}`;
-    return U(`no request and no ${ENV_MARKER}; kimi exit ${String(exit)}`);
-  }
-  return `other: request model ${String(model)}`;
+  const model = turn.chat.model;
+  if (model === ENV_MODEL) return `active (request model ${model}; ${markerText})`;
+  if (model === 'probe-model-a') return `inactive (request model probe-model-a; ${markerText})`;
+  return `other: request model ${String(model)}; ${markerText}`;
 }
 
 function judgeOptions(s: StepRecord): Record<string, string> {
@@ -1629,9 +1700,14 @@ function describeStep(s: StepRecord): string {
   if (s.via === 'library') parts.unshift(`bare-kimi ${s.wrapper?.phase ?? 'no result'}${s.wrapper?.message ? ` (${short(s.wrapper.message, 160)})` : ''}`);
   if (s.process?.deadlineHit) parts.push('deadline hit');
   if (s.sessionId) parts.push(`session ${s.sessionId}`);
-  parts.push(`${s.chats.length} chat request(s)`);
-  const chat = mainChat(s);
-  if (chat) parts.push(`model ${String(chat.model)}`, `thinking fields ${fieldsText(chat.fields)}`);
+  parts.push(`${s.chats.length} chat request(s), ${s.chats.filter((chat) => chat.main).length} carrying the prompt`);
+  const turn = turnOf(s);
+  if ('chat' in turn) parts.push(`model ${String(turn.chat.model)}`, `thinking fields ${fieldsText(turn.chat.fields)}`);
+  else if ('why' in turn) parts.push(`turn not usable: ${turn.why}`);
+  if (s.catalogRequests > 0) parts.push(`${s.catalogRequests} catalog request(s)`);
+  if (s.configChange !== null) parts.push(s.configChange);
+  if (s.logFaults > 0) parts.push(`${s.logFaults} unlogged request(s)`);
+  if (s.credentialFaults > 0) parts.push(`${s.credentialFaults} unexpected credential(s)`);
   if (s.droppedSections.length > 0) parts.push(`dropped sections ${s.droppedSections.join(', ')}`);
   for (const [marker, found] of Object.entries(s.markers ?? {})) if (found.state !== 'not-found') parts.push(`${marker} ${found.state}`);
   return parts.join('; ');
@@ -1657,10 +1733,6 @@ function helpFlags(text: string): string[] {
   return [...new Set([...text.matchAll(/(?:^|[\s,[(|])(-{1,2}[A-Za-z][A-Za-z0-9-]*)/gm)].map((match) => match[1] ?? ''))].filter(
     (flag) => flag.length > 0,
   );
-}
-
-function droppedSections(stderr: string): string[] {
-  return [...stderr.matchAll(/Ignored invalid config section '([^']+)'/g)].map((match) => match[1] ?? '');
 }
 
 /**
@@ -1810,8 +1882,16 @@ function sourceEvidence(): Json {
 
 /** bare-kimi's spawnKimi in the sandbox, as a library caller uses it; kimi's output goes to the step's files. */
 const DRIVER = `
-const { closeSync, openSync, writeFileSync } = await import('node:fs');
+const { closeSync, openSync, readFileSync, writeFileSync } = await import('node:fs');
+const { createHash } = await import('node:crypto');
 const { spawnKimi, KimiSpawnError } = await import(process.env.PROBE_BARE_KIMI);
+const digest = (path) => {
+  try {
+    return createHash('sha256').update(readFileSync(path)).digest('hex');
+  } catch (error) {
+    return 'unreadable: ' + (error?.code ?? String(error));
+  }
+};
 const launch = JSON.parse(process.env.PROBE_LAUNCH);
 const record = (value) => writeFileSync(process.env.PROBE_RESULT, JSON.stringify(value) + '\\n');
 const text = (error) => (error instanceof Error ? error.message : String(error));
@@ -1832,16 +1912,20 @@ try {
 if (refusal !== undefined) {
   record(refusal);
 } else {
-  const base = { assembled: launched.assembled, modelOverlay: launched.modelOverlay, ephemeral: launched.ephemeral, home: launched.home };
+  // Read as soon as spawnKimi returns: kimi has only just started, so this is
+  // the config bare-kimi assembled, though not proven to precede kimi's reads.
+  const configBefore = digest(launched.assembled.configPath);
+  const base = { assembled: launched.assembled, modelOverlay: launched.modelOverlay, ephemeral: launched.ephemeral, home: launched.home, configBefore };
   record({ phase: 'spawned', ...base });
   await launched.subprocess.exited;
+  const configAfter = digest(launched.assembled.configPath);
   let cleanup = null;
   try {
     await launched.dispose();
   } catch (error) {
     cleanup = text(error);
   }
-  record({ phase: 'exited', ...base, exitCode: launched.subprocess.exitCode, signalCode: launched.subprocess.signalCode, cleanup });
+  record({ phase: 'exited', ...base, configAfter, exitCode: launched.subprocess.exitCode, signalCode: launched.subprocess.signalCode, cleanup });
 }
 `;
 
@@ -1866,6 +1950,8 @@ function readWrapperResult(path: string): WrapperResult {
         exitCode: typeof parsed['exitCode'] === 'number' ? parsed['exitCode'] : null,
         signalCode: parsed['signalCode'],
         cleanup: parsed['cleanup'],
+        configBefore: parsed['configBefore'],
+        configAfter: parsed['configAfter'],
       };
     }
     return { phase: 'unreadable', message: `unexpected result ${short(text)}` };
@@ -1930,6 +2016,8 @@ async function runStep(d: Dispatch, def: CaseDef, step: Step, record: StepRecord
   let cmd: string[];
   let env: Record<string, string>;
   let searchRoots: string[] = [stdoutPath, stderrPath];
+  /** The config.toml the step depends on, and the digest it was written with. */
+  let watched: { path: string; sha256: string } | undefined;
 
   if (step.kind === 'native') {
     const home = join(caseDir, step.home ?? 'native-home');
@@ -1939,6 +2027,7 @@ async function runStep(d: Dispatch, def: CaseDef, step: Step, record: StepRecord
       writeFileSync(join(home, 'config.toml'), text, { mode: 0o600 });
       writeFileSync(join(dir, 'config.toml'), text, { mode: 0o600 });
       record.config = { path: join(dir, 'config.toml'), sha256: sha256(text) };
+      watched = { path: join(home, 'config.toml'), sha256: sha256(text) };
     }
     const argv = [d.kimi, ...(step.args ?? [])];
     if (resume !== undefined) argv.push('--session', resume);
@@ -1959,6 +2048,7 @@ async function runStep(d: Dispatch, def: CaseDef, step: Step, record: StepRecord
     writeFileSync(join(source, 'config.toml'), text, { mode: 0o600 });
     writeFileSync(join(dir, 'source-config.toml'), text, { mode: 0o600 });
     record.config = { path: join(dir, 'source-config.toml'), sha256: sha256(text) };
+    watched = { path: join(source, 'config.toml'), sha256: sha256(text) };
     record.expectWrapper = step.expect;
     const kept = step.keptHome === undefined ? undefined : join(caseDir, step.keptHome);
     const launch: Json = {
@@ -1993,7 +2083,7 @@ async function runStep(d: Dispatch, def: CaseDef, step: Step, record: StepRecord
   const driverErr = step.kind === 'native' ? stderrPath : join(dir, 'driver.stderr.txt');
   let processRecord: ProcessRecord;
   try {
-    processRecord = await runOwned(d.lc, cmd, env, work, STEP_DEADLINE_MS, driverOut, driverErr);
+    processRecord = await runOwned(d.lc, `${def.id}/${step.id}`, cmd, env, work, STEP_DEADLINE_MS, driverOut, driverErr);
   } finally {
     active = null;
     record.endedAt = now();
@@ -2007,9 +2097,10 @@ async function runStep(d: Dispatch, def: CaseDef, step: Step, record: StepRecord
   record.status = 'ran';
   if (step.kind === 'library') {
     record.wrapper = readWrapperResult(join(dir, 'result.json'));
+    record.driverStderrTail = readText(driverErr).slice(-2000);
     if (record.wrapper.phase === 'no-result' || record.wrapper.phase === 'unreadable' || record.wrapper.phase === 'spawn-error') {
       record.status = 'failed';
-      record.failure = `driver ${record.wrapper.phase}: ${short(record.wrapper.message ?? readText(driverErr))}`;
+      record.failure = `driver ${record.wrapper.phase}: ${short(record.wrapper.message ?? record.driverStderrTail)}`;
     }
   }
   const stdout = readText(stdoutPath);
@@ -2020,16 +2111,59 @@ async function runStep(d: Dispatch, def: CaseDef, step: Step, record: StepRecord
   record.sessionId = events.find(isMetaSessionResumeHint)?.session_id;
   record.systemVersion = events.find(isMetaSystemVersion)?.version;
   if (record.sessionId !== undefined) sessions.set(step.id, record.sessionId);
-  record.droppedSections = droppedSections(stderr);
+  record.droppedSections = droppedSections(`${stdout}\n${stderr}`);
   if (step.kind === 'native' && step.print === false) record.helpFlags = helpFlags(`${stdout}\n${stderr}`);
-  record.chats = attributed
-    .filter((entry) => entry.caseId === def.id && entry.step === step.id)
-    .flatMap((entry) => (entry.chat === null ? [] : [entry.chat]));
+  const mine = attributed.filter((entry) => entry.caseId === def.id && entry.step === step.id);
+  record.chats = mine.flatMap((entry) => (entry.chat === null ? [] : [entry.chat]));
+  record.catalogRequests = mine.filter((entry) => entry.kind === 'models').length;
+  record.credentialFaults = mine.filter((entry) => entry.unexpectedCredentials.length > 0).length;
+  record.logFaults = logFailures.filter((failure) => failure.caseId === def.id && failure.step === step.id).length;
+  record.configChange = configChange(watched, record.wrapper, dir);
   record.markers = searchMarkers(searchRoots);
 }
 
+/**
+ * How a config.toml the step depends on changed while it ran, or null: the
+ * one the probe wrote (the native home's, or the source's), and for a
+ * launched library step the run home's, before and after kimi. A changed
+ * file is kept in the step directory. An unreadable digest counts as a
+ * change: it cannot be shown unchanged.
+ */
+function configChange(watched: { path: string; sha256: string } | undefined, wrapper: WrapperResult | undefined, dir: string): string | null {
+  const changes: string[] = [];
+  if (watched !== undefined) {
+    let after: string;
+    try {
+      const bytes = readFileSync(watched.path);
+      after = sha256(bytes);
+      if (after !== watched.sha256) writeFileSync(join(dir, 'config-after.toml'), bytes, { mode: 0o600 });
+    } catch (error) {
+      after = `unreadable: ${errno(error) ?? message(error)}`;
+    }
+    if (after !== watched.sha256) changes.push(`${watched.path} changed during the step (${watched.sha256.slice(0, 12)} -> ${after.slice(0, 24)})`);
+  }
+  if (wrapper?.phase === 'exited') {
+    const before = String(wrapper.configBefore);
+    const after = String(wrapper.configAfter);
+    if (before !== after || before.startsWith('unreadable')) changes.push(`run home config.toml ${before.slice(0, 24)} -> ${after.slice(0, 24)}`);
+  }
+  return changes.length === 0 ? null : changes.join('; ');
+}
+
 function newRecord(step: Step): StepRecord {
-  return { id: step.id, via: step.kind, purpose: step.purpose, status: 'not-run', chats: [], droppedSections: [], helpFlags: [] };
+  return {
+    id: step.id,
+    via: step.kind,
+    purpose: step.purpose,
+    status: 'not-run',
+    chats: [],
+    catalogRequests: 0,
+    logFaults: 0,
+    credentialFaults: 0,
+    configChange: null,
+    droppedSections: [],
+    helpFlags: [],
+  };
 }
 
 function judgeCase(def: CaseDef, result: CaseResult, results: ReadonlyMap<string, CaseResult>): void {
@@ -2086,6 +2220,12 @@ function summarize(results: readonly CaseResult[]): Json {
     facts: Object.fromEntries(results.map((result) => [result.id, result.facts])),
     wrapperMismatches: mismatches,
     requestLogFailures: logFailures,
+    progressLogFailures: progressFailures,
+    unattributedRequests: attributed.filter((entry) => entry.caseId === '(unattributed)').map((entry) => entry.seq),
+    outsideStepRequests: attributed.filter((entry) => entry.step === '(outside-step)' && entry.caseId !== '(preflight)').map((entry) => entry.seq),
+    catalogRequests: attributed.filter((entry) => entry.kind === 'models').map((entry) => entry.seq),
+    unexpectedCredentials: attributed.filter((entry) => entry.unexpectedCredentials.length > 0).map((entry) => entry.seq),
+    groupScope: "each step's own process group read empty; descendants that left it are not covered",
   };
 }
 
@@ -2096,7 +2236,7 @@ const EXIT_MEANING: Record<number, string> = {
   1: 'some case unknown, failed or not run',
   2: 'refused before kimi was launched',
   3: "kimi's --version did not show the expected version; no case dispatched",
-  4: 'dispatch stopped: a process group not shown empty, or the custody budget',
+  4: 'dispatch stopped: a process group not shown empty or not led, an unexpected credential, a progress-log fault, or the custody budget',
   5: 'probe failure after kimi was launched',
 };
 
@@ -2152,6 +2292,9 @@ async function main(): Promise<number> {
   report['custody'] = { ...layout, budgetBytes: budgetMib * 1024 * 1024 };
   requestLog = join(layout.evidence, 'requests.jsonl');
   writeFileSync(requestLog, '');
+  progressPath = join(layout.evidence, 'progress.jsonl');
+  writeFileSync(progressPath, '');
+  report['runtime'] = { bun: Bun.version, execPath: process.execPath, nodeOnPath: onPath('node') };
   assertNoAmbientInstructions(layout.root);
   const denied = [...deniedReads(values['deny-read'], [layout.custody, SOURCE_ROOT, kimi.real, process.execPath]), layout.decoyHome];
   const { lc, identity } = await loadLifecycle(lifecyclePath, lifecycleSha, layout.evidence);
@@ -2168,7 +2311,8 @@ async function main(): Promise<number> {
     const port = server.port;
     const decoyPort = decoy.port;
     if (port === undefined || decoyPort === undefined) throw new Refusal('a loopback listener has no port');
-    const profile = sandboxProfile(layout.root, port, denied);
+    const execTargets = DELEGATION_EXEC.map((target) => target.path);
+    const profile = sandboxProfile({ root: layout.root, port, deniedReads: denied, deniedExec: execTargets, deniedMach: DELEGATION_MACH });
     writeFileSync(join(layout.evidence, 'sandbox.sb'), `${profile}\n`);
     const baseEnv: Record<string, string> = {
       PATH: process.env['PATH'] ?? '/usr/bin:/bin',
@@ -2192,15 +2336,20 @@ async function main(): Promise<number> {
       PROBE_DECOY_PORT: String(decoyPort),
       PROBE_WRITE_TARGET: join(layout.writeCheck, 'write-check'),
       PROBE_DECOY_FILE: join(layout.decoyHome, 'decoy.txt'),
+      PROBE_EXEC_TARGETS: JSON.stringify(DELEGATION_EXEC),
+      PROBE_EXEC_CONTROL: EXEC_CONTROL,
     };
     const preflightGroups: Json[] = [];
     const preflight = async (name: string, mode: 'control' | 'sandboxed'): Promise<unknown> => {
       const cmd = mode === 'sandboxed' ? [SANDBOX_EXEC, '-p', profile, process.execPath, '-e', PREFLIGHT] : [process.execPath, '-e', PREFLIGHT];
       const out = join(layout.evidence, `preflight-${name}.stdout.txt`);
       const err = join(layout.evidence, `preflight-${name}.stderr.txt`);
-      const run = await runOwned(lc, cmd, { ...preflightEnv, PROBE_MODE: mode }, layout.root, PREFLIGHT_DEADLINE_MS, out, err);
-      preflightGroups.push({ name, groupState: run.groupState, spawnError: run.spawnError, deadlineHit: run.deadlineHit });
+      const run = await runOwned(lc, `preflight/${name}`, cmd, { ...preflightEnv, PROBE_MODE: mode }, layout.root, PREFLIGHT_DEADLINE_MS, out, err);
+      preflightGroups.push({ name, groupState: run.groupState, leader: run.leader, spawnError: run.spawnError, deadlineHit: run.deadlineHit });
+      // Nothing started: a refusal, not a group left behind.
+      if (run.spawnError !== null) throw new Refusal(`preflight ${name} could not start: ${run.spawnError}`);
       if (run.groupState !== 'empty') throw new Halt(`preflight ${name}: process group ${String(run.pid)} is ${run.groupState}`);
+      if (!leads(run)) throw new Halt(`preflight ${name}: the child does not lead its process group (${String(run.leader)})`);
       try {
         return JSON.parse(readText(out));
       } catch {
@@ -2210,7 +2359,7 @@ async function main(): Promise<number> {
     const before = await preflight('control-before', 'control');
     const sandboxed = await preflight('sandboxed', 'sandboxed');
     const after = await preflight('control-after', 'control');
-    const verdict = judgeIsolation(before, sandboxed, after);
+    const verdict = judgeIsolation(before, sandboxed, after, { execTargets });
     report['isolation'] = { deniedReads: denied, providerPort: port, decoyPort, preflight: { before, sandboxed, after, ...verdict }, preflightGroups };
     if (verdict.failures.length > 0) throw new Refusal(`sandbox preflight did not show isolation (kimi not launched): ${verdict.failures.join('; ')}`);
     if (interruption.signal !== null) return 128 + SIGNAL_NUMBERS[interruption.signal];
@@ -2249,6 +2398,7 @@ async function main(): Promise<number> {
     const idHome = join(layout.root, 'identity-home');
     const idRun = await runOwned(
       lc,
+      'identity/version',
       [SANDBOX_EXEC, '-p', profile, kimi.real, '--version'],
       { ...baseEnv, KIMI_CODE_HOME: idHome },
       idHome,
@@ -2260,7 +2410,9 @@ async function main(): Promise<number> {
     const escaped = expectVersion.replaceAll('.', '\\.');
     const matched = new RegExp(`(^|[^0-9.])${escaped}([^0-9.]|$)`).test(versionText);
     report['kimi'] = { ...(report['kimi'] as Json), versionOutput: short(versionText, 400), versionMatched: matched, versionRun: idRun };
+    if (idRun.spawnError !== null) throw new Refusal(`kimi --version could not start: ${idRun.spawnError}`);
     if (idRun.groupState !== 'empty') throw new Halt(`kimi --version: process group ${String(idRun.pid)} is ${idRun.groupState}`);
+    if (!leads(idRun)) throw new Halt(`kimi --version: the child does not lead its process group (${String(idRun.leader)})`);
     if (!matched) {
       for (const result of results.values()) for (const step of result.steps) step.notRunReason = 'kimi version did not match --expect-version';
       report['summary'] = summarize([...results.values()]);
@@ -2271,14 +2423,9 @@ async function main(): Promise<number> {
     const stop = (reason: string, after: string): void => {
       halted.value ??= { after, reason };
     };
-    const progress = join(layout.evidence, 'progress.jsonl');
     for (const def of selection.order) {
       const result = results.get(def.id);
       if (result === undefined) continue;
-      if (halted.value === null && interruption.signal === null) {
-        const over = checkBudget(d, def.id);
-        if (over !== undefined) stop(over, `before ${def.id}`);
-      }
       const sessions = new Map<string, string>();
       for (const [index, step] of def.steps.entries()) {
         const record = result.steps[index];
@@ -2287,16 +2434,29 @@ async function main(): Promise<number> {
           record.notRunReason = `interrupted by ${interruption.signal}`;
           continue;
         }
+        if (halted.value === null) {
+          const over = checkBudget(d, `${def.id}/${step.id}`);
+          if (over !== undefined) stop(over, `before ${def.id}/${step.id}`);
+        }
         if (halted.value !== null) {
           record.notRunReason = `dispatch stopped: ${halted.value.reason}`;
           continue;
         }
         await runStep(d, def, step, record, sessions);
-        appendFileSync(progress, `${JSON.stringify({ case: def.id, ...record })}\n`);
-        const group = record.process?.groupState;
-        if (group !== undefined && group !== 'empty' && group !== 'never-started') {
-          stop(`process group ${String(record.process?.pid)} is ${group}`, `${def.id}/${step.id}`);
+        logProgress({ event: 'step', case: def.id, ...record });
+        const label = `${def.id}/${step.id}`;
+        const run = record.process;
+        if (run !== undefined && run.groupState !== 'empty' && run.groupState !== 'never-started') {
+          stop(`process group ${String(run.pid)} is ${run.groupState}`, label);
         }
+        if (run !== undefined && run.spawnError === null && !leads(run)) {
+          stop(`the child does not lead its process group (${String(run.leader)})`, label);
+        }
+        const alarms = attributed.filter((entry) => entry.unexpectedCredentials.length > 0);
+        if (alarms.length > 0) {
+          stop(`unexpected credential-shaped header(s) in request(s) ${alarms.map((entry) => `#${entry.seq}`).join(', ')}`, label);
+        }
+        if (progressFailures.length > 0) stop(`progress log not written: ${progressFailures.join('; ')}`, label);
       }
     }
     for (const def of selection.order) {
@@ -2308,6 +2468,8 @@ async function main(): Promise<number> {
     report['summary'] = summarize([...results.values()]);
     if (interruption.signal !== null) return 128 + SIGNAL_NUMBERS[interruption.signal];
     if (halted.value !== null) return 4;
+    // A request no case can account for leaves the run's evidence incomplete.
+    if (attributed.some((entry) => entry.caseId === '(unattributed)')) return 1;
     return [...results.values()].every((result) => result.outcome === 'observed') ? 0 : 1;
   } finally {
     server.stop(true);
@@ -2339,12 +2501,15 @@ async function finish(code: number, failure: string | null): Promise<number> {
   return left.length > 0 && code < 4 ? 4 : code;
 }
 
-let code: number;
-try {
-  code = await finish(await main(), null);
-} catch (error) {
-  const kind = error instanceof Refusal ? 2 : error instanceof Halt ? 4 : 5;
-  const prefix = kind === 2 ? 'refused' : kind === 4 ? 'dispatch stopped' : 'failed';
-  code = await finish(kind, `${prefix}: ${message(error)}`);
+// Run only as a program: importing this module (the pure judging tests do) starts nothing.
+if (import.meta.main) {
+  let code: number;
+  try {
+    code = await finish(await main(), null);
+  } catch (error) {
+    const kind = error instanceof Refusal ? 2 : error instanceof Halt ? 4 : 5;
+    const prefix = kind === 2 ? 'refused' : kind === 4 ? 'dispatch stopped' : 'failed';
+    code = await finish(kind, `${prefix}: ${message(error)}`);
+  }
+  process.exit(code);
 }
-process.exit(code);
