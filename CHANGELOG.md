@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 — unreleased
+## 0.3.0 — 16 October 2026
 
 0.3.0 adds explicit model and effort selection to run homes, pins kept homes
 to the model and effort they were created with, upgrades homes kept by 0.2,
