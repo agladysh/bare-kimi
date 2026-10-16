@@ -207,6 +207,65 @@ describe('thinking off', () => {
   });
 });
 
+describe('thinking off on a wire that also sends a thinking type (the kimi type)', () => {
+  const type = (value: unknown) => effort(value, '$.thinking.type');
+  const kimiEffort = (value: unknown) => effort(value, '$.thinking.effort');
+  const sentKimi = (fields: Field[]) => step({ chats: [chat(1, 'probe-model-a', fields)] });
+
+  test('an explicit enabled type contradicts off, even with no effort value at all', () => {
+    expect(offAnswer(sentKimi([type('enabled'), effort('all', '$.thinking.keep')]), null)).toBe(
+      'thinks despite off: sent $.thinking.type="enabled" with no effort',
+    );
+    expect(offAnswer(sentKimi([type('enabled'), kimiEffort('high')]), 'none')).toStartWith('thinks despite off');
+  });
+
+  test('a disabled type, alone or with only the declared off effort, supports off', () => {
+    expect(offAnswer(sentKimi([type('disabled')]), null)).toBe('off honored: sent $.thinking.type="disabled"');
+    expect(offAnswer(sentKimi([type('disabled'), kimiEffort('none')]), 'none')).toStartWith('off honored: sent the declared off effort');
+  });
+
+  test('the declared off effort beside an enabled type is recorded as conflicting, not as off', () => {
+    const answer = offAnswer(sentKimi([type('enabled'), kimiEffort('none')]), 'none');
+    expect(answer).toStartWith('conflicting:');
+    expect(answer).not.toContain('off honored');
+  });
+
+  test('an unknown thinking type, an undeclared off value, or a blank effort stays unknown', () => {
+    expect(offAnswer(sentKimi([type('adaptive')]), null)).toStartWith('unknown:');
+    expect(offAnswer(sentKimi([type('disabled'), kimiEffort('none')]), null)).toStartWith('unknown:');
+    expect(offAnswer(sentKimi([type('disabled'), kimiEffort(' ')]), null)).toStartWith('unknown:');
+  });
+});
+
+describe('n8c-kimi-off', () => {
+  const n8c = CASES.find((def) => def.id === 'n8c-kimi-off');
+  const judge = (control: CaseResult['outcome'], steps: Record<string, StepRecord>): Record<string, string> => {
+    if (n8c === undefined) throw new Error('n8c-kimi-off is not defined');
+    return n8c.judge({
+      step: (id) => steps[id] ?? step({ id, status: 'not-run', notRunReason: 'not in this test' }),
+      control: (id) => ({ id, question: 'control', title: '', dependsOn: [], outcome: control, facts: {}, observations: {}, steps: [] }),
+    });
+  };
+  const steps = {
+    efforts: cutShort({ id: 'efforts' }),
+    'efforts-none': step({ id: 'efforts-none', chats: [chat(1, 'probe-model-a', [effort('disabled', '$.thinking.type')])] }),
+    'caps-only': step({ id: 'caps-only', chats: [chat(2, 'probe-model-a', [effort('enabled', '$.thinking.type')])] }),
+  };
+
+  test('every answer rests on the kimi-type control', () => {
+    const facts = judge('unknown', steps);
+    for (const fact of Object.values(facts)) expect(fact).toStartWith('unknown: control ctl-kimi');
+  });
+
+  test('with the control observed, each step reads its own wire', () => {
+    const facts = judge('observed', steps);
+    expect(facts['support_efforts ["low", "high"], no off_effort, off']).toStartWith('client-side failure before any request');
+    expect(facts['the same with off_effort "none", off']).toBe('off honored: sent $.thinking.type="disabled"');
+    expect(facts['capabilities ["thinking"] only, off']).toStartWith('thinks despite off');
+    expect(facts['off through bare-kimi on the first model']).toStartWith('unknown:');
+  });
+});
+
 describe('a client-side failure before any request', () => {
   test('is observed when kimi reported it, even though the deadline cut the step short, and claims no exit', () => {
     const answer = offAnswer(cutShort(), null);

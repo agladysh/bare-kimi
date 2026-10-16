@@ -65,8 +65,16 @@
  *   bare-kimi (which takes it as `undeclared`). Open: whether strict
  *   validation sends either as configured.
  *
- * A turn with thinking off counts as off honored when it sent no effort, or
- * only the off effort that same step's config declared. kimi's own
+ * - n8c-kimi-off (N8): thinking off on the strict kimi type, on ctl-kimi's
+ *   model without an off effort (the one long step), the same with
+ *   `off_effort = "none"`, and capability-only thinking; plus bare-kimi's
+ *   `off` on the first. Open: whether the kimi type needs a declared off
+ *   effort for `off` as the openai type does, or sends a disabled thinking
+ *   type without one; and what it sends with one.
+ *
+ * A turn with thinking off counts as off honored when it sent no `enabled`
+ * thinking type and no effort, or only the off effort that same step's
+ * config declared; an `enabled` type contradicts off. kimi's own
  * `turn.step.retrying` reports, in a step that sent no request of any kind,
  * are read as a client-side failure observed before the step ended; the
  * answer says whether a deadline cut it short and claims no exit not seen.
@@ -854,6 +862,8 @@ interface StepBase {
   readonly purpose: string;
   /** Resume the session an earlier step of this case created (`--session` / `resume`). */
   readonly resumeFrom?: string;
+  /** This step's deadline, when not STEP_DEADLINE_MS. */
+  readonly deadlineMs?: number;
 }
 
 interface NativeStep extends StepBase {
@@ -868,8 +878,6 @@ interface NativeStep extends StepBase {
   readonly print?: boolean;
   /** Added to the child's environment; `{PORT}` is replaced by the provider port. */
   readonly env?: Readonly<Record<string, string>>;
-  /** This step's deadline, when not STEP_DEADLINE_MS. */
-  readonly deadlineMs?: number;
 }
 
 interface LibraryStep extends StepBase {
@@ -1507,6 +1515,54 @@ export const CASES: readonly CaseDef[] = [
       };
     },
   },
+  {
+    id: 'n8c-kimi-off',
+    question: 'N8',
+    title: 'kimi type (strict validation): thinking off with and without a declared off_effort, and on capability-only thinking',
+    dependsOn: ['ctl-kimi'],
+    steps: [
+      {
+        kind: 'native',
+        id: 'efforts',
+        purpose: "ctl-kimi's model (support_efforts low, high), no off_effort, off; the one long step, to see how a failure ends",
+        config: cfg('kimi', [A()], OFF),
+        deadlineMs: TERMINAL_RETRY_DEADLINE_MS,
+      },
+      {
+        kind: 'native',
+        id: 'efforts-none',
+        purpose: 'the same model with off_effort "none", off',
+        config: cfg('kimi', [A([...THINKS, OFF_NONE])], OFF),
+        deadlineMs: SHORT_DEADLINE_MS,
+      },
+      {
+        kind: 'native',
+        id: 'caps-only',
+        purpose: 'capabilities ["thinking"] only, off',
+        config: cfg('kimi', [A(['capabilities = ["thinking"]'])], OFF),
+        deadlineMs: SHORT_DEADLINE_MS,
+      },
+      {
+        kind: 'library',
+        id: 'w-off',
+        purpose: 'bare-kimi effort "off" on the first model (its current guard takes it as declared)',
+        expect: 'launched',
+        source: cfg('kimi', [A()], null),
+        effort: 'off',
+        deadlineMs: SHORT_DEADLINE_MS,
+      },
+    ],
+    judge: (j) => {
+      // ctl-kimi is the thinking-on control: the same model sending "high" on this wire.
+      const g = gate(j, 'ctl-kimi');
+      return {
+        'support_efforts ["low", "high"], no off_effort, off': g ?? offAnswer(j.step('efforts'), null),
+        'the same with off_effort "none", off': g ?? offAnswer(j.step('efforts-none'), 'none'),
+        'capabilities ["thinking"] only, off': g ?? offAnswer(j.step('caps-only'), null),
+        'off through bare-kimi on the first model': g ?? offAnswer(j.step('w-off'), null),
+      };
+    },
+  },
 ];
 
 // ---------------------------------------------------------------- step records and judging helpers
@@ -1784,20 +1840,43 @@ export function effortChoice(s: StepRecord, labels: Record<string, string>): str
 }
 
 /**
- * What a turn configured with thinking off sent. `off honored` when it sent
- * no effort value, or only the step's own declared off effort (`declaredOff`,
- * null when the step declares none); `thinks despite off` when it sent any
- * other known effort. A client-side failure or a failing exit is reported as
- * observed; anything else not established is unknown.
+ * What a turn configured with thinking off sent, from two kinds of thinking
+ * field: effort values (see effortRead) and thinking types (a field named
+ * `type` under a thinking key, as the kimi type sends `thinking.type`).
+ * - `thinks despite off`: an explicit `type: "enabled"` with no effort, or
+ *   any known effort other than the step's own declared off effort
+ *   (`declaredOff`, null when the step declares none);
+ * - `conflicting`: only the declared off effort, but beside `type: "enabled"`;
+ *   recorded as sent, not read as off or on;
+ * - `off honored`: no `enabled` type (absent or `"disabled"`), and no effort
+ *   or only the declared off effort;
+ * - unknown: a thinking type other than `enabled`/`disabled`, a blank effort,
+ *   an unrecognized effort value, or no usable turn. Other thinking fields
+ *   (such as `keep`) do not decide it.
+ * A client-side failure or a failing exit is reported as observed.
  */
 export function offAnswer(s: StepRecord, declaredOff: string | null): string {
   const read = effortRead(s, declaredOff === null ? [] : [declaredOff]);
   if ('client' in read) return read.client;
   if ('why' in read) return U(read.why);
   if ('exited' in read) return `no request; kimi exited ${read.exited}: ${read.stderr}`;
-  if (read.fields.length === 0) return 'off honored: no effort sent';
-  if (read.fields.every((field) => field.value === declaredOff)) return `off honored: sent the declared off effort ${fieldsText(read.fields)}`;
-  return `thinks despite off: sent ${fieldsText(read.fields)}`;
+  const types = (mainChat(s)?.fields ?? []).filter((field) => lastSegment(field.path) === 'type');
+  const strangeTypes = types.filter((field) => field.value !== 'enabled' && field.value !== 'disabled');
+  if (strangeTypes.length > 0) return U(`${s.id}: unrecognized thinking type ${fieldsText(strangeTypes)}`);
+  const blank = read.fields.filter((field) => typeof field.value === 'string' && field.value.trim().length === 0);
+  if (blank.length > 0) return U(`${s.id}: blank effort value ${fieldsText(blank)}`);
+  const enabled = types.filter((field) => field.value === 'enabled');
+  const others = read.fields.filter((field) => field.value !== declaredOff);
+  if (others.length > 0) return `thinks despite off: sent ${fieldsText([...enabled, ...others])}`;
+  const declared = read.fields.length > 0 ? ` the declared off effort ${fieldsText(read.fields)}` : '';
+  if (enabled.length > 0) {
+    return declared === ''
+      ? `thinks despite off: sent ${fieldsText(enabled)} with no effort`
+      : `conflicting: sent${declared} beside ${fieldsText(enabled)}`;
+  }
+  const disabled = types.length > 0 ? `${declared === '' ? '' : ' and'} ${fieldsText(types)}` : '';
+  if (declared === '' && disabled === '') return 'off honored: no effort sent';
+  return `off honored: sent${declared}${disabled}`;
 }
 
 /**
@@ -2344,7 +2423,7 @@ async function runStep(d: Dispatch, def: CaseDef, step: Step, record: StepRecord
   const driverErr = step.kind === 'native' ? stderrPath : join(dir, 'driver.stderr.txt');
   let processRecord: ProcessRecord;
   try {
-    const deadline = step.kind === 'native' ? (step.deadlineMs ?? STEP_DEADLINE_MS) : STEP_DEADLINE_MS;
+    const deadline = step.deadlineMs ?? STEP_DEADLINE_MS;
     processRecord = await runOwned(d.lc, `${def.id}/${step.id}`, cmd, env, work, deadline, driverOut, driverErr);
   } finally {
     active = null;
