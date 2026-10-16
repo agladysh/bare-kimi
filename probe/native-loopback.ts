@@ -124,6 +124,7 @@ import { homedir, tmpdir, userInfo } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { isMetaSessionResumeHint, isMetaSystemVersion, parseStreamJson } from '../src/events.ts';
+import { PREFLIGHT, droppedSections, judgeIsolation, sandboxProfile } from './isolation.ts';
 
 const SANDBOX_EXEC = '/usr/bin/sandbox-exec';
 const BARE_KIMI = resolve(import.meta.dir, '..', 'bin', 'bare-kimi.ts');
@@ -503,71 +504,9 @@ function nativeHomes(root: string): string[] {
   return [...found];
 }
 
-function sandboxProfile(root: string, port: number, deniedReads: readonly string[]): string {
-  return [
-    '(version 1)',
-    '(allow default)',
-    '(deny network-outbound)',
-    `(allow network-outbound (remote ip "localhost:${port}"))`,
-    '(deny file-write*)',
-    `(allow file-write* (subpath ${JSON.stringify(root)})`,
-    '  (literal "/dev/null") (literal "/dev/zero") (literal "/dev/dtracehelper")',
-    '  (regex #"^/dev/tty") (regex #"^/dev/fd/"))',
-    ...deniedReads.map((path) => `(deny file-read* (subpath ${JSON.stringify(path)}))`),
-  ].join('\n');
-}
-
-/**
- * The isolation check, run three times with the same environment and the
- * same code: unsandboxed before (`PROBE_MODE=control`), sandboxed with the
- * real profile (`PROBE_MODE=sandboxed`), and unsandboxed after. Each run
- * reports, for the provider port and for a live decoy listener on another
- * loopback port, the outcome of the same raw TCP connect; whether it could
- * write a file in the write-control directory (outside the root and every
- * denied-read path, owned by the probe); and whether it could read the
- * decoy home's file. Only the sandboxed run also
- * tries TEST-NET-1 (RFC 5737, never routed). An unsandboxed run never
- * connects off the host and never reads a real home. Every connect records
- * how long it took.
- */
-const PREFLIGHT = `
-const { connect } = await import('node:net');
-const { readFileSync, writeFileSync, rmSync } = await import('node:fs');
-const attempt = (host, port) => new Promise((done) => {
-  const started = Date.now();
-  const finish = (result) => done({ result, ms: Date.now() - started });
-  const socket = connect({ host, port });
-  const timer = setTimeout(() => { socket.destroy(); finish('timeout'); }, 3000);
-  socket.on('connect', () => { clearTimeout(timer); socket.destroy(); finish('connected'); });
-  socket.on('error', (error) => { clearTimeout(timer); finish(error.code ?? String(error)); });
-});
-const sandboxed = process.env.PROBE_MODE === 'sandboxed';
-const out = { mode: process.env.PROBE_MODE };
-try {
-  const response = await fetch('http://127.0.0.1:' + process.env.PROBE_PORT + '/health');
-  out.provider = (await response.text()) === 'ok';
-} catch (error) {
-  out.provider = false;
-  out.providerError = String(error);
-}
-out.providerTcp = await attempt('127.0.0.1', Number(process.env.PROBE_PORT));
-out.otherLoopback = await attempt('127.0.0.1', Number(process.env.PROBE_DECOY_PORT));
-if (sandboxed) out.egress = await attempt('192.0.2.1', 80);
-try {
-  writeFileSync(process.env.PROBE_WRITE_TARGET, 'x');
-  rmSync(process.env.PROBE_WRITE_TARGET, { force: true });
-  out.write = 'allowed';
-} catch (error) {
-  out.write = error.code ?? String(error);
-}
-try {
-  readFileSync(process.env.PROBE_DECOY_FILE);
-  out.decoyRead = 'allowed';
-} catch (error) {
-  out.decoyRead = error.code ?? String(error);
-}
-console.log(JSON.stringify(out));
-`;
+// The sandbox profile, the preflight script and its judgement are shared
+// with probe/model-effort-loopback.ts (probe/isolation.ts). This probe passes
+// no exec or Mach denial, so its profile and preflight are as they were.
 
 /**
  * A synthetic stand-in for a real native home, created outside the probe
@@ -581,90 +520,6 @@ function makeDecoyHome(): { dir: string; file: string } {
   const file = join(dir, 'decoy.txt');
   writeFileSync(file, 'bare-kimi probe decoy: not a credential\n', { mode: 0o600 });
   return { dir, file };
-}
-
-const DENIED = new Set(['EPERM', 'EACCES']);
-
-/** A connect outcome from the preflight script: 'connected', 'timeout' or an error code. */
-function connectResult(report: Json, key: string): string | undefined {
-  const value = report[key];
-  return isRecord(value) && typeof value['result'] === 'string' ? value['result'] : undefined;
-}
-
-interface IsolationVerdict {
-  /** Why isolation is not shown; empty when it is. */
-  readonly failures: readonly string[];
-  /** How the sandbox refused the live decoy listener, when it did. */
-  readonly networkDenial: string | undefined;
-  /** `errno` when that code is a permission error; `contrast` when only the paired controls make it one. */
-  readonly networkDenialBasis: 'errno' | 'contrast' | undefined;
-}
-
-/**
- * Judge the three preflight reports.
- *
- * The unsandboxed controls, before and after, must reach both loopback
- * listeners, write in the separate write-control directory and read the
- * decoy file. Otherwise the harness itself is broken (a listener not accepting, a path not writable)
- * and no sandboxed failure can be attributed to the sandbox.
- *
- * Sandboxed, the provider must answer over HTTP and over the same raw
- * connect, and the write and the read must fail with EPERM or EACCES. The
- * live decoy listener must fail to connect:
- * - with EPERM or EACCES: a sandbox denial by its error code;
- * - with ECONNREFUSED: accepted only through the contrast. The same listener
- *   accepted the same connect just before and just after, unsandboxed, and
- *   the allowed port connected from inside the sandbox. So in this run the
- *   refusal came from the sandbox, which is how this platform was observed
- *   to report it. ECONNREFUSED is never taken as proof on its own;
- * - with anything else, or not failing: not shown.
- *
- * TEST-NET-1 cannot be controlled unsandboxed (that would be a real off-host
- * connect). It must fail with EPERM/EACCES, or with the very code the
- * sandbox was shown to give the decoy listener.
- */
-function judgeIsolation(before: unknown, sandboxed: unknown, after: unknown): IsolationVerdict {
-  const failures: string[] = [];
-  for (const [label, control] of [
-    ['control before', before],
-    ['control after', after],
-  ] as const) {
-    if (!isRecord(control)) {
-      failures.push(`${label}: no report`);
-      continue;
-    }
-    if (control['provider'] !== true) failures.push(`${label}: provider did not answer`);
-    if (connectResult(control, 'providerTcp') !== 'connected') failures.push(`${label}: provider port did not connect`);
-    if (connectResult(control, 'otherLoopback') !== 'connected') failures.push(`${label}: decoy listener did not connect`);
-    if (control['write'] !== 'allowed') failures.push(`${label}: could not write in the write-control directory`);
-    if (control['decoyRead'] !== 'allowed') failures.push(`${label}: could not read the decoy file`);
-  }
-  if (!isRecord(sandboxed)) {
-    return { failures: [...failures, 'sandboxed: no report'], networkDenial: undefined, networkDenialBasis: undefined };
-  }
-  if (sandboxed['provider'] !== true) failures.push('sandboxed: provider did not answer');
-  if (connectResult(sandboxed, 'providerTcp') !== 'connected') failures.push('sandboxed: provider port did not connect');
-  if (!DENIED.has(String(sandboxed['write']))) failures.push(`sandboxed: write outside the root gave ${String(sandboxed['write'])}`);
-  if (!DENIED.has(String(sandboxed['decoyRead']))) failures.push(`sandboxed: decoy read gave ${String(sandboxed['decoyRead'])}`);
-
-  const controlsHeld = failures.length === 0;
-  const decoy = connectResult(sandboxed, 'otherLoopback');
-  let networkDenial: string | undefined;
-  let networkDenialBasis: 'errno' | 'contrast' | undefined;
-  if (decoy !== undefined && DENIED.has(decoy)) {
-    networkDenial = decoy;
-    networkDenialBasis = 'errno';
-  } else if (decoy === 'ECONNREFUSED' && controlsHeld) {
-    networkDenial = decoy;
-    networkDenialBasis = 'contrast';
-  } else {
-    failures.push(`sandboxed: decoy listener gave ${String(decoy)}, not shown to be a sandbox denial`);
-  }
-  const egress = connectResult(sandboxed, 'egress');
-  if (egress === undefined || !(DENIED.has(egress) || (networkDenial !== undefined && egress === networkDenial))) {
-    failures.push(`sandboxed: TEST-NET-1 gave ${String(egress)}, not the sandbox's shown denial`);
-  }
-  return { failures, networkDenial, networkDenialBasis };
 }
 
 /** No AGENTS.md or Git repository above the probe's cwd: kimi would load them. */
@@ -777,11 +632,6 @@ function wireJournals(home: string): number {
     }
   }
   return count;
-}
-
-/** Config sections kimi announced it dropped as invalid. */
-function droppedSections(stderr: string): string[] {
-  return [...stderr.matchAll(/Ignored invalid config section '([^']+)'/g)].map((match) => match[1] ?? '');
 }
 
 interface Observation {
@@ -1045,7 +895,7 @@ async function main(): Promise<number> {
     const port = server.port;
     const decoyPort = decoy.port;
     if (port === undefined || decoyPort === undefined) throw new Refusal('a loopback listener has no port');
-    const profile = sandboxProfile(root, port, deniedReads);
+    const profile = sandboxProfile({ root, port, deniedReads });
     const env: Record<string, string> = {
       PATH: process.env['PATH'] ?? '/usr/bin:/bin',
       HOME: join(root, 'home'),
@@ -1084,7 +934,7 @@ async function main(): Promise<number> {
     const before = await preflightRun('control-before', 'control');
     const sandboxed = await preflightRun('sandboxed', 'sandboxed');
     const after = await preflightRun('control-after', 'control');
-    const verdict = judgeIsolation(before, sandboxed, after);
+    const verdict = judgeIsolation(before, sandboxed, after, {});
     const isolation = { before, sandboxed, after, ...verdict };
     writeFileSync(join(root, 'preflight-verdict.json'), `${JSON.stringify(isolation, null, 2)}\n`);
     if (verdict.failures.length > 0) {

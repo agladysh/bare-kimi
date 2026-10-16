@@ -4,10 +4,11 @@ import { join, resolve } from 'node:path';
 import {
   assertSafePrompt,
   checkLaunchOptions,
+  isModelOverlayVar,
   makeEphemeralHome,
   removeHome,
   runKimi,
-  sourceHome,
+  runSourceHome,
   KimiCustodyError,
   type KimiRun,
   type LaunchOptions,
@@ -132,14 +133,24 @@ export const DEFAULT_PRIME = 'Acknowledged.';
 /**
  * Every check on a preloaded run that needs no filesystem, for both of its
  * runs: the call to action and the primer prompt as in
- * {@link checkLaunchOptions}, and no `resume` / `continueRecent` — preload
- * always starts a fresh session, so either would be silently overridden.
+ * {@link checkLaunchOptions}, no env-model variable in `extraEnv` (see
+ * {@link isModelOverlayVar}; `KIMI_MODEL_THINKING_KEEP` is not one), and no
+ * `resume` / `continueRecent` — preload always starts a fresh session, so
+ * either would be silently overridden.
  * runPreloaded runs it first; a caller that does its own setup runs it before
  * that setup.
  */
 export function checkPreloadOptions(options: LaunchOptions, prime?: string): void {
   checkLaunchOptions(options);
   assertSafePrompt(prime ?? DEFAULT_PRIME);
+  const overlay = Object.keys(options.extraEnv ?? {}).find(isModelOverlayVar);
+  if (overlay !== undefined) {
+    throw new Error(
+      `${overlay} in extraEnv is an env-model variable (a non-blank KIMI_MODEL_NAME was observed to switch ` +
+        'kimi 2.1.0 to its env model and bind the session to it; the others are refused as policy); preload ' +
+        'needs one pinned model for its primer and resume',
+    );
+  }
   if (options.resume !== undefined || options.continueRecent === true) {
     throw new Error('preload starts a fresh session; it cannot be combined with resume or continue');
   }
@@ -148,7 +159,10 @@ export function checkPreloadOptions(options: LaunchOptions, prime?: string): voi
 /**
  * Run `options.prompt` with `items` already in context: primer run (default
  * prompt {@link DEFAULT_PRIME}) creates the session in a shared home, the
- * items are appended to its wire, and the call to action resumes it.
+ * items are appended to its wire, and the call to action resumes it. Both
+ * runs use the same run home, so they share its model and effort; the
+ * primer's options (model, effort, adoption) prepare it and the resume finds
+ * it pinned to them.
  *
  * Refuses, before any home or primer work, what {@link checkPreloadOptions}
  * refuses. If the primer fails, its KimiRun is returned as-is (nonzero code,
@@ -168,7 +182,7 @@ export async function runPreloaded(
   prime?: string,
 ): Promise<KimiRun> {
   checkPreloadOptions(options, prime);
-  const src = resolve(sourceHome(options.srcHome));
+  const src = resolve(runSourceHome(options.home, options.srcHome));
   const requested = options.home ?? '';
   const ephemeral = requested.length === 0;
   const home = ephemeral ? makeEphemeralHome() : resolve(requested);

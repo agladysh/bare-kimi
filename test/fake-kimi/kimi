@@ -16,8 +16,12 @@
 //                             tests can see where it landed), chmod credentials/ to
 //                             0700, write <slot>.json.tmp.<pid>.<hex> and rename it
 //                             over credentials/<slot>.json. Fake token values only.
+//   FAKE_KIMI_SESSION_OUT     emulate session model/effort binding, as bare-kimi reads
+//                             kimi 2.1.0, and append one JSON line per run to this path
+//                             (see "Session selection" below)
 //
-// Honors: -p/--prompt, --output-format, --session/--resume/-r/-S, --continue.
+// Honors: -p/--prompt, --output-format, --session/--resume/-r/-S, --continue,
+// -m/--model.
 // With KIMI_CODE_HOME set, creates a wire.jsonl per run (or requires one on
 // resume) so preload/custody tests exercise the real file layout.
 
@@ -47,12 +51,15 @@ let prompt = '';
 let outputFormat = 'text';
 let resumeId: string | undefined;
 let continueRecent = false;
+let modelArg: string | undefined;
 
 const argv = process.argv.slice(2);
 for (let i = 0; i < argv.length; i += 1) {
   const arg = argv[i]!;
   if (arg === '-p' || arg === '--prompt') {
     prompt = argv[++i] ?? '';
+  } else if (arg === '--model' || arg === '-m') {
+    modelArg = argv[++i];
   } else if (arg === '--session' || arg === '--resume' || arg === '-r' || arg === '-S') {
     const next = argv[i + 1];
     if (next !== undefined && !next.startsWith('-')) {
@@ -83,9 +90,70 @@ const version = process.env['FAKE_KIMI_VERSION'] ?? '9.9.9-fake';
 const reply = process.env['FAKE_KIMI_REPLY'] ?? 'ok';
 const exitCode = Number(process.env['FAKE_KIMI_EXIT_CODE'] ?? '0');
 
+// Session selection (FAKE_KIMI_SESSION_OUT), as bare-kimi reads kimi 2.1.0
+// `-p`: a new session takes its alias from --model, else default_model, and
+// fixes its thinking effort from config.toml's [thinking] (`enabled = false`
+// is `off`, else `effort`, else the model's default_effort, else "default");
+// both are stored with the session. A resume keeps the stored effort, whatever
+// config.toml says now, and looks the stored alias up in config.toml again,
+// failing as kimi does when it is gone. KIMI_MODEL_THINKING_EFFORT forces the
+// effort of every request on a `kimi`-type provider unless thinking is off.
+// Strict effort validation is not emulated.
+type Table = Record<string, unknown>;
+const PROFILE = 'fake.session_profile';
+const sessionOut = process.env['FAKE_KIMI_SESSION_OUT'];
+
+interface Selection {
+  readonly model: string;
+  readonly storedEffort: string;
+  readonly configuredEffort: string | null;
+  readonly providerType: string | undefined;
+}
+
+function table(value: unknown): Table | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Table) : undefined;
+}
+
+async function selectSession(wirePath: string, created: boolean): Promise<Selection> {
+  const { parse } = await import('smol-toml');
+  const config = parse(readFileSync(join(home, 'config.toml'), 'utf-8')) as Table;
+  const models = table(config['models']) ?? {};
+  const thinking = table(config['thinking']);
+  const effort = thinking?.['effort'];
+  const configuredEffort = thinking?.['enabled'] === false ? 'off' : typeof effort === 'string' ? effort : null;
+  let model: string;
+  let storedEffort: string;
+  if (created) {
+    const alias = modelArg ?? config['default_model'];
+    if (typeof alias !== 'string') fail('no default_model in config.toml');
+    const record = table(models[alias]);
+    if (record === undefined) fail(`Model "${alias}" is not configured in config.toml.`);
+    const fallback = record['default_effort'];
+    model = alias;
+    storedEffort = configuredEffort ?? (typeof fallback === 'string' ? fallback : 'default');
+    appendFileSync(wirePath, `${JSON.stringify({ type: PROFILE, model, thinking_effort: storedEffort })}\n`);
+  } else {
+    const profile = readFileSync(wirePath, 'utf-8')
+      .split('\n')
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as Table)
+      .find((record) => record['type'] === PROFILE);
+    const storedModel = profile?.['model'];
+    const storedThinking = profile?.['thinking_effort'];
+    if (typeof storedModel !== 'string' || typeof storedThinking !== 'string') fail('session has no profile to resume');
+    if (table(models[storedModel]) === undefined) fail(`Model "${storedModel}" is not configured in config.toml.`);
+    model = storedModel;
+    storedEffort = storedThinking;
+  }
+  const provider = table(models[model])?.['provider'];
+  const providerType = typeof provider === 'string' ? table(table(config['providers'])?.[provider])?.['type'] : undefined;
+  return { model, storedEffort, configuredEffort, providerType: typeof providerType === 'string' ? providerType : undefined };
+}
+
 let sessionId: string | undefined;
 let wire = '';
 let wireContent = '';
+let selection: Selection | undefined;
 
 if (home.length > 0) {
   const bucket = join(home, 'sessions', 'wd_fake_000000000000');
@@ -105,12 +173,14 @@ if (home.length > 0) {
     wire = join(bucket, sessionId, 'agents', 'main', 'wire.jsonl');
   }
   mkdirSync(join(bucket, sessionId, 'agents', 'main'), { recursive: true });
-  if (!existsSync(wire)) {
+  const created = !existsSync(wire);
+  if (created) {
     writeFileSync(
       wire,
       `${JSON.stringify({ type: 'metadata', protocol_version: '1.5', created_at: new Date().toISOString() })}\n`,
     );
   }
+  if (sessionOut !== undefined) selection = await selectSession(wire, created);
   appendFileSync(wire, `${JSON.stringify({ type: 'turn.prompt', prompt })}\n`);
   wireContent = readFileSync(wire, 'utf-8');
 }
@@ -141,6 +211,22 @@ if (envOut !== undefined && envKeys !== undefined) {
     if (key.length > 0) recorded[key] = process.env[key];
   }
   writeFileSync(envOut, JSON.stringify(recorded, null, 2));
+}
+
+if (sessionOut !== undefined && selection !== undefined) {
+  const forced = process.env['KIMI_MODEL_THINKING_EFFORT']?.trim();
+  const forces =
+    forced !== undefined && forced.length > 0 && selection.providerType === 'kimi' && selection.storedEffort !== 'off';
+  const report = {
+    argv,
+    sessionId,
+    resumed: resumeId !== undefined || continueRecent,
+    model: selection.model,
+    storedEffort: selection.storedEffort,
+    effectiveEffort: forces ? forced : selection.storedEffort,
+    configuredEffort: selection.configuredEffort,
+  };
+  appendFileSync(sessionOut, `${JSON.stringify(report)}\n`);
 }
 
 const hasPreload = wireContent.includes('[preload]');
