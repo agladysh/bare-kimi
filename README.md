@@ -6,10 +6,13 @@ home. Each run gets its own configuration and sessions, and the login is
 shared. bare-kimi selects the model alias and thinking effort that a run home
 carries, and keeps a kept home on that model and effort. Before it changes
 anything, it refuses selections that kimi was observed not to honour, and
-arguments or environment variables that would silently override them. Some
-further refusals are stated policy where kimi's behaviour was not observed.
-It is a Bun library first. The CLI
-(`bin/bare-kimi.ts`) is its worked example.
+the known kimi arguments and environment variables that would quietly
+replace the model, effort or session it arranged. Some refusals are stated
+policy where kimi's behaviour was not observed. Other arguments passed
+through to kimi are not checked; whether an agent profile chosen with
+`--agent` selects a model of its own, for example, has not been established.
+It is a Bun library first. The CLI (`bin/bare-kimi.ts`) is its worked
+example.
 
 **Status: 0.3.0, early (pre-1.0).** Each release is a Git tag of this
 repository. Nothing is published to a package registry. 0.3.0 adds model and
@@ -93,8 +96,9 @@ bare-kimi: routed to model "ALIAS" (selected; provider type kimi, model id ID), 
 The line gives the model alias and where it came from, the provider type and
 model id, and either the pinned effort with its origin and support or the
 effort that `config.toml` gives new sessions. On a resume it also says that
-the session keeps its stored effort and alias. It names no path, URL or
-credential. `--help` lists every option and exit code.
+the session keeps its stored effort, and either keeps its stored alias or,
+when `--model` is given, runs on the alias that `--model` names. It names no
+path, URL or credential. `--help` lists every option and exit code.
 
 The library takes the same choices:
 
@@ -198,9 +202,17 @@ refresh may replace it.
 
 ## Fresh, kept and resumed runs
 
-A session's model alias and effort are fixed when kimi creates the session,
-and stored with it. A resume keeps them, whatever `config.toml` says later.
-bare-kimi arranges its run homes around that native behaviour.
+When kimi creates a session, it stores the session's model alias and effort
+with it. In the ordinary case a resume runs on both: kimi 2.1.0 was observed
+to keep the stored effort whatever `config.toml` says later, and to look the
+stored alias up in `config.toml` again rather than follow a changed
+`default_model` (the scope of these observations is under
+[What has been observed](#what-has-been-observed)). Two inputs override that
+case. A `--model` given on the
+resume switches the session to the alias it names, and a forced effort in
+the environment overrides the stored effort. bare-kimi arranges its run
+homes around this native behaviour and controls when either override can
+reach kimi.
 
 - **Fresh runs.** Without `home`, every run gets a new temporary home and a
   new session on the selected or default model and effort. The home is
@@ -219,9 +231,9 @@ bare-kimi arranges its run homes around that native behaviour.
 - **Resumed sessions.** `resume` (`--resume`) or `continueRecent`
   (`--continue`) resumes a session in its own working directory; kimi
   refuses a resume from another one. The session keeps the effort it
-  stored. bare-kimi passes `--model` only when `model` is given, and on a
-  kept home only the pinned alias, so a session created on the pin stays on
-  it. On a loopback provider, kimi 2.1.0 was observed to switch a resumed
+  stored, unless a forced effort reaches kimi (see below). bare-kimi passes
+  `--model` only when `model` is given, and on a kept home only the pinned
+  alias, so a session created on the pin stays on it. On a loopback provider, kimi 2.1.0 was observed to switch a resumed
   session to whatever alias `--model` named. A session created in a 0.2 or
   adopted home under an earlier alias is therefore switched to the pin when
   `model` is given. Without `model`, kimi looks up the session's own alias in
@@ -267,9 +279,12 @@ which alias older sessions are bound to: sessions created before
 above).
 
 **The upgrade is one-way.** bare-kimi 0.2.0 and 0.2.1 read only version-1
-stamps, and they refuse a home once 0.3 has rewritten its stamp. 0.3 has no
-path that writes a version-1 stamp again. A consumer that has to keep
-running 0.2 on a home must keep that home away from 0.3.
+stamps, and they refuse a home once 0.3 has rewritten its stamp. In a check
+on one upgraded synthetic home, the 0.2 code refused the home and left its
+stamp and `config.toml` unchanged (see
+[What has been observed](#what-has-been-observed)). 0.3 has no path that
+writes a version-1 stamp again. A consumer that has to keep running 0.2 on a
+home must keep that home away from 0.3.
 
 Other changes that can break a 0.2 consumer are listed in
 [CHANGELOG.md](CHANGELOG.md): the model pin itself, arguments refused in
@@ -461,10 +476,24 @@ probes observed:
   [Environment](#environment);
 - a schema-valid deny rule did not stop a tool call, and carried hooks fired.
 
-**A real managed login.** bare-kimi 0.3.0 was also run against the managed
-Kimi Code provider, on an existing login in link mode, with installed kimi
-2.1.0. The model was the source's default managed alias, of the `kimi` type,
-whose table listed both `low` and `high`. Three calls were made. One kept
+**Upgrading and downgrading 0.2 homes.** The 0.3 code at commit `a96c613`,
+before its package version was set to 0.3.0, upgraded homes made by the
+published 0.2.0 `src/home.ts`, which 0.2.1 left unchanged. The homes and
+sources were synthetic, and no kimi child or provider was involved. Three
+cases were run: an unchanged `config.toml` (basis `config`); `config.toml`
+removed, with a session directory present and the source's default changed
+(basis `digest`); and a CRLF source with comments, `[thinking]`, permission
+rules and hooks (basis `config`). In each case the stamp's settings digest
+and the `config.toml` bytes held, and the basis survived a later reuse. The
+0.2 code was then run on the upgraded home from the first case. It refused
+the version-2 stamp as not one it wrote, and left the stamp and
+`config.toml` unchanged. As a control, the same 0.2 code created and reused
+a version-1 home from the same source.
+
+**A real managed login.** The 0.3 code at the same commit was also run
+against the managed Kimi Code provider, on an existing login in link mode,
+with installed kimi 2.1.0. The model was the source's default managed
+alias, of the `kimi` type, whose table listed both `low` and `high`. Three calls were made. One kept
 home was created with `--model` naming that alias and `--effort low`, and
 another with `--effort high`. Each answered its prompt and exited 0. The
 first home's session was then resumed without `--model` or `--effort`. It

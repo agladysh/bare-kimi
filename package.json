@@ -1,7 +1,7 @@
 {
   "name": "@agladysh/bare-kimi",
   "version": "0.3.0",
-  "description": "Run kimi (Kimi Code CLI) headless against an isolated KIMI_CODE_HOME, on the operator's own login. Library first; the CLI is its worked example.",
+  "description": "Run kimi (Kimi Code CLI) headless in a run home of its own (KIMI_CODE_HOME) on an existing Kimi Code login, with checked model and effort selection and kept homes pinned to them. Library first; the CLI is its worked example.",
   "license": "MIT",
   "type": "module",
   "module": "src/index.ts",

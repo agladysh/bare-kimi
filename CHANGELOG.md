@@ -4,9 +4,10 @@
 
 0.3.0 adds explicit model and effort selection to run homes, pins kept homes
 to the model and effort they were created with, upgrades homes kept by 0.2,
-and adopts homes kept before 0.2 on request. It also closes routes by which
-an argument or environment variable could quietly change a run's model,
-effort or session. Some of these changes break existing uses (see *Breaking
+and adopts homes kept before 0.2 on request. It also refuses the known kimi
+arguments and environment variables that would quietly replace the model,
+effort or session that bare-kimi arranged. Other arguments passed to kimi,
+such as `--agent` with an agent profile, are still not checked. Some of these changes break existing uses (see *Breaking
 changes* below). Like earlier releases, this is a Git release and is not
 published to a package registry. Publishing it does not mean any project has
 adopted it. The README explains the behaviour in full.
@@ -28,7 +29,7 @@ adopted it. The README explains the behaviour in full.
   effort, stays on them when the source's `default_model` changes, and
   refuses another model or effort before any effect. kimi binds each session
   to the alias and effort it was created with and looks the alias up again
-  on resume. A source that no longer configures the pinned alias makes the
+  on resume, unless `--model` on the resume names another alias. A source that no longer configures the pinned alias makes the
   home refused, not switched.
 - **Routing report.** Every CLI run prints one `bare-kimi: routed to model`
   line on stderr. The line names the alias and its origin, the provider type
@@ -55,9 +56,10 @@ adopted it. The README explains the behaviour in full.
 - **Kept homes no longer follow the source's `default_model`.** A home
   created or upgraded by 0.3 stays on its pinned alias. Another `model` or
   `effort` on it is refused. A different model or effort needs another home.
-- **The stamp upgrade is one-way.** 0.2.0 and 0.2.1 refuse a home that 0.3
-  has used, because they read only version-1 stamps. A home that must still
-  run under 0.2 has to stay away from 0.3.
+- **The stamp upgrade is one-way.** 0.2.0 and 0.2.1 refuse a home whose
+  stamp 0.3 has rewritten, because they read only version-1 stamps (checked
+  on one synthetic home; see *Evidence*). A home that must still run under
+  0.2 has to stay away from 0.3.
 - **Model and session arguments in `extraArgs`** (CLI `--kimi-arg`) are
   refused, in every spelling that kimi 2.1.0's parser accepts: `-m`,
   `--model`, `-S`, `--session`, `-r`, `--resume`, `-c`, `--continue` and
@@ -112,8 +114,12 @@ adopted it. The README explains the behaviour in full.
 
 ### Evidence
 
-- The integrated tree passed its typecheck and test suite.
-- Homes kept by the published 0.2.0 code were upgraded by this version from
+The evidence below was taken on the 0.3 code at commit `a96c613`, before the
+package version was set to 0.3.0. Only documentation and the version number
+changed after it. No run is recorded against a `v0.3.0` tag.
+
+- That tree passed its typecheck and test suite.
+- Homes kept by the published 0.2.0 code were upgraded by that code from
   synthetic sources, with no kimi child or provider involved. The 0.2.0 code
   was imported byte-identical to the tag's `src/home.ts`. Three cases were
   run: an unchanged `config.toml` (basis `config`); `config.toml` removed,
@@ -121,10 +127,16 @@ adopted it. The README explains the behaviour in full.
   `digest`); and a CRLF source with comments, `[thinking]`, permission rules
   and hooks (basis `config`). In each case the stamp's settings digest and
   the `config.toml` bytes held, and the basis survived a later reuse.
+- The same 0.2.0 code, which 0.2.1 left unchanged, was then run on the
+  upgraded home from the first case. It refused the version-2 stamp as not
+  one it wrote, and the stamp and `config.toml` stayed unchanged. As a
+  control, it created and reused a version-1 home from the same source.
 - Loopback runs of installed kimi 2.1.0 in `-p` mode supplied the
-  observations on which the effort refusals, the resume behaviour, and the
-  environment and argument refusals rest. The README summarizes them, and
-  `checkEffort` in `src/home.ts` states the basis of each refusal.
+  observations on which the effort refusals, the resume behaviour and the
+  environment refusals rest. The argument refusals rest on a reading of the
+  installed 2.1.0 bundle's argument parser. The README summarizes the
+  observations, and `checkEffort` in `src/home.ts` states the basis of each
+  effort refusal.
 - Three real calls ran against the managed Kimi Code provider, on an
   existing login in link mode, with installed kimi 2.1.0: kept homes created
   at `low` and at `high` on the source's default managed alias, and a resume
