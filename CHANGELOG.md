@@ -383,9 +383,11 @@ against installed kimi 2.1.0. Its preflight showed:
 
 Then all five scenarios finished with exit 0, each with version 2.1.0, a
 session id and one wire journal. No synthetic source home gained
-`sessions/`, every process group the probe owned was gone afterwards (kimi
-starts tool commands in their own groups, so descendants are not proven
-gone), and no request was unattributed.
+`sessions/`, the probe reported its process groups absent, and no request
+was unattributed. **Qualification, 16 October 2026 (UTC+00:00):** that group
+check maps every inspection error to absence; it did not establish emptiness.
+A typed recheck and replay remain owed. Kimi starts tool commands in their
+own groups, which leaves complete descendant cleanup unverified.
 Findings:
 - **control:** held. The scripted call ran, and the `PreToolUse` hook fired;
 - **deny:** not enforced. No section was dropped, the call ran, and the

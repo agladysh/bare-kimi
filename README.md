@@ -195,9 +195,11 @@ Observed in its one completed run (installed kimi 2.1.0, `-p`, macOS):
   observed.
 - **Each scenario:** exit 0, a parsed `system.version` and
   `session.resume_hint`, one wire journal in the run home, and no `sessions/`
-  in its synthetic source home. Every process group the probe owned was gone
-  afterwards; kimi starts tool commands in their own groups, so descendants
-  are not proven gone.
+  in its synthetic source home. The probe reported its groups absent using a
+  Boolean helper that maps inspection errors, including EPERM, to absence.
+  Their emptiness is therefore unverified pending a typed recheck and replay.
+  Kimi starts tool commands in their own groups, which also leaves complete
+  descendant cleanup unverified.
 
 These are observations of one installed version with a test provider, not
 guarantees. They say nothing about a real login.
