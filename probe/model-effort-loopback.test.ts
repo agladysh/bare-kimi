@@ -3,6 +3,7 @@ import {
   CASES,
   activation,
   compareTurns,
+  clientFailure,
   effortAnswer,
   effortChoice,
   modelAnswer,
@@ -225,6 +226,11 @@ describe('a client-side failure before any request', () => {
     expect(offAnswer(cutShort({ retrying: retries(NO_OFF, 400) }), null)).toStartWith('unknown:');
     expect(offAnswer(cutShort({ retrying: retries('EPERM: operation not permitted, connect') }), null)).toStartWith('unknown:');
     expect(offAnswer(cutShort({ catalogRequests: 1 }), null)).toStartWith('unknown:');
+    for (const message of ['getaddrinfo ENOTFOUND api.openai.com', 'Connection error.', 'ECONNREFUSED']) {
+      const failed = cutShort({ retrying: retries(message) });
+      expect(clientFailure(failed)).toBeUndefined();
+      expect(offAnswer(failed, null)).toStartWith('unknown:');
+    }
   });
 
   test('cannot serve as a control that must send an effort', () => {
@@ -257,11 +263,13 @@ describe('n8b-off', () => {
       off: turn('off', [effort('none')]),
       field: turn('field', [effort('none')]),
       string: turn('string', [effort('high')]),
+      'base-no-off': cutShort({ id: 'base-no-off' }),
       'caps-only': cutShort({ id: 'caps-only' }),
       bare: turn('bare', []),
     });
     expect(facts['always_thinking = true (model field), off_effort "none", off']).toStartWith('off honored');
     expect(facts['capability "always_thinking", off_effort "none", off']).toStartWith('thinks despite off');
+    expect(facts['thinking + support_efforts, no off_effort, off (as n8-always)']).toStartWith('client-side failure');
     expect(facts['capabilities ["thinking"] only, no off_effort, off']).toStartWith('client-side failure');
     expect(facts['no thinking metadata, off']).toBe('off honored: no effort sent');
     expect(facts['support_efforts ["high"] only, no off_effort, off']).toStartWith('unknown:');

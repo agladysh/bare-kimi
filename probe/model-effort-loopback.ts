@@ -57,7 +57,7 @@
  *   at all, none declaring an off effort. Open: what `off` sends once an off
  *   effort is declared; whether the field and the capability string differ
  *   from that control; which declarations make kimi fail before sending; and
- *   how that failure ends (the capability-only step has the one long
+ *   how that failure ends (the known thinking-plus-support-efforts failure has the one long
  *   deadline; the other no-off steps are short and show only kimi's first
  *   retry reports).
  * - n2-kimi-undeclared (N2): efforts `high` and `max` on a kimi-type model
@@ -1422,10 +1422,17 @@ export const CASES: readonly CaseDef[] = [
       },
       {
         kind: 'native',
-        id: 'caps-only',
-        purpose: 'capabilities ["thinking"] only, no off_effort, off; the one long step, to see how the retries end',
-        config: cfg('openai', [A(['capabilities = ["thinking"]'])], OFF),
+        id: 'base-no-off',
+        purpose: 'thinking plus support_efforts, no off_effort, off; known retry failure, observe terminal exit',
+        config: cfg('openai', [A(N8_BASE)], OFF),
         deadlineMs: TERMINAL_RETRY_DEADLINE_MS,
+      },
+      {
+        kind: 'native',
+        id: 'caps-only',
+        purpose: 'capabilities ["thinking"] only, no off_effort, off',
+        config: cfg('openai', [A(['capabilities = ["thinking"]'])], OFF),
+        deadlineMs: SHORT_DEADLINE_MS,
       },
       {
         kind: 'native',
@@ -1452,6 +1459,7 @@ export const CASES: readonly CaseDef[] = [
         'control: thinking off, off_effort "none"': offControl,
         'always_thinking = true (model field), off_effort "none", off': offBlocked ?? offAnswer(j.step('field'), 'none'),
         'capability "always_thinking", off_effort "none", off': offBlocked ?? offAnswer(j.step('string'), 'none'),
+        'thinking + support_efforts, no off_effort, off (as n8-always)': on ?? offAnswer(j.step('base-no-off'), null),
         'capabilities ["thinking"] only, no off_effort, off': on ?? offAnswer(j.step('caps-only'), null),
         'support_efforts ["high"] only, no off_effort, off': on ?? offAnswer(j.step('efforts-only'), null),
         'no thinking metadata, off': on ?? offAnswer(j.step('bare'), null),
@@ -1640,7 +1648,8 @@ export function clientFailure(s: StepRecord): string | undefined {
   if (s.status !== 'ran' || retrying === null || s.requests > 0) return undefined;
   if (s.via === 'library' && s.wrapper?.phase === 'refused') return undefined;
   if (evidenceFault(s) !== undefined || sandboxLike(s) !== undefined) return undefined;
-  if (retrying.errors.some((error) => error.statusCode !== null || SANDBOX_LIKE.test(error.message))) return undefined;
+  if (retrying.errors.some((error) => error.statusCode !== null || SANDBOX_LIKE.test(error.message) || TRANSPORT_LIKE.test(error.message))) return undefined;
+  if (TRANSPORT_LIKE.test(`${s.stderrTail ?? ''} ${s.driverStderrTail ?? ''}`)) return undefined;
   const first = retrying.errors[0];
   if (first === undefined) return undefined;
   const others = retrying.errors.length > 1 ? ` (+${retrying.errors.length - 1} other error text(s))` : '';
@@ -1662,6 +1671,7 @@ function childExit(s: StepRecord): number | null {
 }
 
 const SANDBOX_LIKE = /EPERM|operation not permitted|sandbox/i;
+const TRANSPORT_LIKE = /ENOTFOUND|EAI_AGAIN|getaddrinfo|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|fetch failed|connection error|socket hang up/i;
 
 /** Why a failing exit may be the sandbox's doing rather than kimi's, from the step's stderr; else undefined. */
 function sandboxLike(s: StepRecord): string | undefined {
