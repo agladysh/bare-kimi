@@ -111,28 +111,34 @@ export interface AssembledHome {
    * The thinking effort the home is pinned to: one chosen with `effort`, or
    * null when the home carries the source's own `[thinking]` table (or none).
    * It is configured for new sessions. A resumed session runs at the effort
-   * it stored when it was created, and kimi may run another one when
-   * {@link AssembledHome.effortSupport} is `undeclared`.
+   * it stored when it was created, and kimi may run another one, or none,
+   * when {@link AssembledHome.effortSupport} is `undeclared`.
    */
   readonly effort: string | null;
   /**
    * How the pinned effort relates to what the source config declares about
-   * the model's thinking (null when no effort is pinned):
+   * the model's thinking (null when no effort is pinned); see
+   * {@link checkEffort} for what is refused instead:
    * - `declared`: the model's table (its `overrides` winning) declares its
    *   thinking support, and the effort agrees with it;
    * - `undeclared`: the table declares nothing to check the effort against
    *   (no `support_efforts`, and for `off` no thinking metadata at all), so
-   *   kimi decides at run time. kimi 2.1.0 sends a non-`kimi` provider the
-   *   string as given. On a `kimi`-type provider it validates the effort
-   *   against model metadata that bare-kimi does not read; for the managed
-   *   provider that comes from the provider's `/models` catalog. It may then
-   *   run the model's default effort or none.
+   *   kimi decides at run time. On an `openai`-type provider kimi 2.1.0 was
+   *   observed to send such an effort as given; whether the provider applies
+   *   it is unknown. On another provider type, or for a model that sets
+   *   `protocol`, what kimi sends is not established. Never reported for a
+   *   non-`off` effort on a `kimi`-type provider whose model sets no
+   *   `protocol`: that is refused.
    */
   readonly effortSupport: EffortSupport | null;
   /**
    * The effort the home's config.toml gives a new session: the pinned
    * effort, else the source `[thinking]`'s (`off` when it disables
-   * thinking), else null — kimi then uses the model's default effort.
+   * thinking), else null — kimi then uses the model's default effort. This
+   * is what the file configures, not what kimi sends: from a carried source
+   * `[thinking]`, on a `kimi`-type provider, kimi 2.1.0 was observed to send
+   * no effort for a model listing no `support_efforts`, and to replace one
+   * the model does not list.
    */
   readonly configuredEffort: string | null;
   /** The canonical source home the run home is stamped with. */
@@ -198,10 +204,13 @@ export interface RunHomeOptions {
   /**
    * The thinking effort to write into the run home's `[thinking]` and pin:
    * one of the model's `support_efforts`, or `off`. When the model declares
-   * no `support_efforts`, any effort name is taken and reported as
-   * `undeclared` (see {@link AssembledHome.effortSupport}). Omitted: a new
-   * home carries the source's `[thinking]`; a kept home keeps its pin. A kept
-   * home refuses another effort.
+   * no `support_efforts`, an effort name is refused on a `kimi`-type
+   * provider (unless the model sets `protocol`, which no observation
+   * covered) and otherwise taken and reported as `undeclared` (see
+   * {@link AssembledHome.effortSupport}); other refusals are listed at
+   * {@link checkEffort}. Omitted: a new home carries the source's
+   * `[thinking]`; a kept home keeps its pin. A kept home refuses another
+   * effort.
    */
   readonly effort?: string;
   /**
@@ -413,7 +422,9 @@ interface Selection {
 
 /**
  * The model's settings as kimi uses them: its `overrides` table over the
- * model's own fields (kimi 2.1.0 `effectiveModelConfig`).
+ * model's own fields (kimi 2.1.0 `effectiveModelConfig`). {@link checkEffort}
+ * reads `capabilities`, `support_efforts`, `off_effort` and `protocol` from
+ * it.
  */
 function effectiveModel(model: TomlTable): TomlTable {
   const { overrides, ...base } = model;
@@ -440,43 +451,108 @@ const EFFORT_NAME = /^[a-z0-9][a-z0-9_-]*$/;
 export type EffortSupport = 'declared' | 'undeclared';
 
 /**
- * Check a selected effort against what the source config declares about the
- * model (its `overrides` already applied), refusing what that declaration
- * contradicts and reporting what it leaves open.
- *
- * As read from the installed kimi 2.1.0 bundle: a new session's effort comes
- * from `[thinking]` (`enabled = false` is `off`, else `effort`, else the
- * model's default) and is stored with the session. Whether kimi validates
- * the effort depends on the provider type (`requiresStrictThinkingValidation`;
- * this library reads only the `kimi` type as strict). A strict type replaces
- * an effort the model does not list with the model's default, and runs a
- * model without thinking with thinking off. Other types "receive effort
- * strings without client-side mapping". kimi's own registry import marks a
- * model as thinking when it has `reasoning` or a non-empty `support_efforts`
- * (`capabilitiesFromCustomEntry`), and may leave `support_efforts` out. A
- * managed model's efforts come from the provider's `/models` catalog
- * (`parseThinkEfforts`), which this library does not read: it makes no
- * network or login reads.
- *
- * So, on every provider type:
- * - an effort that is not a lowercase name is refused;
- * - `off` is refused for a model declared always-thinking;
- * - another effort is refused for a model whose declaration excludes
- *   thinking: a `capabilities` list without it and no `support_efforts`;
- * - an effort missing from a declared `support_efforts` is refused. A strict
- *   type would silently run another effort, and kimi's provider-error hint
- *   tells users to choose an effort the model supports;
- * - anything else the declaration does not settle is accepted as
- *   `undeclared`, not refused: unknown support is not taken for no support.
+ * Which native observations of kimi 2.1.0 a model's effort handling rests
+ * on: those made on a `kimi`-type provider, those made on an `openai`-type
+ * provider, or none. As read from the bundle, kimi decides strict thinking
+ * validation from the model's `protocol` as well as the provider type
+ * (`requiresStrictThinkingValidation`), and no observation set `protocol`.
+ * So a model that sets it (its `overrides` applied) is `unobserved` whatever
+ * its provider's type, as is a provider of any other type or of none.
  */
-function checkEffort(effort: string, alias: string, model: TomlTable): EffortSupport {
+type EffortEvidence = 'kimi' | 'openai' | 'unobserved';
+
+function effortEvidence(providerType: unknown, model: TomlTable): EffortEvidence {
+  if (model['protocol'] !== undefined) return 'unobserved';
+  return providerType === 'kimi' || providerType === 'openai' ? providerType : 'unobserved';
+}
+
+/** An `unobserved` provider and model, as a refusal names them. */
+function unobservedWhere(providerType: unknown, model: TomlTable): string {
+  if (model['protocol'] !== undefined) return `a model that sets protocol (${JSON.stringify(model['protocol'])})`;
+  return typeof providerType === 'string' ? `provider type "${providerType}"` : 'a provider without a type';
+}
+
+/**
+ * Check a selected effort against what the source config declares about the
+ * model (its `overrides` already applied) and its provider's `type`. What
+ * kimi was observed not to run as asked is refused; so is what this library
+ * refuses as policy where kimi's behaviour was not observed or does not
+ * settle the question. Every refusal happens before any effect.
+ *
+ * Native basis: installed kimi 2.1.0 in `-p` mode, one plain-text turn per
+ * case against a synthetic loopback provider with synthetic configs, read
+ * from the request kimi sent (or failed to send). These are wire
+ * observations of finite cases. They do not show whether a provider honours
+ * an effort or a model actually thinks, and say nothing of other versions,
+ * provider catalogs or real logins. Observed:
+ * - `kimi` type: a listed effort was sent, and an unlisted one replaced by a
+ *   listed one. For a model listing no `support_efforts` (thinking by
+ *   capability only, and the env model) a configured effort was not sent:
+ *   only thinking enabled, with no level. Thinking off sent
+ *   `thinking.type = "disabled"` for `support_efforts = ["high"]` and
+ *   `["low", "high"]`, the latter with or without `off_effort`, and for
+ *   capability-only thinking.
+ * - `openai` type: an effort was sent as given on a model with no thinking
+ *   metadata, and on one whose `capabilities = ["image_in"]` exclude
+ *   thinking. Thinking off on a model listing `support_efforts = ["high"]`
+ *   or `["low", "high"]` and no `off_effort` failed before any request
+ *   ("declares no off effort"), retried, and exited 1. With
+ *   `off_effort = "none"` it sent "none". Capability-only thinking and no
+ *   metadata sent no thinking field.
+ * - The capability string `"always_thinking"` (openai type) sent an effort
+ *   with thinking off, with or without `off_effort`. The Boolean model field
+ *   `always_thinking = true` changed nothing observed, so it is not read.
+ *
+ * Read from the 2.1.0 bundle, not observed, and consistent with the above:
+ * - In `-p` a model's `supportEfforts`, `offEffort`, `defaultEffort` and
+ *   `protocol` come from its config.toml table alone, its `overrides`
+ *   applied (`mergeModel`); the runtime catalog is built from config
+ *   (`ProviderCatalogRuntimeService.syncAll`), and no `-p` path refreshes
+ *   the provider catalog. kimi writes a managed model's table from the
+ *   provider's `/models` catalog (`toManagedModelAlias`; efforts from
+ *   `think_efforts.valid_efforts`, never an off effort) at login and in the
+ *   interactive UI's and the server's refreshes, which this library neither
+ *   runs nor reads: it judges the source config.toml, as kimi `-p` will.
+ * - Only the kimi type without `protocol` uses the strict trait
+ *   (`kimiOpenAITrait`); the kimi type with protocol `anthropic` or
+ *   `openai_responses` does not, and the managed catalog sets those two for
+ *   some models (`parseModelProtocol`). Strict, a model
+ *   listing no efforts runs any other effort as "on", an unlisted one as its
+ *   default (`normalizeThinkingEffortForModel`). Not strict, `off` without an
+ *   off effort fails for any listed efforts (`resolveThinkingEffort`).
+ * - `alwaysThinking` is derived from the capability string only
+ *   (`declaresAlwaysThinking`).
+ * The observations above are applied only where {@link effortEvidence} says
+ * they were made.
+ *
+ * So:
+ * - an effort that is not a lowercase name is refused;
+ * - `off` is refused for a model listing the capability `always_thinking`:
+ *   observed on the openai type, policy on every other;
+ * - `off` is refused for a model listing `support_efforts` without
+ *   `off_effort`, except on the kimi type: observed on the openai type for
+ *   one- and two-entry lists, and policy on unobserved types. On the kimi
+ *   type `off` is taken: observed for the declarations above;
+ * - another effort is refused, as policy, for a model whose declaration
+ *   excludes thinking (a `capabilities` list without it, no
+ *   `support_efforts`). kimi was observed to send it on the openai type;
+ * - on the kimi type, another effort is refused for a model listing no
+ *   `support_efforts`: kimi was observed to send none;
+ * - an effort missing from a declared `support_efforts` is refused: observed
+ *   replaced on the kimi type, policy elsewhere;
+ * - anything else is accepted as `undeclared`, not refused: unknown support
+ *   is not taken for no support.
+ */
+function checkEffort(effort: string, alias: string, model: TomlTable, providerType: unknown): EffortSupport {
   if (!EFFORT_NAME.test(effort)) {
     throw new Error(`effort ${JSON.stringify(effort)} is not a lowercase effort name; refusing`);
   }
+  const evidence = effortEvidence(providerType, model);
   const capabilities = model['capabilities'];
   const listed = stringList(capabilities).map((item) => item.toLowerCase());
   const efforts = stringList(model['support_efforts']);
-  const always = model['always_thinking'] === true || listed.includes('always_thinking');
+  const offEffort = model['off_effort'];
+  const always = listed.includes('always_thinking');
   const thinks =
     always ||
     model['adaptive_thinking'] === true ||
@@ -484,18 +560,49 @@ function checkEffort(effort: string, alias: string, model: TomlTable): EffortSup
     (isTable(capabilities) && capabilities['thinking'] === true) ||
     efforts.length > 0;
   const declaresThinking =
-    capabilities !== undefined ||
-    efforts.length > 0 ||
-    typeof model['always_thinking'] === 'boolean' ||
-    typeof model['adaptive_thinking'] === 'boolean';
+    capabilities !== undefined || efforts.length > 0 || typeof model['adaptive_thinking'] === 'boolean';
   if (effort === 'off') {
-    if (always) throw new Error(`model "${alias}" always thinks, so kimi would ignore effort "off"; refusing`);
+    if (always) {
+      throw new Error(
+        `model "${alias}" lists the capability "always_thinking": with thinking off, kimi 2.1.0 was observed ` +
+          'to send an effort on an openai-type provider' +
+          (evidence === 'openai'
+            ? ''
+            : `; on ${evidence === 'kimi' ? 'a kimi-type provider' : unobservedWhere(providerType, model)} ` +
+              'that is untested, and bare-kimi refuses it as policy') +
+          '; refusing effort "off"',
+      );
+    }
+    if (evidence !== 'kimi' && efforts.length > 0 && !(typeof offEffort === 'string' && offEffort.trim().length > 0)) {
+      throw new Error(
+        `model "${alias}" lists support_efforts but no off_effort: with thinking off, kimi 2.1.0 on an ` +
+          'openai-type provider failed such a model before sending any request, and exited 1 ' +
+          '(observed for support_efforts = ["high"] and ["low", "high"])' +
+          (evidence === 'openai'
+            ? ''
+            : `; on ${unobservedWhere(providerType, model)} that is untested, and bare-kimi refuses it as policy`) +
+          '; refusing effort "off" (declare the model\'s off_effort, e.g. "none")',
+      );
+    }
     return declaresThinking ? 'declared' : 'undeclared';
   }
   if (declaresThinking && !thinks) {
-    throw new Error(`model "${alias}" is declared without thinking, so effort "${effort}" would not run as asked; refusing`);
+    throw new Error(
+      `model "${alias}" is declared without thinking (it declares no thinking capability and lists no ` +
+        `support_efforts); bare-kimi refuses effort "${effort}" there as policy. kimi 2.1.0 was observed to ` +
+        'send such an effort on an openai-type provider; whether a provider applies it is unknown',
+    );
   }
-  if (efforts.length === 0) return 'undeclared';
+  if (efforts.length === 0) {
+    if (evidence !== 'kimi') return 'undeclared';
+    throw new Error(
+      `model "${alias}" lists no support_efforts, and on a kimi-type provider kimi 2.1.0 was observed to ` +
+        `send no effort for such a model (thinking enabled, no level); refusing effort "${effort}" ` +
+        '(choose no effort). kimi -p reads the efforts from config.toml alone. For a managed model only kimi ' +
+        "writes them there, from the provider's catalog, at login and in its interactive refresh, and only " +
+        'when the catalog lists efforts; bare-kimi neither runs that refresh nor supplies efforts itself',
+    );
+  }
   if (!efforts.includes(effort)) {
     throw new Error(
       `effort "${effort}" is not one of model "${alias}"'s support_efforts (${efforts.join(', ')}); refusing`,
@@ -592,7 +699,8 @@ function minimalConfig(configText: string, source: TomlTable, where: string, sel
   const providerTable = isTable(providers) ? providers[provider] : undefined;
   if (!isTable(providerTable)) throw new Error(`no [providers."${provider}"] in ${where}`);
   const { effort } = selection;
-  const effortSupport = effort === null ? null : checkEffort(effort, modelAlias, effectiveModel(model));
+  const effortSupport =
+    effort === null ? null : checkEffort(effort, modelAlias, effectiveModel(model), providerTable['type']);
 
   const prefixes: (readonly string[])[] = [
     ['providers', provider],
@@ -1079,7 +1187,9 @@ export const HOME_STAMP = '.bare-kimi-home';
  * read from kimi 2.1.0, such a session cannot be resumed once the rewritten
  * config.toml no longer configures its alias. When its `[thinking]` differs from the source's, it
  * is also pinned to the effort that table names, and that effort is checked
- * like a selected one. That pin is the effort the home's config.toml gave
+ * like a selected one: adoption is refused, for one, for an effort on a
+ * `kimi`-type model listing no `support_efforts` (see {@link checkEffort}).
+ * That pin is the effort the home's config.toml gave
  * new sessions when it was found. It says nothing about the effort its
  * existing sessions ran at: each stored its own when created, perhaps under
  * an earlier config.toml, and a `kimi`-type provider may have replaced an

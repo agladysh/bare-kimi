@@ -11,7 +11,9 @@ import {
   makeEphemeralHome,
   removeHome,
   spawnKimi,
+  type AssembledHome,
   type LaunchOptions,
+  type MigrationBasis,
   type OutputFormat,
 } from '../src/index.ts';
 import {
@@ -82,15 +84,29 @@ Model and effort:
   --effort EFFORT       Thinking effort for sessions the run home creates:
                         one of the model's support_efforts, or off. Written
                         into the run home's [thinking] and pinned like the
-                        model. Refused before any effect when the source
-                        config's declaration of the model excludes it. When
-                        the config declares no efforts for the model (a
-                        managed model's efforts come from the provider's
-                        catalog, which bare-kimi does not read), it is
-                        taken unchecked and a notice says so; kimi decides
-                        at run time. With --preload no notice is printed.
-                        A resumed
-                        session keeps the effort it was created with.
+                        model. Checked before any effect against the source
+                        config's table for the model, which is what kimi
+                        2.1.0 -p reads (kimi's login and interactive
+                        refresh write a managed model's support_efforts
+                        there from the provider's catalog). Refused: an
+                        effort the model does not list; on a kimi-type
+                        provider, any effort but off for a model listing
+                        no support_efforts (kimi then sends no level); off
+                        for a model listing support_efforts without
+                        off_effort, except on a kimi-type provider, or
+                        listing the capability always_thinking. Some of
+                        these refusals rest on observed kimi behaviour,
+                        others are library policy (see src/home.ts). On
+                        another provider type, an effort for a model
+                        listing no support_efforts is taken unchecked and
+                        a notice says so; kimi decides at run time. With
+                        --preload no notice is printed. A resumed session
+                        keeps the effort it was created with.
+  Every run prints one "routed to model" line on stderr: the alias, its
+  provider type and model id, the effort pinned or configured for new
+  sessions and its support, and where each came from (selected, the
+  source's default, pinned, adopted, or how a bare-kimi 0.2 home's alias was
+  established when its stamp was upgraded).
 
 Run shape:
   --cwd DIR             Working directory (default: current). A resume must
@@ -107,8 +123,11 @@ Run shape:
   --kimi-bin PATH       kimi binary (default: $KIMI_BIN ?? kimi on PATH).
                         A relative PATH resolves against the current
                         directory.
-  --kimi-arg ARG        Forward ARG verbatim to kimi (repeatable; not
-                        --model or -m, which -m replaces).
+  --kimi-arg ARG        Forward ARG verbatim to kimi (repeatable). Refused
+                        when kimi would read it as selecting a model or a
+                        session (-m, --model, -S, --session, -r, --resume,
+                        -c, --continue, -C, also as -mX, --model=X or in a
+                        cluster such as -yc): use -m, --resume, --continue.
                         --skills-dir, --add-dir and --kimi-arg go to kimi
                         verbatim; kimi resolves relative paths in --cwd.
   --no-process-env      Do not inherit the parent environment.
@@ -136,9 +155,9 @@ thinking-effort overrides; use --effort), every KIMI_SECONDARY_* variable
 then sets KIMI_CODE_HOME to the run home and KIMI_CODE_HOME_SOURCE to the
 source home, and KIMI_DISABLE_TELEMETRY=1 and KIMI_CODE_NO_AUTO_UPDATE=1
 unless already set. A dropped variable cannot be restored from the CLI (the
-library's extraEnv can, except KIMI_CODE_HOME, and a KIMI_MODEL_* variable
-that may switch kimi to its env model only on an ephemeral run without a
-model).
+library's extraEnv can, except KIMI_CODE_HOME; an env-model variable, any
+KIMI_MODEL_* but KIMI_MODEL_THINKING_EFFORT and KIMI_MODEL_THINKING_KEEP,
+only on an ephemeral run without a model or effort).
 
 Permissions: -p forces kimi's native auto permission mode; -y/--yolo,
 --auto and --plan conflict with -p and cannot be used. bare-kimi passes no
@@ -325,6 +344,7 @@ async function main(): Promise<number> {
       const run = await runPreloaded(options, items, cli.prime);
       process.stdout.write(run.stdout);
       process.stderr.write(run.stderr);
+      if (run.assembled !== undefined) console.error(describeRouting(run.assembled, options, 'preload'));
       report(run.code, run.home, options);
       return run.code;
     } catch (error) {
@@ -336,6 +356,7 @@ async function main(): Promise<number> {
       if (error instanceof KimiCustodyError && error.run !== undefined) {
         process.stdout.write(error.run.stdout);
         process.stderr.write(error.run.stderr);
+        if (error.run.assembled !== undefined) console.error(describeRouting(error.run.assembled, options, 'preload'));
         report(error.run.code, error.run.home, options);
         return custodyKept(error);
       }
@@ -360,11 +381,14 @@ async function main(): Promise<number> {
         `of its session files are kept in ${ADOPTION_RECORD}/`,
     );
   }
+  console.error(
+    describeRouting(assembled, options, options.resume !== undefined || options.continueRecent === true ? 'resume' : 'new'),
+  );
   if (assembled.effort !== null && assembled.effortSupport === 'undeclared') {
     console.error(
-      `bare-kimi: effort "${assembled.effort}" is unchecked: the source config declares no ` +
-        `thinking efforts for model "${assembled.modelAlias}", so kimi decides at run time whether ` +
-        'it runs as given',
+      `bare-kimi: effort "${assembled.effort}" is unchecked: the source config lists no ` +
+        `support_efforts for model "${assembled.modelAlias}" (provider type ` +
+        `${assembled.providerType ?? 'unset'}), so kimi decides at run time whether it is sent as given`,
     );
   }
   const forward = (signal: NodeJS.Signals): void => {
@@ -405,6 +429,63 @@ function discardUnusedHome(home: string | undefined): void {
   } catch {
     // best effort: a leftover empty temp dir is harmless
   }
+}
+
+/** Where a 0.2 home's pinned alias came from when its stamp was upgraded. */
+const MIGRATION_ORIGIN: Readonly<Record<MigrationBasis, string>> = {
+  config: 'the alias its config.toml held, as bare-kimi 0.2 last wrote it',
+  digest: "the one alias whose source config reproduces the 0.2 stamp's digest",
+  caller: 'the alias the caller named; the home could not show it',
+  'source-default': "the source's default_model at the upgrade",
+};
+
+/**
+ * One stderr line naming what this run was routed to, from what bare-kimi
+ * prepared: the model alias the run home carries and where it came from, the
+ * provider type and model id, and the effort pinned or configured for new
+ * sessions with its support. It names no path, credential, URL or key. A
+ * resumed session keeps the effort it stored (observed in kimi 2.1.0 -p);
+ * --model makes it run on the named alias, else it keeps its own.
+ */
+function describeRouting(assembled: AssembledHome, options: LaunchOptions, run: 'new' | 'resume' | 'preload'): string {
+  const pinned = assembled.adopted ? 'pinned when the home was adopted' : 'pinned by the home';
+  const modelOrigin =
+    assembled.migrated !== null
+      ? `pinned at the upgrade of a bare-kimi 0.2 home: ${MIGRATION_ORIGIN[assembled.migrated.basis]}`
+      : assembled.action === 'adopt'
+        ? "named by the adopted home's config.toml"
+        : assembled.action === 'reuse'
+          ? pinned
+          : options.model !== undefined
+            ? 'selected'
+            : "the source's default_model";
+  const provider = `provider type ${assembled.providerType ?? 'unset'}${
+    assembled.modelId === undefined ? '' : `, model id ${assembled.modelId}`
+  }`;
+  let effort: string;
+  if (assembled.effort !== null) {
+    const effortOrigin =
+      assembled.action === 'adopt'
+        ? "named by the adopted home's [thinking]"
+        : assembled.action === 'reuse'
+          ? pinned
+          : 'selected';
+    effort = `effort "${assembled.effort}" (${effortOrigin}, ${assembled.effortSupport ?? 'unchecked'})`;
+  } else {
+    const configured =
+      assembled.configuredEffort === null ? "the model's default effort" : `effort "${assembled.configuredEffort}"`;
+    effort = `no effort pinned; config.toml gives new sessions ${configured} from the source's [thinking]`;
+  }
+  const kept = `keeps the effort it stored and ${
+    options.model === undefined ? 'the alias it stored' : 'runs on this alias, which --model names'
+  }`;
+  const resume =
+    run === 'resume'
+      ? `; this run resumes a session, which ${kept}`
+      : run === 'preload'
+        ? `; with --preload a primer run creates the session here and the call to action resumes it, which ${kept}`
+        : '';
+  return `bare-kimi: routed to model "${assembled.modelAlias}" (${modelOrigin}; ${provider}), ${effort}${resume}`;
 }
 
 /** The run ended, but cleanup kept something on purpose; say what and where. */

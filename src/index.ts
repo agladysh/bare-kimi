@@ -62,7 +62,7 @@ export {
   type ToolEvent,
 } from './events.ts';
 
-/** kimi's non-interactive output formats (kimi 2.0.1 `--output-format` choices). */
+/** kimi's non-interactive output formats (the `--output-format` choices of the installed kimi 2.1.0 bundle's `createProgram`). */
 export type OutputFormat = 'text' | 'stream-json';
 
 export interface LaunchOptions {
@@ -118,6 +118,18 @@ export interface LaunchOptions {
    * the source's default_model changes, and a different alias is refused
    * before any effect (use another home). Sessions such a home created under
    * an earlier alias are not covered by the pin.
+   *
+   * On a resume, as observed in kimi 2.1.0 `-p` with `--session` on an
+   * openai-type loopback provider (`--continue` takes the same path in the
+   * bundle, `resolveNativeSession`):
+   * without `--model` the session keeps the alias it stored; with `--model`
+   * the resumed session's requests use the named alias instead. bare-kimi
+   * passes `--model` only when this option is set, and only the alias the
+   * home is pinned to, so a session the home created on its pin stays on
+   * it. A session a 0.2 or adopted home created under an earlier alias is
+   * switched to the pin when `model` is given; without it, its own alias is
+   * looked up in config.toml, which carries only the pin, so kimi cannot
+   * resume it.
    */
   readonly model?: string;
   /**
@@ -129,16 +141,24 @@ export interface LaunchOptions {
    * like the model. Omitted: a new home carries the source's `[thinking]`, a
    * kept home keeps its pin.
    *
-   * Native semantics (kimi 2.1.0 `-p`): a session's effort is fixed when it
-   * is created and stored with it; a resume keeps it, whatever config.toml
-   * says later. Refused before any effect, on what the source config
-   * declares for the model: an effort missing from its `support_efforts`, a
-   * model declared without thinking, and `off` for a model declared
-   * always-thinking. Also refused: a `KIMI_MODEL_THINKING_EFFORT` in
-   * `extraEnv` or the spawn env, which overrides every request of the
-   * process, resumed ones included. An effort the config declares nothing
-   * about is taken, and the run's `assembled.effortSupport` is `undeclared`.
-   * kimi then decides at run time (see {@link AssembledHome.effortSupport}).
+   * Native semantics (kimi 2.1.0 `-p`, observed on a loopback provider): a
+   * session's effort is fixed when it is created and stored with it; a
+   * resume keeps it, whatever config.toml says later. Refused before any
+   * effect, on what the source config declares for the model and its
+   * provider's `type` (the full list, and which refusals are observed and
+   * which are policy, is at `checkEffort` in `home.ts`): an effort missing
+   * from its `support_efforts`; on a `kimi`-type provider, an effort for a
+   * model listing no `support_efforts` and setting no `protocol`, which kimi
+   * was observed not to send;
+   * an effort for a model declared without thinking (policy); `off` for a
+   * model listing the capability `always_thinking`; and, except on a
+   * `kimi`-type provider, `off` for a model listing `support_efforts` without
+   * `off_effort`. Also refused: a `KIMI_MODEL_THINKING_EFFORT` in `extraEnv`
+   * or the spawn env, which overrides every request of the process, resumed
+   * ones included; and an env-model variable (see {@link LaunchOptions.extraEnv}). An
+   * effort the config declares nothing about is otherwise taken, and the
+   * run's `assembled.effortSupport` is `undeclared`. kimi then decides at run
+   * time (see {@link AssembledHome.effortSupport}).
    */
   readonly effort?: string;
   /**
@@ -184,21 +204,30 @@ export interface LaunchOptions {
   /**
    * Extra environment, applied over the inherited layer. May re-add a
    * scrubbed variable explicitly, and may override the telemetry/auto-update
-   * defaults; may NOT override `KIMI_CODE_HOME`. A non-empty
+   * defaults; may NOT override `KIMI_CODE_HOME`. A non-blank
    * `KIMI_MODEL_THINKING_EFFORT` (here or in the spawn env) is refused
-   * beside `effort` and on a run home pinned to an effort. Any other
-   * `KIMI_MODEL_*` variable, here or in the spawn env and even empty, may
-   * switch kimi to its env model (see {@link isModelOverlayVar}): it is
-   * refused before any effect beside `model`, with a caller-supplied `home`,
-   * and in a preloaded run. Only an ephemeral launch without `model` takes
-   * it; {@link KimiSubprocess.modelOverlay} then names it, and
-   * `assembled.modelAlias` is not established as the model kimi runs.
+   * beside `effort` and on a run home pinned to an effort.
+   * `KIMI_MODEL_THINKING_KEEP` is taken on any launch: in kimi 2.1.0 it did
+   * not switch the model, and on a `kimi`-type provider it reached the
+   * request as `thinking.keep`. Any other `KIMI_MODEL_*` variable, here or in
+   * the spawn env and even blank, is an env-model variable (see
+   * {@link isModelOverlayVar}): it is refused before any effect beside
+   * `model` or `effort`, with a caller-supplied `home`, and in a preloaded
+   * run. Only an ephemeral launch without `model` and `effort` takes it;
+   * {@link KimiSubprocess.modelOverlay} then names it,
+   * `assembled.modelAlias` is not established as the model kimi runs, and
+   * `assembled.configuredEffort` is null.
    */
   readonly extraEnv?: Record<string, string>;
   /**
    * Extra arguments forwarded verbatim to kimi, just before `-p`. They may
-   * not select a model (`--model`, `-m`): use `model`, so the run home
-   * carries it.
+   * not select a model or a session, which kimi 2.1.0's `createProgram`
+   * reads from `-m`/`--model`, `-S`/`--session`, the hidden
+   * `-r`/`--resume`, `-c`/`--continue` and the hidden `-C`, in any spelling
+   * its parser takes (`--model=x`, `-mx`, a cluster such as `-yc`): use
+   * `model`, so the run home carries it, and `resume` or `continueRecent`,
+   * so their exclusivity and preload's fresh session hold. See
+   * {@link selectingArg}.
    */
   readonly extraArgs?: string[];
 }
@@ -218,9 +247,10 @@ interface ForcedEffort {
 /**
  * The forced effort the child's environment will carry, by the layering of
  * {@link buildEnv}: the inherited value is scrubbed, `extraEnv` wins over the
- * spawn env, and a blank value is taken as unset. That last reading comes
- * from kimi 2.1.0's env-model overlay (`trimmed$2`); whether the separate
- * binding of this variable (`envBindings`) trims it too is not established.
+ * spawn env, and a blank value is taken as unset. kimi 2.1.0 was observed to
+ * do the same: on a `kimi`-type provider, an empty or single-space value,
+ * natively and through bare-kimi, left the configured effort on the wire,
+ * where `low` and `max` replaced it.
  */
 function forcedEffort(
   extraEnv: Record<string, string> | undefined,
@@ -239,58 +269,139 @@ function forcedEffortConflict(layer: string): Error {
   );
 }
 
+/** kimi 2.1.0's env-model name, the variable observed to switch the model. */
+const ENV_MODEL_NAME = 'KIMI_MODEL_NAME';
+
+/** kimi 2.1.0's env-only override of `thinking.keep`. */
+const THINKING_KEEP_ENV = 'KIMI_MODEL_THINKING_KEEP';
+
 /**
- * Whether `name` may feed kimi 2.1.0's env-model overlay. When active, the
- * overlay adds a provider `__kimi_env__` and a model `__kimi_env_model__`
- * built from `KIMI_MODEL_*` variables and makes that model the default, so
- * a new session runs it instead of the run home's alias and is bound to it.
- * Which variable activates the overlay is not in the bundle excerpts read,
- * so every `KIMI_MODEL_*` name counts except {@link FORCED_EFFORT_ENV},
- * which kimi binds separately and {@link spawnKimi} checks on its own.
- * `KIMI_MODEL_THINKING_KEEP` counts: the overlay collects it as a model
- * override.
+ * Whether bare-kimi treats `name` as feeding kimi 2.1.0's env-model overlay,
+ * which adds a provider `__kimi_env__` and a model `__kimi_env_model__` and
+ * makes that model the default.
+ *
+ * Observed (kimi 2.1.0 `-p`, loopback provider, one turn each): a non-blank
+ * `KIMI_MODEL_NAME` with `KIMI_MODEL_BASE_URL` and `KIMI_MODEL_API_KEY`
+ * switched a new session's request to the env model, natively and through
+ * bare-kimi, and sent no effort although `[thinking]` configured one.
+ * Without the key, kimi bound the session to `__kimi_env_model__` and then
+ * exited 1 before any request. An empty or single-space `KIMI_MODEL_NAME`
+ * beside the key and base URL left the model and the configured effort as
+ * they were.
+ *
+ * Policy: which other variables feed the overlay is read from the bundle,
+ * not observed, so every `KIMI_MODEL_*` name counts, whatever its value,
+ * except two that kimi was observed to treat otherwise:
+ * {@link FORCED_EFFORT_ENV}, which {@link spawnKimi} checks on its own, and
+ * `KIMI_MODEL_THINKING_KEEP`, which alone left the model unchanged and
+ * reached a `kimi`-type request as `thinking.keep`.
  */
 export function isModelOverlayVar(name: string): boolean {
-  return name.startsWith('KIMI_MODEL_') && name !== FORCED_EFFORT_ENV;
+  return name.startsWith('KIMI_MODEL_') && name !== FORCED_EFFORT_ENV && name !== THINKING_KEEP_ENV;
 }
 
-/** A variable the child will see, and the layer that sets it. */
-interface ChildVariable {
+/** An env-model variable the child will see, and the layer that sets it. */
+interface ModelOverlay {
   readonly name: string;
   readonly layer: string;
+  /** It is a non-blank `KIMI_MODEL_NAME`, which was observed to switch the model. */
+  readonly observed: boolean;
 }
 
 /**
- * The first variable that may feed the env-model overlay and that the
- * child's environment will carry, by the layering of {@link buildEnv}: the
- * inherited layer is scrubbed, a name `extraEnv` sets is decided there, and
- * a spawn-env value of `undefined` deletes. An empty value counts: how kimi
- * reads the activating variable is not established.
+ * The env-model variable the child's environment will carry, by the
+ * layering of {@link buildEnv}: the inherited layer is scrubbed, a name
+ * `extraEnv` sets is decided there, and a spawn-env value of `undefined`
+ * deletes. A non-blank `KIMI_MODEL_NAME` is named first; otherwise the first
+ * other one, blank or not (see {@link isModelOverlayVar}).
  */
 function modelOverlay(
   extraEnv: Record<string, string> | undefined,
   spawnEnv: Record<string, string | undefined> | undefined,
-): ChildVariable | undefined {
-  const fromExtra = Object.keys(extraEnv ?? {}).find(isModelOverlayVar);
-  if (fromExtra !== undefined) return { name: fromExtra, layer: 'extraEnv' };
-  const fromSpawn = Object.entries(spawnEnv ?? {}).find(([name, value]) => value !== undefined && isModelOverlayVar(name));
-  return fromSpawn === undefined ? undefined : { name: fromSpawn[0], layer: 'the spawn env' };
+): ModelOverlay | undefined {
+  const fromExtra = extraEnv !== undefined && Object.hasOwn(extraEnv, ENV_MODEL_NAME);
+  const name = fromExtra ? extraEnv?.[ENV_MODEL_NAME] : spawnEnv?.[ENV_MODEL_NAME];
+  if (name !== undefined && name.trim().length > 0) {
+    return { name: ENV_MODEL_NAME, layer: fromExtra ? 'extraEnv' : 'the spawn env', observed: true };
+  }
+  const other = Object.keys(extraEnv ?? {}).find(isModelOverlayVar);
+  if (other !== undefined) return { name: other, layer: 'extraEnv', observed: false };
+  const fromSpawn = Object.entries(spawnEnv ?? {}).find(([key, value]) => value !== undefined && isModelOverlayVar(key));
+  return fromSpawn === undefined ? undefined : { name: fromSpawn[0], layer: 'the spawn env', observed: false };
 }
 
 /**
- * Refuse, before any effect, an env-model variable beside `model` or on a
- * caller-supplied (kept) home: a new session there could run another model
- * than the one asked for or pinned, and be bound to `__kimi_env_model__`,
- * which a later run without the variable could not resume.
+ * Refuse, before any effect, an env-model variable beside `model` or
+ * `effort`, or on a caller-supplied (kept) home. What each refusal rests on:
+ * - on a kept home: observed, a new session ran the env model instead of
+ *   the home's alias, and was bound to it even when kimi then failed;
+ *   whether a later run without the variable can resume it was not examined;
+ * - beside `effort`: observed, with the env model active kimi sent no
+ *   effort although `[thinking]` configured one;
+ * - beside `model`: policy. Natively, `--model` beside the overlay requested
+ *   the named alias; which model such a session is bound to was not
+ *   examined.
+ * Any env-model variable but a non-blank `KIMI_MODEL_NAME` is refused on the
+ * same terms as policy (see {@link isModelOverlayVar}).
  */
-function checkModelOverlay(variable: ChildVariable | undefined, model: string | undefined, kept: boolean): void {
+function checkModelOverlay(
+  variable: ModelOverlay | undefined,
+  model: string | undefined,
+  effort: string | undefined,
+  kept: boolean,
+): void {
   if (variable === undefined) return;
-  const why = model !== undefined ? `beside model "${model}"` : kept ? 'on a kept run home' : undefined;
-  if (why === undefined) return;
-  throw new Error(
-    `${variable.name} in ${variable.layer} may switch kimi to its env model (__kimi_env_model__) instead of ` +
-      `the run home's alias; refused ${why} (only an ephemeral launch without model may set it)`,
-  );
+  let why: string;
+  let observed: string;
+  if (model !== undefined) {
+    why = `beside model "${model}"`;
+    observed =
+      'beside --model, kimi requested the named alias, but which model such a session is bound to was not ' +
+      'examined, so this is policy';
+  } else if (effort !== undefined) {
+    why = `beside effort "${effort}"`;
+    observed = 'with the env model active, kimi sent no effort although one was configured';
+  } else if (kept) {
+    why = 'on a kept run home';
+    observed = "a new session ran the env model instead of the home's alias and was bound to it";
+  } else {
+    return;
+  }
+  const what = variable.observed
+    ? `${variable.name} in ${variable.layer} switches kimi 2.1.0 to its env model (__kimi_env_model__), as ` +
+      `observed; ${observed}`
+    : `${variable.name} in ${variable.layer} is an env-model variable: only a non-blank ${ENV_MODEL_NAME} was ` +
+      'observed to switch kimi to its env model (__kimi_env_model__), and bare-kimi refuses the others as policy';
+  throw new Error(`${what}; refused ${why} (only an ephemeral launch without model or effort may set it)`);
+}
+
+/** kimi 2.1.0's short flags that take no value (`-c`, `-C`, `-y`, `-h`, `-V`), which a cluster may chain. */
+const CHAINABLE_SHORT_FLAGS = new Set(['c', 'C', 'y', 'h', 'V']);
+
+/**
+ * Whether `arg` selects the model or a session, as kimi 2.1.0's
+ * command-line parser (`createProgram`, commander) reads an option argument:
+ * `--model`, `--session`, `--resume` or `--continue`, alone or with
+ * `=value`; or `-m`, `-S`, `-r`, `-c` or `-C`, alone, with a value attached
+ * (`-mx`), or reached through a cluster of flags that take no value (`-yc`).
+ * A cluster stops at any other letter: a flag that takes a value ends it,
+ * and kimi rejects an unknown one. An argument meant as the value of the one
+ * before it is read the same way, so such a value is refused when it looks
+ * like one of these flags.
+ */
+function selectingArg(arg: string): 'model' | 'session' | undefined {
+  if (arg.startsWith('--')) {
+    const name = arg.slice(2).split('=', 1)[0];
+    if (name === 'model') return 'model';
+    return name === 'session' || name === 'resume' || name === 'continue' ? 'session' : undefined;
+  }
+  if (!arg.startsWith('-')) return undefined;
+  for (const flag of arg.slice(1)) {
+    if (flag === 'm') return 'model';
+    if (flag === 'S' || flag === 'r' || flag === 'c' || flag === 'C') return 'session';
+    if (!CHAINABLE_SHORT_FLAGS.has(flag)) return undefined;
+  }
+  return undefined;
 }
 
 export function LaunchConfig(o: LaunchOptions): LaunchConfig {
@@ -302,9 +413,18 @@ export function LaunchConfig(o: LaunchOptions): LaunchConfig {
   if (o.effort !== undefined && forcedEffort(o.extraEnv, undefined) !== undefined) {
     throw forcedEffortConflict('extraEnv');
   }
-  checkModelOverlay(modelOverlay(o.extraEnv, undefined), o.model, o.home !== undefined && o.home.length > 0);
-  if ((o.extraArgs ?? []).some((arg) => arg === '--model' || arg === '-m' || arg.startsWith('--model='))) {
-    throw new Error('pass the model as the model option, not in extraArgs: the run home must carry it');
+  checkModelOverlay(modelOverlay(o.extraEnv, undefined), o.model, o.effort, o.home !== undefined && o.home.length > 0);
+  for (const arg of o.extraArgs ?? []) {
+    const selects = selectingArg(arg);
+    if (selects === 'model') {
+      throw new Error(`extraArgs ${JSON.stringify(arg)} selects a model; pass it as the model option: the run home must carry it`);
+    }
+    if (selects === 'session') {
+      throw new Error(
+        `extraArgs ${JSON.stringify(arg)} selects a session; pass it as resume or continueRecent, which are ` +
+          'exclusive and which a preloaded run refuses',
+      );
+    }
   }
   if (o.adoptLegacyHome === true && (o.home === undefined || o.home.length === 0)) {
     throw new Error('adoptLegacyHome needs a caller-supplied home');
@@ -348,7 +468,7 @@ export function assertSafePrompt(prompt: string): void {
  * Every check on launch options that needs no filesystem: prompt shape,
  * option conflicts, and the selection checks that need no config (an empty
  * model or effort, an effort beside a forced one in `extraEnv`, an env-model
- * variable in `extraEnv` beside `model` or a `home`, a model in `extraArgs`,
+ * variable in `extraEnv` beside `model`, `effort` or a `home`, a model in `extraArgs`,
  * adoption without a home). spawnKimi runs it first; a caller
  * that does its own setup (the CLI's --keep-home) runs it before that setup.
  * Checks against the source config are {@link previewRunHome}'s.
@@ -362,8 +482,10 @@ export function checkLaunchOptions(options: LaunchOptions): LaunchConfig {
  * The command vector handed to Bun.spawn. `-p <prompt>` is always last:
  * kimi's flag parser accepts flags after the prompt, but keeping the prompt
  * terminal means a prompt that looks like a value can never be swallowed by
- * a trailing flag. Flags verified 2026-09-24 against kimi-code @ 6451f1e
- * `apps/kimi-code/src/cli/commands.ts` (installed kimi 2.0.1).
+ * a trailing flag. Flags as read from the installed kimi 2.1.0 bundle's
+ * `createProgram`: `-m/--model <model>`, `-S/--session [id]`,
+ * `-c/--continue`, repeatable `--skills-dir <dir>` and `--add-dir <dir>`,
+ * `--output-format <text|stream-json>`, `-p/--prompt <prompt>`.
  */
 export function buildArgv(config: LaunchConfig, kimiBin: string): string[] {
   const argv: string[] = [kimiBin];
@@ -390,20 +512,21 @@ export function buildArgv(config: LaunchConfig, kimiBin: string): string[] {
  * - `KIMI_DISABLE_OAUTH_LOCK` — opts out of the cross-process refresh lock;
  *   link mode's shared-lineage guarantee depends on that lock.
  * - `KIMI_MODEL_*` — the engine's env overlay can inject a whole
- *   provider+model+default_model over the assembled config. The prefix also
- *   covers `KIMI_MODEL_THINKING_EFFORT` and `KIMI_MODEL_THINKING_KEEP`
- *   (kimi 2.1.0 env-only overrides of the thinking effort and keep), so an
- *   ambient value cannot silently replace the `[thinking]` table the run
- *   home carries.
+ *   provider+model+default_model over the assembled config (see
+ *   {@link isModelOverlayVar}). The prefix also covers
+ *   `KIMI_MODEL_THINKING_EFFORT` and `KIMI_MODEL_THINKING_KEEP` (kimi 2.1.0
+ *   env-only overrides of the thinking effort and keep, which do not switch
+ *   the model), so an ambient value cannot silently replace the `[thinking]`
+ *   table the run home carries.
  * - `KIMI_SECONDARY_*` — kimi 2.1.0 reads `KIMI_SECONDARY_MODEL` and
  *   `KIMI_SECONDARY_EFFORT` as overrides of the secondary (subagent) model
  *   and its effort. The run home carries no `[secondary_model]`; what the
  *   variables do in `-p` without it is not established.
  *
  * All of these can be re-added deliberately via {@link LaunchOptions.extraEnv},
- * except that a `KIMI_MODEL_*` variable that may switch kimi to its env model
- * ({@link isModelOverlayVar}) is taken only by an ephemeral launch without
- * `model`, and refused before any effect otherwise.
+ * except that an env-model variable ({@link isModelOverlayVar}) is taken only
+ * by an ephemeral launch without `model` and `effort`, and refused before
+ * any effect otherwise.
  * To choose an effort, use {@link LaunchOptions.effort}: it is written into
  * the run home and stored with each new session. `KIMI_MODEL_THINKING_EFFORT`
  * in `extraEnv` instead forces an effort on every request of that process,
@@ -500,12 +623,21 @@ export interface KimiSubprocess<
   readonly subprocess: Bun.Subprocess<In, Out, Err>;
   /** The resolved, absolute run home (also the child's `KIMI_CODE_HOME`). */
   readonly home: string;
-  /** The run home as prepared: its model, effort, source, and whether it was created, reused or adopted. */
+  /**
+   * The run home as prepared: its model, effort, source, and whether it was
+   * created, reused or adopted. With {@link modelOverlay} set, `effort` and
+   * `effortSupport` are null (no effort may be selected then) and so is
+   * `configuredEffort`: the home's config.toml still carries the source's
+   * `[thinking]`, but with the env model active kimi 2.1.0 was observed not
+   * to send its effort. `modelAlias` remains the alias that config.toml
+   * carries, which kimi then does not run.
+   */
   readonly assembled: AssembledHome;
   /**
    * The env-model variable the child sees (see {@link isModelOverlayVar}),
-   * which only an ephemeral launch without `model` may set; else null. When
-   * set, kimi may run its env model rather than `assembled.modelAlias`.
+   * which only an ephemeral launch without `model` and `effort` may set; else
+   * null. When set, kimi may run its env model rather than
+   * `assembled.modelAlias`, as a non-blank `KIMI_MODEL_NAME` was observed to.
    */
   readonly modelOverlay: string | null;
   /** Whether spawnKimi created the home (and dispose will remove it). */
@@ -585,8 +717,8 @@ export class KimiCustodyError extends Error {
  * `KIMI_MODEL_THINKING_EFFORT` that the child would see (from `extraEnv` or
  * `spawnOptions.env`) is refused beside `effort` before anything is made. On a
  * run home pinned to an effort it is refused before that home is prepared.
- * Another `KIMI_MODEL_*` variable the child would see is refused beside
- * `model` and on a caller-supplied `home` before anything is made (see
+ * An env-model variable the child would see is refused beside `model` or
+ * `effort` and on a caller-supplied `home` before anything is made (see
  * {@link LaunchOptions.extraEnv}).
  *
  * @throws {KimiSpawnError} when the binary cannot be executed. Home-assembly
@@ -606,7 +738,7 @@ export function spawnKimi<
   if (config.effort !== undefined && forced !== undefined) throw forcedEffortConflict(forced.layer);
   const ephemeral = config.home.length === 0;
   const overlay = modelOverlay(config.extraEnv, spawnOptions.env);
-  checkModelOverlay(overlay, config.model, !ephemeral);
+  checkModelOverlay(overlay, config.model, config.effort, !ephemeral);
 
   const cwd = config.cwd.length > 0 ? config.cwd : (spawnOptions.cwd ?? process.cwd());
   // Absolute before anything else sees it: the child runs in `cwd` and would
@@ -665,7 +797,8 @@ export function spawnKimi<
     return {
       subprocess,
       home,
-      assembled,
+      assembled:
+        overlay === undefined ? assembled : { ...assembled, effort: null, effortSupport: null, configuredEffort: null },
       modelOverlay: overlay?.name ?? null,
       ephemeral,
       cwd,
@@ -720,6 +853,11 @@ export interface KimiRun {
   readonly unparsed: string[];
   /** Spawn error message, when `code` is 127. */
   readonly spawnError: string | undefined;
+  /**
+   * The run home as prepared for this run, as {@link KimiSubprocess.assembled}
+   * reports it; undefined when the binary could not be spawned.
+   */
+  readonly assembled: AssembledHome | undefined;
 }
 
 const SIGNAL_NUMBERS: Record<string, number> = {
@@ -781,9 +919,10 @@ export async function runKimi(launchOptions: LaunchOptions): Promise<KimiRun> {
       events: [],
       unparsed: [],
       spawnError: error.message,
+      assembled: undefined,
     };
   }
-  const { subprocess, home } = launched;
+  const { subprocess, home, assembled } = launched;
   let run: KimiRun;
   try {
     const [stdout, stderr] = await Promise.all([
@@ -806,6 +945,7 @@ export async function runKimi(launchOptions: LaunchOptions): Promise<KimiRun> {
       events: parsed.events,
       unparsed: parsed.unparsed,
       spawnError: undefined,
+      assembled,
     };
   } catch (error) {
     // The run's own failure is the one reported; whatever cleanup keeps

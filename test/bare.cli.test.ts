@@ -693,14 +693,45 @@ describe('model, effort and source identity', () => {
     expect(readSessionReports(out)).toEqual([]);
   });
 
-  test('--effort on a model that declares no efforts runs, and says it was not checked; a declared one says nothing', async () => {
+  test('--effort on a kimi-type model listing no support_efforts is refused before any home or kimi; off runs', async () => {
+    // kimi 2.1.0 was observed to send no effort level for such a model on a
+    // kimi-type provider; -p reads the efforts from config.toml alone.
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    const home = join(root, 'kept-home');
+    const out = join(root, 'sessions.ndjson');
+
+    const refused = await runCli(['--home', home, '--effort', 'high', '--', 'x'], {
+      srcHome: src,
+      env: { FAKE_KIMI_SESSION_OUT: out },
+    });
+
+    expect(refused.code).toBe(2);
+    expect(refused.stderr).toContain('model "kimi-code/k3" lists no support_efforts');
+    expect(refused.stderr).toContain('refusing effort "high"');
+    expect(existsSync(home)).toBe(false);
+    expect(readSessionReports(out)).toEqual([]);
+
+    const off = await runCli(['--home', home, '--effort', 'off', '--', 'x'], { srcHome: src, env: { FAKE_KIMI_SESSION_OUT: out } });
+    expect(off.code).toBe(0);
+    expect(readSessionReports(out).map((report) => [report.model, report.storedEffort])).toEqual([['kimi-code/k3', 'off']]);
+  });
+
+  test('--effort on an openai-type model listing no support_efforts runs, and says it was not checked; a declared one says nothing', async () => {
     const root = temp('bare-kimi-test-');
     const src = makeSourceHome(root);
     addSelectableModels(src);
+    writeFileSync(
+      join(src, 'config.toml'),
+      '\n[models."other/plain"]\nprovider = "other"\nmodel = "plain-1"\nmax_context_size = 131072\ncapabilities = ["thinking"]\n',
+      { flag: 'a' },
+    );
     const out = join(root, 'sessions.ndjson');
 
-    // The managed default declares neither capabilities nor support_efforts.
-    const unchecked = await runCli(['--effort', 'high', '--', 'x'], { srcHome: src, env: { FAKE_KIMI_SESSION_OUT: out } });
+    const unchecked = await runCli(['--model', 'other/plain', '--effort', 'high', '--', 'x'], {
+      srcHome: src,
+      env: { FAKE_KIMI_SESSION_OUT: out },
+    });
     const checked = await runCli(['--model', 'kimi-code/k3-thinking', '--effort', 'high', '--', 'x'], {
       srcHome: src,
       env: { FAKE_KIMI_SESSION_OUT: out },
@@ -708,12 +739,119 @@ describe('model, effort and source identity', () => {
 
     expect([unchecked.code, checked.code]).toEqual([0, 0]);
     expect(unchecked.stderr).toContain('effort "high" is unchecked');
-    expect(unchecked.stderr).toContain('model "kimi-code/k3"');
+    expect(unchecked.stderr).toContain('model "other/plain"');
     expect(checked.stderr).not.toContain('unchecked');
     expect(readSessionReports(out).map((report) => [report.model, report.storedEffort])).toEqual([
-      ['kimi-code/k3', 'high'],
+      ['other/plain', 'high'],
       ['kimi-code/k3-thinking', 'high'],
     ]);
+  });
+
+  test('each run names what it was routed to: selected, then pinned by the kept home, then a resume', async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const home = join(root, 'kept-home');
+    const out = join(root, 'sessions.ndjson');
+    const env = { srcHome: src, env: { FAKE_KIMI_SESSION_OUT: out } };
+
+    const first = await runCli(['--home', home, '--model', 'kimi-code/k3-thinking', '--effort', 'high', '--', 'x'], env);
+    const again = await runCli(['--home', home, '--', 'y'], env);
+    const sessionId = readSessionReports(out)[0]!.sessionId;
+    const resumed = await runCli(['--home', home, '--resume', sessionId, '--', 'z'], env);
+
+    expect([first.code, again.code, resumed.code]).toEqual([0, 0, 0]);
+    expect(first.stderr).toContain(
+      'bare-kimi: routed to model "kimi-code/k3-thinking" (selected; provider type kimi, model id k3-thinking), ' +
+        'effort "high" (selected, declared)',
+    );
+    expect(again.stderr).toContain(
+      'bare-kimi: routed to model "kimi-code/k3-thinking" (pinned by the home; provider type kimi, model id k3-thinking), ' +
+        'effort "high" (pinned by the home, declared)',
+    );
+    expect(resumed.stderr).toContain('this run resumes a session, which keeps the effort it stored and the alias it stored');
+    // What the line names is what the child ran.
+    expect(readSessionReports(out).map((report) => [report.model, report.storedEffort, report.resumed])).toEqual([
+      ['kimi-code/k3-thinking', 'high', false],
+      ['kimi-code/k3-thinking', 'high', false],
+      ['kimi-code/k3-thinking', 'high', true],
+    ]);
+    const line = first.stderr.split('\n').find((text) => text.startsWith('bare-kimi: routed'))!;
+    expect(line).not.toContain(src);
+    expect(line).not.toContain('https://');
+  });
+
+  test("a bare-kimi 0.2 home's upgrade names how its alias was established, including a caller's assertion", async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const fromConfig = join(root, 'from-config');
+    const named = join(root, 'named');
+    for (const home of [fromConfig, named]) {
+      expect((await runCli(['--home', home, '--', 'x'], { srcHome: src })).code).toBe(0);
+      const stampPath = join(home, '.bare-kimi-home');
+      const stamp = JSON.parse(readFileSync(stampPath, 'utf-8'));
+      writeFileSync(stampPath, `${JSON.stringify({ version: 1, source: stamp.source, config: stamp.config })}\n`);
+    }
+    rmSync(join(named, 'config.toml'));
+    // A carried table changes: no alias reproduces the 0.2 stamp's digest any more.
+    writeFileSync(join(src, 'config.toml'), '\n[[permission.rules]]\ndecision = "deny"\npattern = "Bash(rm *)"\n', {
+      flag: 'a',
+    });
+
+    const config = await runCli(['--home', fromConfig, '--', 'y'], { srcHome: src });
+    const unknown = await runCli(['--home', named, '--', 'y'], { srcHome: src });
+    const caller = await runCli(['--home', named, '--model', 'kimi-code/k3', '--', 'y'], { srcHome: src });
+
+    expect([config.code, unknown.code, caller.code]).toEqual([0, 2, 0]);
+    expect(config.stderr).toContain(
+      'routed to model "kimi-code/k3" (pinned at the upgrade of a bare-kimi 0.2 home: the alias its config.toml held',
+    );
+    expect(unknown.stderr).toContain('the model alias the home last configured is unknown');
+    expect(caller.stderr).toContain(
+      'routed to model "kimi-code/k3" (pinned at the upgrade of a bare-kimi 0.2 home: the alias the caller named; ' +
+        'the home could not show it',
+    );
+  });
+
+  test('a preloaded run names what its call to action was routed to', async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const fact = join(root, 'fact.md');
+    writeFileSync(fact, 'The answer is synthesized.\n');
+
+    const run = await runCli(['--preload', fact, '--model', 'kimi-code/k3-thinking', '--effort', 'high', '--', 'x'], {
+      srcHome: src,
+    });
+
+    expect(run.code).toBe(0);
+    expect(run.stderr).toContain('routed to model "kimi-code/k3-thinking"');
+    expect(run.stderr).toContain('effort "high"');
+    expect(run.stderr).toContain(
+      'with --preload a primer run creates the session here and the call to action resumes it, which keeps the ' +
+        'effort it stored and runs on this alias, which --model names',
+    );
+  });
+
+  test.each([
+    ['--kimi-arg=-mkimi-code/k3-thinking', 'selects a model'],
+    ['--kimi-arg=--model=kimi-code/k3-thinking', 'selects a model'],
+    ['--kimi-arg=-yc', 'selects a session'],
+    ['--kimi-arg=--session=session_a', 'selects a session'],
+  ])('%s is refused before any home or kimi', async (arg, message) => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const home = join(root, 'kept-home');
+    const out = join(root, 'sessions.ndjson');
+
+    const run = await runCli(['--home', home, arg, '--', 'x'], { srcHome: src, env: { FAKE_KIMI_SESSION_OUT: out } });
+
+    expect(run.code).toBe(2);
+    expect(run.stderr).toContain(message);
+    expect(existsSync(home)).toBe(false);
+    expect(readSessionReports(out)).toEqual([]);
   });
 
   test('a kept home runs on the source it is stamped with; another source is refused before kimi', async () => {

@@ -1210,19 +1210,27 @@ describe('effort selection', () => {
     expect(readStampJson(dst)).toMatchObject({ version: 2, model: 'kimi-code/k3-thinking', effort: 'high' });
   });
 
-  test('off disables thinking, and is refused for a model that always thinks', () => {
+  test('off disables thinking, and is refused for a model listing the capability always_thinking', () => {
     const root = temp('bare-kimi-home-');
     const src = makeSourceHome(root);
     addSelectableModels(src);
 
+    // kimi-type, support_efforts listed, no off_effort: taken, as kimi 2.1.0 was observed to disable thinking there.
     const off = prepareRunHome(src, join(root, 'off'), 'link', { model: 'kimi-code/k3-thinking', effort: 'off' });
-    expect(off).toMatchObject({ effort: 'off', configuredEffort: 'off' });
+    expect(off).toMatchObject({ effort: 'off', configuredEffort: 'off', effortSupport: 'declared' });
     expect(parseToml(readFileSync(off.configPath, 'utf-8'))['thinking']).toEqual({ enabled: false });
 
     const always = join(root, 'always');
-    expect(() => prepareRunHome(src, always, 'link', { model: 'kimi-code/k3-always', effort: 'off' })).toThrow(
-      'always thinks',
-    );
+    let refusal = '';
+    try {
+      prepareRunHome(src, always, 'link', { model: 'kimi-code/k3-always', effort: 'off' });
+    } catch (error) {
+      refusal = (error as Error).message;
+    }
+    // Observed on the openai type only: on this kimi-type model the refusal is policy, and says so.
+    expect(refusal).toContain('lists the capability "always_thinking"');
+    expect(refusal).toContain('on a kimi-type provider that is untested, and bare-kimi refuses it as policy');
+    expect(refusal).not.toContain('would ignore');
     expect(existsSync(always)).toBe(false);
     expect(prepareRunHome(src, always, 'link', { model: 'kimi-code/k3-always', effort: 'high' }).configuredEffort).toBe(
       'high',
@@ -1342,22 +1350,24 @@ describe('effort selection', () => {
  * - custom-registry models are written with `capabilities` derived from
  *   `reasoning` or a non-empty `support_efforts` (capabilitiesFromCustomEntry),
  *   and with `supportEfforts: model.support_efforts`, which may be absent;
- * - "Non-Kimi providers receive effort strings without client-side mapping"
- *   (appendThinkingEffortConfigHint); strict thinking validation depends on
- *   the provider type (requiresStrictThinkingValidation);
+ * - strict thinking validation depends on the provider type and the model's
+ *   protocol (requiresStrictThinkingValidation);
  * - a managed model's efforts come from the provider's /models catalog
  *   (parseThinkEfforts), which bare-kimi does not read.
- * What the declaration excludes is refused; what it leaves open is taken and
- * reported as `undeclared`, never refused as if unsupported.
+ * Native wire observations (kimi 2.1.0 `-p`, loopback provider) decide the
+ * kimi- and openai-type cases; see checkEffort in home.ts. What the
+ * declaration leaves open, where no observation shows otherwise, is taken
+ * and reported as `undeclared`, never refused as if unsupported.
  */
 describe('effort selection: partial model declarations', () => {
-  function registrySource(root: string, declaration: string): string {
+  /** A source whose `registry/reasoner` has `declaration` on a provider with `typeLine` (empty: no type). */
+  function registrySource(root: string, declaration: string, typeLine = 'type = "openai"'): string {
     const src = makeSourceHome(root);
     editConfig(
       src,
       (text) => `${text}
 [providers."registry"]
-type = "openai"
+${typeLine}
 base_url = "https://registry.example/v1"
 api_key = ""
 
@@ -1369,6 +1379,18 @@ ${declaration}
 `,
     );
     return src;
+  }
+
+  /** The refusal message of preparing `dst` with `effort`, after checking nothing was made. */
+  function refusal(src: string, dst: string, effort: string): string {
+    let message = '';
+    try {
+      prepareRunHome(src, dst, 'link', { model: 'registry/reasoner', effort });
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(existsSync(dst)).toBe(false);
+    return message;
   }
 
   test('an openai-type model declaring thinking without support_efforts takes a selected effort, reported undeclared', () => {
@@ -1399,16 +1421,17 @@ ${declaration}
     expect(existsSync(max)).toBe(false);
   });
 
-  test('a model declared without thinking refuses an effort before any effect, but takes off', () => {
+  test('a model declared without thinking refuses an effort as policy before any effect, but takes off', () => {
     // As native writes a registry model whose rich fields omit reasoning and efforts.
     const root = temp('bare-kimi-home-');
     const src = registrySource(root, 'capabilities = ["tool_use", "image_in"]');
     const dst = join(root, 'run-home');
 
-    expect(() => prepareRunHome(src, dst, 'link', { model: 'registry/reasoner', effort: 'high' })).toThrow(
-      'declared without thinking',
-    );
-    expect(existsSync(dst)).toBe(false);
+    const message = refusal(src, dst, 'high');
+    expect(message).toContain('declared without thinking');
+    // kimi 2.1.0 sent such an effort on the openai type: the refusal is policy, not a native rejection.
+    expect(message).toContain('as policy');
+    expect(message).not.toContain('would not run');
     expect(prepareRunHome(src, dst, 'link', { model: 'registry/reasoner', effort: 'off' })).toMatchObject({
       effort: 'off',
       effortSupport: 'declared',
@@ -1424,26 +1447,79 @@ ${declaration}
     ).toMatchObject({ effort: 'max', effortSupport: 'undeclared' });
   });
 
-  test('the managed default model, declared without capabilities or support_efforts, takes an effort, reported undeclared', () => {
-    // Its efforts are the provider catalog's, which bare-kimi does not read
-    // (no network or login reads): neither refused nor claimed as checked.
+  test('the managed default model, kimi-type and listing no support_efforts, refuses an effort before any effect; off is taken', () => {
+    // On a kimi-type provider kimi 2.1.0 sent no effort for a model listing
+    // none (loopback, no catalog). Efforts a provider catalog might list at
+    // run time are not read, so nothing offline shows one would be sent.
     const root = temp('bare-kimi-home-');
     const src = makeSourceHome(root);
+    rmSync(join(src, 'oauth'), { recursive: true });
     const dst = join(root, 'run-home');
 
-    const assembled = prepareRunHome(src, dst, 'link', { effort: 'high' });
+    expect(() => prepareRunHome(src, dst, 'link', { effort: 'high' })).toThrow(
+      'model "kimi-code/k3" lists no support_efforts, and on a kimi-type provider kimi 2.1.0 was observed to send no effort',
+    );
+    let message = '';
+    try {
+      previewRunHome(src, dst, 'link', { effort: 'max' });
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain('refusing effort "max" (choose no effort)');
+    // Only kimi writes a managed model's efforts; the refusal must not suggest declaring them by hand.
+    expect(message).not.toMatch(/\bdeclare\b/i);
+    expect(existsSync(dst)).toBe(false);
+    expect(existsSync(join(src, 'oauth'))).toBe(false);
 
-    expect(assembled).toMatchObject({
-      modelAlias: 'kimi-code/k3',
+    expect(prepareRunHome(src, join(root, 'off'), 'link', { effort: 'off' })).toMatchObject({
       providerType: 'kimi',
-      effort: 'high',
-      configuredEffort: 'high',
+      effort: 'off',
       effortSupport: 'undeclared',
     });
-    expect(readStampJson(dst)).toMatchObject({ model: 'kimi-code/k3', effort: 'high' });
-    expect(prepareRunHome(src, join(root, 'off'), 'link', { effort: 'off' }).effortSupport).toBe('undeclared');
     // Still a lowercase effort name, like any other.
     expect(() => prepareRunHome(src, join(root, 'bad'), 'link', { effort: 'High' })).toThrow('lowercase effort name');
+  });
+
+  test('the same thinking model without support_efforts: refused on the kimi type, taken as undeclared on openai', () => {
+    const root = temp('bare-kimi-home-');
+    const declaration = 'capabilities = ["thinking"]';
+    const strict = registrySource(join(root, 'kimi'), declaration, 'type = "kimi"');
+    const openai = registrySource(join(root, 'openai'), declaration);
+
+    for (const effort of ['high', 'max']) {
+      expect(refusal(strict, join(root, `kimi-${effort}`), effort)).toContain('lists no support_efforts');
+      expect(
+        prepareRunHome(openai, join(root, `openai-${effort}`), 'link', { model: 'registry/reasoner', effort }),
+      ).toMatchObject({ effort, effortSupport: 'undeclared' });
+    }
+  });
+
+  test('on the kimi type a listed effort is declared and an unlisted one refused; overrides decide the list', () => {
+    const root = temp('bare-kimi-home-');
+    const src = registrySource(
+      root,
+      'capabilities = ["thinking"]\n\n[models."registry/reasoner".overrides]\nsupport_efforts = ["low", "high"]',
+      'type = "kimi"',
+    );
+
+    expect(
+      prepareRunHome(src, join(root, 'high'), 'link', { model: 'registry/reasoner', effort: 'high' }),
+    ).toMatchObject({ effort: 'high', effortSupport: 'declared' });
+    expect(refusal(src, join(root, 'max'), 'max')).toContain('support_efforts (low, high)');
+  });
+
+  test.each([
+    ['a provider without a type', '', 'capabilities = ["thinking"]'],
+    ['an unobserved provider type', 'type = "anthropic"', 'capabilities = ["thinking"]'],
+    // As kimi writes a managed model whose catalog entry names the anthropic protocol.
+    ['a kimi-type model that sets protocol', 'type = "kimi"', 'capabilities = ["thinking"]\nprotocol = "anthropic"'],
+  ])('%s does not inherit the kimi-type refusal: an effort is taken as undeclared', (_label, typeLine, declaration) => {
+    const root = temp('bare-kimi-home-');
+    const src = registrySource(root, declaration, typeLine);
+
+    expect(
+      prepareRunHome(src, join(root, 'run-home'), 'link', { model: 'registry/reasoner', effort: 'high' }),
+    ).toMatchObject({ effort: 'high', effortSupport: 'undeclared' });
   });
 
   test('a fully declared model reports its effort as declared; no effort reports none', () => {
@@ -1455,6 +1531,116 @@ ${declaration}
       prepareRunHome(src, join(root, 'high'), 'link', { model: 'kimi-code/k3-thinking', effort: 'high' }).effortSupport,
     ).toBe('declared');
     expect(prepareRunHome(src, join(root, 'none'), 'link', { model: 'kimi-code/k3-thinking' }).effortSupport).toBeNull();
+  });
+});
+
+/**
+ * `off` against kimi 2.1.0's wire (`-p`, loopback provider). openai type: a
+ * model listing support_efforts = ["high"] or ["low", "high"] without
+ * off_effort failed before any request and exited 1; with off_effort =
+ * "none" it sent "none"; capability-only and no metadata sent no thinking
+ * field. kimi type: support_efforts = ["high"], and ["low", "high"] with or
+ * without off_effort, and capability-only thinking sent thinking disabled.
+ * For these lists, the exact-list crosses rule out list length as what differs
+ * between the types. The capability string
+ * always_thinking sent an effort despite off (openai type); the Boolean
+ * field always_thinking = true changed nothing.
+ */
+describe('effort selection: off', () => {
+  function offSource(root: string, typeLine: string, declaration: string): string {
+    const src = makeSourceHome(root);
+    editConfig(
+      src,
+      (text) => `${text}
+[providers."loop"]
+${typeLine}
+base_url = "https://loop.example/v1"
+api_key = ""
+
+[models."loop/m"]
+provider = "loop"
+model = "m"
+max_context_size = 131072
+${declaration}
+`,
+    );
+    return src;
+  }
+
+  /** What preparing `off` yields: the effort support, or the refusal (after checking nothing was made). */
+  function off(typeLine: string, declaration: string): string {
+    const root = temp('bare-kimi-home-');
+    const src = offSource(root, typeLine, declaration);
+    const dst = join(root, 'run-home');
+    try {
+      return String(prepareRunHome(src, dst, 'link', { model: 'loop/m', effort: 'off' }).effortSupport);
+    } catch (error) {
+      expect(existsSync(dst)).toBe(false);
+      return `refused: ${(error as Error).message}`;
+    }
+  }
+
+  const OPENAI = 'type = "openai"';
+  const KIMI = 'type = "kimi"';
+
+  test('openai type: support_efforts without off_effort is refused as observed, naming the remedy', () => {
+    const single = off(OPENAI, 'capabilities = ["thinking"]\nsupport_efforts = ["high"]');
+    expect(single).toStartWith('refused: model "loop/m" lists support_efforts but no off_effort');
+    expect(single).toContain('declare the model\'s off_effort, e.g. "none"');
+    expect(off(OPENAI, 'support_efforts = ["high"]')).toStartWith('refused:');
+    // The exact-list cross failed the two-entry list too: no longer labelled policy.
+    const two = off(OPENAI, 'support_efforts = ["low", "high"]');
+    expect(two).toContain('observed for support_efforts = ["high"] and ["low", "high"]');
+    expect(two).not.toContain('policy');
+  });
+
+  test('openai type: off_effort, from the model or its overrides, or no support_efforts, takes off', () => {
+    expect(off(OPENAI, 'capabilities = ["thinking"]\nsupport_efforts = ["high"]\noff_effort = "none"')).toBe('declared');
+    expect(
+      off(OPENAI, 'support_efforts = ["high"]\n\n[models."loop/m".overrides]\noff_effort = "none"'),
+    ).toBe('declared');
+    expect(off(OPENAI, 'capabilities = ["thinking"]')).toBe('declared');
+    expect(off(OPENAI, '')).toBe('undeclared');
+    // A blank off_effort declares none.
+    expect(off(OPENAI, 'support_efforts = ["high"]\noff_effort = " "')).toStartWith('refused:');
+  });
+
+  test('kimi type: support_efforts without off_effort takes off, for the single-entry list that fails on openai too', () => {
+    expect(off(KIMI, 'capabilities = ["thinking"]\nsupport_efforts = ["high"]')).toBe('declared');
+    expect(off(KIMI, 'capabilities = ["thinking"]\nsupport_efforts = ["low", "high"]')).toBe('declared');
+    expect(off(KIMI, 'capabilities = ["thinking"]\nsupport_efforts = ["low", "high"]\noff_effort = "none"')).toBe(
+      'declared',
+    );
+    expect(off(KIMI, 'capabilities = ["thinking"]')).toBe('declared');
+  });
+
+  test.each([
+    ['no type', ''],
+    ['an unobserved type', 'type = "anthropic"'],
+  ])('%s: support_efforts without off_effort is refused as policy, not as an observation', (_label, typeLine) => {
+    const message = off(typeLine, 'support_efforts = ["high"]');
+    expect(message).toContain('that is untested, and bare-kimi refuses it as policy');
+    expect(off(typeLine, 'support_efforts = ["high"]\noff_effort = "none"')).toBe('declared');
+  });
+
+  test('a kimi-type model that sets protocol is outside the kimi-type observations: refused as policy', () => {
+    const message = off(KIMI, 'support_efforts = ["low", "high"]\nprotocol = "anthropic"');
+    expect(message).toContain('on a model that sets protocol ("anthropic") that is untested');
+  });
+
+  test('the Boolean always_thinking field is not read; the capability string refuses off as observed', () => {
+    const declared = 'capabilities = ["thinking"]\nsupport_efforts = ["high"]\noff_effort = "none"';
+    expect(off(OPENAI, `${declared}\nalways_thinking = true`)).toBe('declared');
+    const always = off(OPENAI, 'capabilities = ["thinking", "always_thinking"]\nsupport_efforts = ["high"]\noff_effort = "none"');
+    expect(always).toStartWith('refused: model "loop/m" lists the capability "always_thinking"');
+    expect(always).not.toContain('policy');
+
+    // The field alone declares nothing: an effort is undeclared, not refused as "declared without thinking".
+    const root = temp('bare-kimi-home-');
+    const src = offSource(root, OPENAI, 'always_thinking = true');
+    expect(prepareRunHome(src, join(root, 'run-home'), 'link', { model: 'loop/m', effort: 'high' })).toMatchObject({
+      effortSupport: 'undeclared',
+    });
   });
 });
 
@@ -1615,6 +1801,58 @@ describe('version-1 stamps (bare-kimi 0.2)', () => {
       effort: null,
       migrated: { from: 1, basis: 'digest' },
     });
+  });
+
+  test('a 0.2 home from a CRLF source with comments, [thinking], permission rules and hooks: bytes held on its alias, or proven by digest', () => {
+    // O3 against this candidate's own digest; equality with 0.2's rests on the exercise outside this suite.
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    editConfig(src, (text) =>
+      `${text}
+# carried tables
+[thinking] # effort
+enabled = true
+effort = "low"
+keep = "all"
+
+[[permission.rules]]
+decision = "deny"
+pattern = "Bash(rm *)"
+
+[[hooks]]
+event = "PreToolUse"
+command = "true"
+`
+        .replace('[models."kimi-code/k3"]', '[models."kimi-code/k3"] # the default model')
+        .replaceAll('\n', '\r\n'),
+    );
+    const kept = join(root, 'kept');
+    const bare = join(root, 'bare');
+    prepareRunHome(src, kept);
+    prepareRunHome(src, bare);
+    const config = readFileSync(join(kept, 'config.toml'), 'utf-8');
+    expect(config).toContain('# the default model\r\n');
+    downgradeStampToV1(kept);
+    addSession(bare);
+    downgradeStampToV1(bare);
+    rmSync(join(bare, 'config.toml'));
+
+    expect(prepareRunHome(src, kept)).toMatchObject({
+      action: 'reuse',
+      modelAlias: 'kimi-code/k3',
+      configuredEffort: 'low',
+      migrated: { from: 1, basis: 'config' },
+    });
+    expect(readFileSync(join(kept, 'config.toml'), 'utf-8')).toBe(config);
+
+    editConfig(src, (text) => text.replace('default_model = "kimi-code/k3"\r\n', 'default_model = "kimi-code/k3-thinking"\r\n'));
+    expect(prepareRunHome(src, bare)).toMatchObject({ modelAlias: 'kimi-code/k3', migrated: { from: 1, basis: 'digest' } });
+    const rewritten = parseToml(readFileSync(join(bare, 'config.toml'), 'utf-8'));
+    expect(rewritten['default_model']).toBe('kimi-code/k3');
+    expect(rewritten['thinking']).toEqual({ enabled: true, effort: 'low', keep: 'all' });
+    expect(rewritten['permission']).toEqual({ rules: [{ decision: 'deny', pattern: 'Bash(rm *)' }] });
+    expect(rewritten['hooks']).toEqual([{ event: 'PreToolUse', command: 'true' }]);
   });
 
   test('a 0.2 home without config.toml whose alias cannot be proven: refused with sessions unless named; followed without', () => {
@@ -1785,28 +2023,37 @@ describe('adopting a home kept before 0.2', () => {
     expect(() => prepareRunHome(src, home, 'link', { effort: 'high' })).toThrow('pinned to effort "low"');
   });
 
-  test("a home on the managed default with its own effort is adopted; the pin is reported undeclared, not checked", () => {
-    // The managed default declares no efforts (its catalog does), so nothing
-    // offline shows what kimi ran its sessions at; adoption does not refuse it
-    // and does not claim it either.
+  test("a home on the managed default with its own effort is checked like a selection: refused before any effect; its own off is adopted", () => {
+    // The managed default is kimi-typed and lists no support_efforts, where
+    // kimi 2.1.0 was observed to send no effort; pinning the home's "high"
+    // would report an effort its new sessions do not send.
     const root = temp('bare-kimi-home-');
     const src = makeSourceHome(root);
     const home = join(root, 'legacy');
-    legacyHome(src, home, { effort: 'high' });
+    legacyHome(src, home);
+    const configPath = join(home, 'config.toml');
+    writeFileSync(configPath, `${readFileSync(configPath, 'utf-8')}\n[thinking]\nenabled = true\neffort = "high"\n`);
+    const preimage = readFileSync(configPath);
     const wire = readFileSync(join(home, 'sessions', LEGACY_SESSION));
 
-    const adopted = prepareRunHome(src, home, 'link', { adoptLegacyHome: true });
+    expect(() => prepareRunHome(src, home, 'link', { adoptLegacyHome: true })).toThrow(
+      'model "kimi-code/k3" lists no support_efforts',
+    );
+    expect(existsSync(join(home, HOME_STAMP))).toBe(false);
+    expect(existsSync(join(home, ADOPTION_RECORD))).toBe(false);
+    expect(readFileSync(configPath)).toEqual(preimage);
 
-    expect(adopted).toMatchObject({
+    writeFileSync(configPath, preimage.toString('utf-8').replace('enabled = true\neffort = "high"', 'enabled = false'));
+    expect(prepareRunHome(src, home, 'link', { adoptLegacyHome: true })).toMatchObject({
       action: 'adopt',
       modelAlias: 'kimi-code/k3',
-      effort: 'high',
+      effort: 'off',
       effortSupport: 'undeclared',
-      configuredEffort: 'high',
+      configuredEffort: 'off',
     });
     expect(JSON.parse(readFileSync(join(home, ADOPTION_RECORD, 'manifest.json'), 'utf-8'))).toMatchObject({
       model: 'kimi-code/k3',
-      configuredEffort: 'high',
+      configuredEffort: 'off',
     });
     expect(readFileSync(join(home, 'sessions', LEGACY_SESSION))).toEqual(wire);
   });

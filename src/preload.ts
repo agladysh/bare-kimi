@@ -133,8 +133,10 @@ export const DEFAULT_PRIME = 'Acknowledged.';
 /**
  * Every check on a preloaded run that needs no filesystem, for both of its
  * runs: the call to action and the primer prompt as in
- * {@link checkLaunchOptions}, and no `resume` / `continueRecent` — preload
- * always starts a fresh session, so either would be silently overridden.
+ * {@link checkLaunchOptions}, no env-model variable in `extraEnv` (see
+ * {@link isModelOverlayVar}; `KIMI_MODEL_THINKING_KEEP` is not one), and no
+ * `resume` / `continueRecent` — preload always starts a fresh session, so
+ * either would be silently overridden.
  * runPreloaded runs it first; a caller that does its own setup runs it before
  * that setup.
  */
@@ -143,7 +145,11 @@ export function checkPreloadOptions(options: LaunchOptions, prime?: string): voi
   assertSafePrompt(prime ?? DEFAULT_PRIME);
   const overlay = Object.keys(options.extraEnv ?? {}).find(isModelOverlayVar);
   if (overlay !== undefined) {
-    throw new Error(`${overlay} in extraEnv may switch kimi to its env model; preload needs one pinned model for its primer and resume`);
+    throw new Error(
+      `${overlay} in extraEnv is an env-model variable (a non-blank KIMI_MODEL_NAME was observed to switch ` +
+        'kimi 2.1.0 to its env model and bind the session to it; the others are refused as policy); preload ' +
+        'needs one pinned model for its primer and resume',
+    );
   }
   if (options.resume !== undefined || options.continueRecent === true) {
     throw new Error('preload starts a fresh session; it cannot be combined with resume or continue');
