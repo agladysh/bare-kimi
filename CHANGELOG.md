@@ -2,11 +2,12 @@
 
 ## Unreleased — repair candidate
 
-Written by Claude (an AI coding agent) after recovery, in five rounds.
-Earlier states of this candidate passed their typecheck and test suite when
-those were run separately. The fifth round, prompted by an independent
-review of the fourth, has not been run by its author. Nothing here has been
-run against a real kimi.
+Written by Claude (an AI coding agent) after recovery, in six rounds.
+Earlier states of this candidate, including the fifth round's library
+changes, passed their typecheck and test suite when those were run
+separately. The sixth round changed only the optional native probe and its
+documentation. It has not been run by its author. Nothing here has been run
+against a real kimi.
 
 ### Native evidence
 
@@ -205,17 +206,43 @@ kimi could hang it. The current version:
   real native homes, computed at run time;
 - requires the kimi executable to be named, and records its real path.
 
+The second version was also reviewed and not run. It could report
+enforcement without evidence. Its "withheld by omission" and "enforced"
+verdicts were not gated on the control. "Enforced" matched any
+`denied|permission` text, which a shell `Permission denied` would satisfy.
+And the read denial of the real homes was declared but never shown to work.
+The current version:
+- gates "enforced" and "withheld by omission" on the control having held;
+- counts "enforced" only on kimi 2.1.0's exact rule refusal for this
+  scenario's own rule, `Tool "Bash" was denied by permission rule. Reason:
+  probe`, matched against the tool result's text (string content as is,
+  content parts joined);
+- proves the read denial in the preflight, on a synthetic decoy home created
+  outside the temp root and denied like the real homes. No real home is
+  read;
+- writes each run's raw stdout/stderr (and the preflight's) to disk before
+  judging anything, and names both created directories on success, refusal
+  and failure;
+- attributes requests by a per-scenario provider path (`/s/<name>/v1`), and
+  stops running scenarios once a process group outlives SIGKILL;
+- clears its timers, so it exits once done, and skips non-directories when
+  counting wire journals.
+
 In more detail:
 - **Isolation:** macOS only, from an unsandboxed shell. The probe runs
   bare-kimi and kimi under `sandbox-exec`:
   - outbound network only to the provider's own loopback port;
   - file writes only under its temp root;
-  - reads of the real native homes denied.
+  - reads of the real native homes, and of a synthetic decoy home, denied.
 
   A preflight inside the same sandbox must show the provider port answering,
   a listening decoy port and a never-routed address refused, a write outside
-  the root refused, and an owned process group. Otherwise the probe refuses
-  before kimi is launched.
+  the root refused, a read of the decoy home refused, and an owned process
+  group. Otherwise the probe refuses before kimi is launched.
+- **Custody:** two directories are created in the system temp dir and left
+  for inspection: the temp root (runs, raw output, report) and the decoy
+  home (one non-secret file). The report lists the real homes it denied by
+  absolute path, so it must stay private.
 - **Setup:** a synthetic `openai`-type provider points at a loopback server
   that scripts a `Bash` tool call and records, per scenario, whether it sent
   it. It uses a temporary HOME, cwd and source home and a dummy API key,

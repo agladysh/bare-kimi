@@ -14,10 +14,12 @@
  * How:
  * - A loopback HTTP server stands in for an OpenAI-compatible provider
  *   (kimi provider `type = "openai"`, model `protocol = "openai"`, i.e.
- *   `/chat/completions`). When a request offers kimi's `Bash` tool and holds
- *   no tool result yet, it replies with one scripted call, `touch <canary>`
- *   under the probe's temp root, and records per scenario that it did.
- *   Otherwise it replies with plain text. Every request is logged.
+ *   `/chat/completions`). Each scenario's provider lives under its own path,
+ *   `/s/<scenario>/v1`, so requests are attributed by where kimi sent them.
+ *   When a request offers kimi's `Bash` tool and holds no tool result yet,
+ *   the server replies with one scripted call, `touch <canary>` under the
+ *   probe's temp root, and records that it did. Otherwise it replies with
+ *   plain text. Every request is logged.
  * - Each scenario gets a fresh synthetic source home (dummy API key, empty
  *   credentials/), cwd and run home under one temp root. HOME, TMPDIR and
  *   the cache dir point there too; model-catalog refresh is off.
@@ -26,29 +28,36 @@
  *   - file writes are allowed only under the temp root;
  *   - reads are denied for the real native homes (`~/.kimi-code`, `~/.kimi`,
  *     and any `KIMI_CODE_HOME`/`KIMI_CODE_HOME_SOURCE` this shell selects),
- *     computed at run time.
+ *     computed at run time, and for a synthetic decoy home.
  *
  *   A preflight inside the same sandbox must show all of the following
  *   before kimi is launched, or the probe refuses (exit 2):
  *   - the provider port answers;
  *   - another loopback port and a never-routed address are refused;
  *   - a write outside the root is refused;
+ *   - reading the decoy home's file is refused (proving the read denial
+ *     without touching a real home);
  *   - the child owns its own process group.
  * - Every child runs in its own process group, which the probe owns. At a
  *   deadline the group gets SIGTERM, then SIGKILL after a grace period;
  *   output is collected as it arrives and the drain is bounded. Whether the
- *   group was gone afterwards is recorded, not assumed. Nothing here claims
- *   that the provider request or a tool was cancelled.
+ *   group was gone afterwards is recorded, not assumed; if one was not, no
+ *   further scenario runs. Nothing here claims that the provider request or
+ *   a tool was cancelled. kimi starts tool commands in their own groups, so
+ *   a gone group does not prove every descendant is gone.
  *
  * Scenarios, each judged on its own evidence:
  * - control: no rules, one valid hook. The scripted call must be sent, its
  *   result returned, and its canary created, with no config section dropped.
  *   The hook verdict comes from this run;
- * - deny: `[[permission.rules]] decision = "deny", pattern = "Bash"`, the
- *   shape kimi 2.1.0's schema accepts. Enforced only when the call was sent,
- *   a tool result came back reporting a refusal, the canary is absent, and
- *   no section was dropped. If Bash was never offered, that is reported as
- *   withheld by omission. Anything else is inconclusive;
+ * - deny: `[[permission.rules]] decision = "deny", pattern = "Bash",
+ *   reason = "probe"`, the shape kimi 2.1.0's schema accepts. `not-enforced`
+ *   when the scripted call was sent and its canary appeared. `enforced` only
+ *   when the control held, the call was sent, the canary is absent, no
+ *   section was dropped, and a tool result carries kimi's exact rule refusal
+ *   for this rule: `Tool "Bash" was denied by permission rule. Reason:
+ *   probe`. `withheld-by-omission` (Bash not offered) also needs the control
+ *   to have held. Anything else is inconclusive;
  * - deny-string: `[permission] deny = ["Bash"]`, a string rule that 2.1.0's
  *   schema rejects. Observes whether kimi drops the whole section;
  * - invalid-hook: the valid hook plus one with an unknown event. Judged only
@@ -61,12 +70,25 @@
  * the run home, and where the configured thinking effort appears in the
  * requests kimi sent.
  *
+ * Custody: the probe creates two directories in the system temp dir and
+ * leaves both for inspection, naming them on success, refusal and failure:
+ * - the temp root `bare-kimi-probe-*`, which holds everything the runs
+ *   write, the report, and each run's raw stdout/stderr (written before
+ *   anything is judged), plus the preflight's;
+ * - the decoy home `bare-kimi-probe-decoy-home-*`, which holds one
+ *   non-secret file. It lies outside the root on purpose: the read denial
+ *   must be shown on a path the write allowance does not also cover.
+ *
+ * The preflight's own attempt to write outside the root targets one more
+ * path in the temp dir. It is expected to be refused, and is removed again
+ * if the attempt succeeds. The report lists the real native homes it denied
+ * by absolute path; keep it private.
+ *
  * Exit codes: 0 when the control held (the report may still mark other
- * findings inconclusive), 1 when it did not, 2 when the probe refused
- * before launching kimi. The temp root is left for inspection; nothing
- * outside it is written. This is one observation of one installed kimi
- * under one sandbox profile, not a claim about kimi in general and not an
- * OS-level guarantee.
+ * findings inconclusive), 1 when it did not or the probe failed, 2 when the
+ * probe refused before launching kimi. This is one observation of one
+ * installed kimi under one sandbox profile, not a claim about kimi in
+ * general and not an OS-level guarantee.
  */
 
 import { spawn } from 'node:child_process';
@@ -99,6 +121,12 @@ const DRAIN_MS = 5_000;
 /** The probe cannot run safely here; nothing native was launched. */
 class Refusal extends Error {}
 
+/**
+ * Directories this probe created (the temp root, then the decoy home), in
+ * order, so they are named on success, refusal and failure alike.
+ */
+const created: string[] = [];
+
 type Json = Record<string, unknown>;
 
 function isRecord(value: unknown): value is Json {
@@ -111,6 +139,19 @@ function shellQuote(text: string): string {
 
 function sleep(ms: number): Promise<'elapsed'> {
   return new Promise((done) => setTimeout(() => done('elapsed'), ms));
+}
+
+/** `promise`, or 'elapsed' after `ms`; the timer is cleared either way, so it never keeps the probe alive. */
+async function within<T>(promise: Promise<T>, ms: number): Promise<T | 'elapsed'> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const elapsed = new Promise<'elapsed'>((done) => {
+    timer = setTimeout(() => done('elapsed'), ms);
+  });
+  try {
+    return await Promise.race([promise, elapsed]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ---------------------------------------------------------------- owned process groups
@@ -207,7 +248,7 @@ async function runOwned(cmd: readonly string[], env: Record<string, string>, cwd
   // exists, the group cannot be owned: kill the child and report it.
   if (!groupAlive(pid)) {
     child.kill('SIGKILL');
-    await Promise.race([exited, sleep(GRACE_MS)]);
+    await within(exited, GRACE_MS);
     return {
       spawnError: undefined,
       groupNotOwned: true,
@@ -234,15 +275,15 @@ async function runOwned(cmd: readonly string[], env: Record<string, string>, cwd
     }
   };
 
-  const first = await Promise.race([exited, sleep(deadlineMs)]);
+  const first = await within(exited, deadlineMs);
   if (first === 'elapsed') {
     timedOut = true;
     await endGroup();
   }
-  const exit = await Promise.race([exited, sleep(GRACE_MS)]);
+  const exit = await within(exited, GRACE_MS);
   // The leader is gone; members it left behind are still the probe's to end.
   if (groupAlive(pid)) await endGroup();
-  const drained = (await Promise.race([closed, sleep(DRAIN_MS)])) === 'closed';
+  const drained = (await within(closed, DRAIN_MS)) === 'closed';
   if (!drained) {
     child.stdout.destroy();
     child.stderr.destroy();
@@ -276,13 +317,14 @@ interface Reply {
   readonly toolCalls: readonly ToolCall[];
 }
 
-interface Active {
-  readonly scenario: string;
+/** What the provider scripts for one scenario, found by its own base-URL path. */
+interface Script {
   readonly toolCall: boolean;
   readonly canary: string;
 }
 
 interface LoggedRequest {
+  /** Scenario named by the request path (`/s/<name>/v1/...`), else `(unattributed)`. */
   readonly scenario: string;
   readonly method: string;
   readonly path: string;
@@ -291,8 +333,19 @@ interface LoggedRequest {
   readonly scriptedCall: boolean;
 }
 
-let active: Active | undefined;
+/**
+ * Each scenario's provider lives under its own path, `/s/<name>/v1`, so a
+ * request is attributed by where kimi sent it, not by which scenario happens
+ * to be running: a stale kimi from an earlier run cannot feed a later one.
+ */
+const scripts = new Map<string, Script>();
 const requests: LoggedRequest[] = [];
+const SCENARIO_PATH = /^\/s\/([A-Za-z0-9-]+)\/v1\//;
+
+function scenarioOf(path: string): string | undefined {
+  const name = SCENARIO_PATH.exec(path)?.[1];
+  return name !== undefined && scripts.has(name) ? name : undefined;
+}
 
 function functionName(tool: unknown): unknown {
   if (!isRecord(tool)) return undefined;
@@ -309,22 +362,36 @@ function offersBash(body: unknown): boolean {
   return tools.some((tool) => functionName(tool) === 'Bash');
 }
 
+/**
+ * The text of each tool-result message, as sent: a string content as is, an
+ * array of content parts as their `text` fields joined, anything else as
+ * JSON. Returned unescaped, so a native message can be matched exactly.
+ */
 function toolResultsOf(body: unknown): string[] {
   return messagesOf(body)
     .filter((message) => isRecord(message) && message['role'] === 'tool')
-    .map((message) => JSON.stringify(isRecord(message) ? message['content'] : message));
+    .map((message) => {
+      const content = isRecord(message) ? message['content'] : undefined;
+      if (typeof content === 'string') return content;
+      if (Array.isArray(content)) {
+        return content
+          .map((part: unknown) => (isRecord(part) && typeof part['text'] === 'string' ? part['text'] : JSON.stringify(part)))
+          .join('');
+      }
+      return JSON.stringify(content);
+    });
 }
 
-function replyFor(body: unknown): Reply {
+function replyFor(script: Script | undefined, body: unknown): Reply {
   const answered = toolResultsOf(body).length > 0;
-  if (active !== undefined && active.toolCall && offersBash(body) && !answered) {
+  if (script !== undefined && script.toolCall && offersBash(body) && !answered) {
     return {
       content: null,
       toolCalls: [
         {
           id: 'call_probe_1',
           type: 'function',
-          function: { name: 'Bash', arguments: JSON.stringify({ command: `touch ${shellQuote(active.canary)}` }) },
+          function: { name: 'Bash', arguments: JSON.stringify({ command: `touch ${shellQuote(script.canary)}` }) },
         },
       ],
     };
@@ -373,9 +440,10 @@ async function handle(request: Request): Promise<Response> {
       body = text;
     }
   }
-  const scenario = active?.scenario ?? '(preflight)';
+  const named = scenarioOf(url.pathname);
+  const scenario = named ?? (url.pathname === '/health' ? '(preflight)' : '(unattributed)');
   if (url.pathname.endsWith('/chat/completions') && request.method === 'POST') {
-    const reply = replyFor(body);
+    const reply = replyFor(named === undefined ? undefined : scripts.get(named), body);
     requests.push({ scenario, method: request.method, path: url.pathname, body, scriptedCall: reply.toolCalls.length > 0 });
     return chatResponse(body, reply);
   }
@@ -434,11 +502,13 @@ function sandboxProfile(root: string, port: number, deniedReads: readonly string
  * Runs inside the sandbox with the same profile and environment as the real
  * runs: the provider port must answer; a listening decoy on another loopback
  * port and TEST-NET-1 (RFC 5737, never routed) must both be refused by the
- * sandbox itself; a write outside the root must be refused.
+ * sandbox itself; a write outside the root must be refused; and reading the
+ * synthetic decoy home, denied exactly as the real native homes are, must be
+ * refused. That proves the read denial works without touching a real home.
  */
 const PREFLIGHT = `
 const { connect } = await import('node:net');
-const { writeFileSync, rmSync } = await import('node:fs');
+const { readFileSync, writeFileSync, rmSync } = await import('node:fs');
 const attempt = (host, port) => new Promise((done) => {
   const socket = connect({ host, port });
   const timer = setTimeout(() => { socket.destroy(); done('timeout'); }, 3000);
@@ -462,8 +532,28 @@ try {
 } catch (error) {
   out.write = error.code ?? String(error);
 }
+try {
+  readFileSync(process.env.PROBE_DECOY_FILE);
+  out.decoyRead = 'allowed';
+} catch (error) {
+  out.decoyRead = error.code ?? String(error);
+}
 console.log(JSON.stringify(out));
 `;
+
+/**
+ * A synthetic stand-in for a real native home, created outside the probe
+ * root (the read denial must be shown on a path the write allowance does not
+ * also cover). It holds one non-secret file. It is denied in the profile
+ * exactly like the real homes, and is left in place, identifiable by its
+ * name, alongside the root.
+ */
+function makeDecoyHome(): { dir: string; file: string } {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'bare-kimi-probe-decoy-home-')));
+  const file = join(dir, 'decoy.txt');
+  writeFileSync(file, 'bare-kimi probe decoy: not a credential\n', { mode: 0o600 });
+  return { dir, file };
+}
 
 const DENIED = new Set(['EPERM', 'EACCES']);
 
@@ -529,7 +619,7 @@ function sourceConfig(port: number, scenario: Scenario, hookMarker: string): str
     '',
     '[providers.probe]',
     'type = "openai"',
-    `base_url = "http://127.0.0.1:${port}/v1"`,
+    `base_url = "http://127.0.0.1:${port}/s/${scenario.name}/v1"`,
     'api_key = "probe-dummy-not-a-secret"',
     '',
     '[models."probe/model"]',
@@ -557,12 +647,22 @@ function pathsTo(value: unknown, wanted: string, path = '$'): string[] {
   return [];
 }
 
+/** Subdirectory names of `dir`; empty when it is missing or not a directory. */
+function subdirectories(dir: string): string[] {
+  try {
+    return readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+  } catch {
+    return [];
+  }
+}
+
 function wireJournals(home: string): number {
   const sessions = join(home, 'sessions');
-  if (!existsSync(sessions)) return 0;
   let count = 0;
-  for (const bucket of readdirSync(sessions)) {
-    for (const session of readdirSync(join(sessions, bucket))) {
+  for (const bucket of subdirectories(sessions)) {
+    for (const session of subdirectories(join(sessions, bucket))) {
       if (existsSync(join(sessions, bucket, session, 'agents', 'main', 'wire.jsonl'))) count += 1;
     }
   }
@@ -625,9 +725,11 @@ async function runScenario(
   }
   args.push('--', PROMPT);
 
-  active = { scenario: scenario.name, toolCall: scenario.toolCall, canary };
+  scripts.set(scenario.name, { toolCall: scenario.toolCall, canary });
   const owned = await runOwned([SANDBOX_EXEC, '-p', profile, process.execPath, BARE_KIMI, ...args], env, work, RUN_DEADLINE_MS);
-  active = undefined;
+  // Raw output first, before anything that could fail while judging it.
+  writeFileSync(join(dir, 'stdout.txt'), owned.stdout);
+  writeFileSync(join(dir, 'stderr.txt'), owned.stderr);
 
   const chats = requests.filter((request) => request.scenario === scenario.name && request.path.endsWith('/chat/completions'));
   const firstChat = chats[0];
@@ -693,26 +795,46 @@ function judgeHook(control: Observation, controlHeld: boolean): Finding {
     : { status: 'did-not-fire', evidence: 'the tool ran, but the configured PreToolUse hook left no marker' };
 }
 
-function judgeDeny(o: Observation, expectDrop: boolean): Finding {
+/**
+ * kimi 2.1.0's refusal by a configured rule, exactly as it builds it:
+ * `Tool "<name>" was denied by permission rule.` plus ` Reason: <reason>`
+ * when the matching rule has one. Matching it, reason included, shows that
+ * this scenario's own rule decided, and not a shell error such as
+ * "Permission denied" or some other policy.
+ */
+function nativeRuleRefusal(reason: string | undefined): string {
+  return `Tool "Bash" was denied by permission rule.${reason === undefined ? '' : ` Reason: ${reason}`}`;
+}
+
+/**
+ * Judge a deny scenario. A missing call is evidence only next to a control
+ * that held: without it, the same absence may just mean the probe's script
+ * never engaged. `not-enforced` (the canary appeared) is positive evidence
+ * and needs no control.
+ */
+function judgeDeny(o: Observation, controlHeld: boolean, expectDrop: boolean, reason: string | undefined): Finding {
   if (o.droppedSections.includes('permission')) {
     return expectDrop
       ? { status: 'section-dropped', evidence: 'kimi dropped the whole [permission] section as invalid' }
       : inconclusive('kimi dropped [permission] as invalid: the rule never loaded');
   }
   if (o.droppedSections.length > 0) return inconclusive(`config sections dropped: ${o.droppedSections.join(', ')}`);
+  if (o.scriptedCallSent && o.canaryCreated) {
+    return { status: 'not-enforced', evidence: 'the scripted call was sent and its canary was created' };
+  }
+  if (!controlHeld) return inconclusive('the control did not hold, so a missing call is not evidence');
   if (o.chatRequests > 0 && !o.bashOffered && o.completed) {
-    return { status: 'withheld-by-omission', evidence: 'Bash was not offered to the model at all' };
+    return { status: 'withheld-by-omission', evidence: 'Bash was offered in the control but not to this run' };
   }
   const broken = callCompleted(o);
   if (broken !== undefined) return inconclusive(broken);
-  if (o.canaryCreated) {
-    return { status: 'not-enforced', evidence: 'the scripted call was sent and its canary was created' };
-  }
-  const refusal = o.toolResults.find((result) => /denied|not allowed|permission/i.test(result));
+  if (o.canaryCreated) return inconclusive('the canary appeared, but not after this run\'s scripted call');
+  const expected = nativeRuleRefusal(reason);
+  const refusal = o.toolResults.find((result) => result.includes(expected));
   if (refusal !== undefined) {
-    return { status: 'enforced', evidence: `the call did not run and its tool result reported a refusal: ${refusal.slice(0, 300)}` };
+    return { status: 'enforced', evidence: `the call did not run; kimi returned its rule refusal: ${refusal.slice(0, 300)}` };
   }
-  return inconclusive('the call did not run, but no tool result reported a refusal');
+  return inconclusive(`the call did not run, but no tool result carried ${JSON.stringify(expected)}`);
 }
 
 function judgeInvalidHook(o: Observation): Finding {
@@ -749,9 +871,9 @@ function findings(observations: readonly Observation[]): Record<string, Finding>
   out['control'] = controlFinding;
   if (control !== undefined) out['hook'] = judgeHook(control, controlHeld);
   const deny = by('deny');
-  if (deny !== undefined) out['deny-rule'] = judgeDeny(deny, false);
+  if (deny !== undefined) out['deny-rule'] = judgeDeny(deny, controlHeld, false, 'probe');
   const denyString = by('deny-string');
-  if (denyString !== undefined) out['deny-string-rule'] = judgeDeny(denyString, true);
+  if (denyString !== undefined) out['deny-string-rule'] = judgeDeny(denyString, controlHeld, true, undefined);
   const invalid = by('invalid-hook');
   if (invalid !== undefined) out['invalid-hook'] = judgeInvalidHook(invalid);
   const preload = by('preload');
@@ -789,9 +911,12 @@ async function main(): Promise<number> {
   const kimi = resolveKimi(values['kimi-bin']);
 
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'bare-kimi-probe-')));
+  created.push(root);
   for (const sub of ['home', 'tmp', 'cache']) mkdirSync(join(root, sub));
   assertNoAmbientInstructions(root);
-  const deniedReads = nativeHomes(root);
+  const decoyHome = makeDecoyHome();
+  created.push(decoyHome.dir);
+  const deniedReads = [...nativeHomes(root), decoyHome.dir];
   releaseGroupsOnExit();
 
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: handle });
@@ -819,10 +944,13 @@ async function main(): Promise<number> {
         PROBE_PORT: String(port),
         PROBE_DECOY_PORT: String(decoyPort),
         PROBE_OUTSIDE: join(tmpdir(), `bare-kimi-probe-escape-${process.pid}`),
+        PROBE_DECOY_FILE: decoyHome.file,
       },
       root,
       PREFLIGHT_DEADLINE_MS,
     );
+    writeFileSync(join(root, 'preflight.stdout.txt'), preflight.stdout);
+    writeFileSync(join(root, 'preflight.stderr.txt'), preflight.stderr);
     if (preflight.groupNotOwned) throw new Refusal('the probe cannot own a process group for its children');
     let isolation: unknown;
     try {
@@ -836,7 +964,8 @@ async function main(): Promise<number> {
       isolation['provider'] !== true ||
       !DENIED.has(String(isolation['otherLoopback'])) ||
       !DENIED.has(String(isolation['egress'])) ||
-      !DENIED.has(String(isolation['write']))
+      !DENIED.has(String(isolation['write'])) ||
+      !DENIED.has(String(isolation['decoyRead']))
     ) {
       throw new Refusal(
         `sandbox preflight did not prove isolation (no native launch): ${preflight.stdout.trim() || preflight.stderr.trim()}`,
@@ -844,19 +973,30 @@ async function main(): Promise<number> {
     }
 
     const observations: Observation[] = [];
+    let stoppedAfter: string | undefined;
     for (const scenario of SCENARIOS) {
-      observations.push(await runScenario(root, port, profile, env, kimi.real, scenario));
+      const observation = await runScenario(root, port, profile, env, kimi.real, scenario);
+      observations.push(observation);
+      // A group that outlived SIGKILL could still talk to the provider: run nothing more.
+      if (observation.run.groupRemained) {
+        stoppedAfter = scenario.name;
+        break;
+      }
     }
     const report = {
       kimi,
       root,
+      decoyHome: decoyHome.dir,
       isolation: { preflight: isolation, deniedReads, providerPort: port },
+      stoppedAfter,
       findings: findings(observations),
       observations,
       requests,
     };
     writeFileSync(join(root, 'report.json'), `${JSON.stringify(report, null, 2)}\n`);
-    console.log(JSON.stringify({ root, report: join(root, 'report.json'), findings: report.findings }, null, 2));
+    console.log(
+      JSON.stringify({ root, decoyHome: decoyHome.dir, report: join(root, 'report.json'), findings: report.findings }, null, 2),
+    );
     return report.findings['control']?.status === 'held' ? 0 : 1;
   } finally {
     server.stop(true);
@@ -869,5 +1009,15 @@ try {
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   console.error(`native-loopback: ${error instanceof Refusal ? 'refused' : 'failed'}: ${message}`);
+  const root = created[0];
+  if (root !== undefined) {
+    try {
+      // Raw per-scenario and preflight output is already on disk; keep the request log too.
+      writeFileSync(join(root, 'requests.json'), `${JSON.stringify(requests, null, 2)}\n`);
+    } catch {
+      // the paths below still say where everything else is
+    }
+  }
+  if (created.length > 0) console.error(`native-loopback: left for inspection: ${created.join(', ')}`);
   process.exitCode = error instanceof Refusal ? 2 : 1;
 }
