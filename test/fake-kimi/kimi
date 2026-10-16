@@ -9,12 +9,27 @@
 //   FAKE_KIMI_ENV_OUT         path to write a JSON object of recorded env vars
 //   FAKE_KIMI_ENV_KEYS        comma-separated env names to record into ENV_OUT
 //   FAKE_KIMI_NO_VERSION_LINE omit the system.version line (failure-mode shape)
+//   FAKE_KIMI_REFRESH_SLOT    simulate a token refresh for this credential slot the
+//                             way kimi 2.1.0's file token store does: take the lock
+//                             dir $KIMI_CODE_HOME/oauth/<slot>.lock (left in place, so
+//                             tests can see where it landed), chmod credentials/ to
+//                             0700, write <slot>.json.tmp.<pid>.<hex> and rename it
+//                             over credentials/<slot>.json. Fake token values only.
 //
 // Honors: -p/--prompt, --output-format, --session/--resume/-r/-S, --continue.
 // With KIMI_CODE_HOME set, creates a wire.jsonl per run (or requires one on
 // resume) so preload/custody tests exercise the real file layout.
 
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 
 const VALUE_FLAGS = new Set([
@@ -95,6 +110,22 @@ if (home.length > 0) {
 }
 
 sessionId = sessionId ?? `session_${crypto.randomUUID()}`;
+
+const refreshSlot = process.env['FAKE_KIMI_REFRESH_SLOT'];
+if (home.length > 0 && refreshSlot !== undefined) {
+  mkdirSync(join(home, 'oauth', `${refreshSlot}.lock`), { recursive: true });
+  const credentials = join(home, 'credentials');
+  mkdirSync(credentials, { recursive: true, mode: 0o700 });
+  chmodSync(credentials, 0o700);
+  const target = join(credentials, `${refreshSlot}.json`);
+  const tmp = `${target}.tmp.${process.pid}.fake0000`;
+  writeFileSync(
+    tmp,
+    `${JSON.stringify({ access_token: 'fake-refreshed-access-token', refresh_token: 'fake-rotated-refresh-token' }, null, 2)}\n`,
+    { mode: 0o600 },
+  );
+  renameSync(tmp, target);
+}
 
 const envOut = process.env['FAKE_KIMI_ENV_OUT'];
 const envKeys = process.env['FAKE_KIMI_ENV_KEYS'];

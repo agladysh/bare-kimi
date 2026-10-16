@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { accessSync, constants, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -8,6 +8,10 @@ export function makeTempDir(prefix: string): string {
 
 /** A fake OAuth token value that must never appear in argv, env or output. */
 export const FAKE_TOKEN = 'fake-access-token-0123456789abcdef';
+
+/** The synthetic source home's credential slot, and its file under credentials/. */
+export const CREDENTIAL_SLOT = 'kimi-code-env-0e4f99c69cc27850';
+export const CREDENTIAL_FILE = `${CREDENTIAL_SLOT}.json`;
 
 /**
  * A synthetic source home mirroring a managed global-region login: verbatim
@@ -19,7 +23,7 @@ export function makeSourceHome(dir: string): string {
   mkdirSync(join(src, 'credentials'), { recursive: true, mode: 0o700 });
   mkdirSync(join(src, 'oauth'), { recursive: true, mode: 0o700 });
   writeFileSync(
-    join(src, 'credentials', 'kimi-code-env-0e4f99c69cc27850.json'),
+    join(src, 'credentials', CREDENTIAL_FILE),
     `${JSON.stringify(
       {
         access_token: FAKE_TOKEN,
@@ -76,7 +80,7 @@ export interface CliEnv {
 }
 
 const BIN = resolve(import.meta.dir, '..', 'bin', 'bare-kimi.ts');
-const FAKE_BIN_DIR = resolve(import.meta.dir, 'fake-kimi');
+export const FAKE_BIN_DIR = resolve(import.meta.dir, 'fake-kimi');
 
 /**
  * Run the real bin/bare-kimi.ts as a subprocess — never imported, never
@@ -116,7 +120,17 @@ export async function runCli(args: string[], options: CliEnv): Promise<CliRun> {
   return { code, stdout, stderr };
 }
 
-/** Make the fake child executable once per checkout. */
-export function ensureFakeExecutable(): void {
-  chmodSync(join(FAKE_BIN_DIR, 'kimi'), 0o755);
+/** The tracked fake child, by absolute path (for library tests' `kimiBin`). */
+export const FAKE_KIMI = join(FAKE_BIN_DIR, 'kimi');
+
+/**
+ * Fail early, with a reason, when the tracked fake child is not executable.
+ * Its mode is part of the checkout; tests check it rather than change it.
+ */
+export function assertFakeExecutable(): void {
+  try {
+    accessSync(FAKE_KIMI, constants.X_OK);
+  } catch {
+    throw new Error(`${FAKE_KIMI} is not executable; restore its tracked mode (100755)`);
+  }
 }

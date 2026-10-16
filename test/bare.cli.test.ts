@@ -8,14 +8,18 @@ import {
   readlinkSync,
   realpathSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import {
+  CREDENTIAL_FILE,
+  CREDENTIAL_SLOT,
+  FAKE_BIN_DIR,
   FAKE_TOKEN,
-  ensureFakeExecutable,
+  assertFakeExecutable,
   makeSourceHome,
   makeTempDir,
   runCli,
@@ -30,7 +34,7 @@ function temp(prefix: string): string {
 }
 
 beforeAll(() => {
-  ensureFakeExecutable();
+  assertFakeExecutable();
 });
 
 afterEach(() => {
@@ -140,6 +144,20 @@ describe('plain runs', () => {
     expect(existsSync(envOut)).toBe(false); // kimi never started
     expect(ephemeralHomes().filter((dir) => !before.includes(dir))).toEqual([]);
     expect(existsSync(join(src, 'sessions'))).toBe(false);
+  });
+
+  test('a relative --kimi-bin resolves against the invoking directory, not --cwd', async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    const invokedFrom = dirname(FAKE_BIN_DIR);
+
+    const run = await runCli(
+      ['--kimi-bin', relative(invokedFrom, join(FAKE_BIN_DIR, 'kimi')), '--cwd', root, '--', 'x'],
+      { srcHome: src, cwd: invokedFrom },
+    );
+
+    expect(run.code).toBe(0);
+    expect(run.stdout).toContain('• ok');
   });
 });
 
@@ -269,6 +287,112 @@ describe('home custody', () => {
     expect(existsSync(copied)).toBe(true);
     expect(lstatSync(copied).isSymbolicLink()).toBe(false);
   });
+
+  test('--home naming a non-empty directory that is not a run home is refused before kimi', async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    const project = join(root, 'project');
+    mkdirSync(project);
+    writeFileSync(join(project, 'notes.md'), 'mine\n');
+    const envOut = join(root, 'env.json');
+
+    const run = await runCli(['--home', project, '--', 'x'], {
+      srcHome: src,
+      env: { FAKE_KIMI_ENV_OUT: envOut, FAKE_KIMI_ENV_KEYS: 'KIMI_CODE_HOME' },
+    });
+
+    expect(run.code).toBe(2);
+    expect(run.stderr).toContain('not a run home');
+    expect(readdirSync(project)).toEqual(['notes.md']);
+    expect(existsSync(envOut)).toBe(false);
+  });
+});
+
+describe('native-style token refresh (simulated by the fake)', () => {
+  test('link mode: the refresh lands in the source home and takes the shared lock', async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+
+    const run = await runCli(['--', 'x'], {
+      srcHome: src,
+      env: { FAKE_KIMI_REFRESH_SLOT: CREDENTIAL_SLOT },
+    });
+
+    expect(run.code).toBe(0);
+    expect(readFileSync(join(src, 'credentials', CREDENTIAL_FILE), 'utf-8')).toContain(
+      'fake-refreshed-access-token',
+    );
+    // tmp + rename landed inside the real directory; nothing else was left.
+    expect(readdirSync(join(src, 'credentials'))).toEqual([CREDENTIAL_FILE]);
+    expect(statSync(join(src, 'credentials')).mode & 0o777).toBe(0o700);
+    expect(statSync(join(src, 'oauth', `${CREDENTIAL_SLOT}.lock`)).isDirectory()).toBe(true);
+  });
+
+  test('copy mode: a refreshed copy is kept, output survives, the run exits 4', async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    const home = join(root, 'kept-home');
+
+    const run = await runCli(['--home', home, '--auth', 'copy', '--json', '--', 'x'], {
+      srcHome: src,
+      env: { FAKE_KIMI_REFRESH_SLOT: CREDENTIAL_SLOT, FAKE_KIMI_SESSION_ID: 'session_kept' },
+    });
+
+    expect(run.code).toBe(4);
+    expect(run.stdout).toContain('"session_id":"session_kept"');
+    expect(run.stderr).toContain('may hold the only current refresh token');
+    expect(readFileSync(join(home, 'credentials', CREDENTIAL_FILE), 'utf-8')).toContain(
+      'fake-refreshed-access-token',
+    );
+    // The source keeps its own token and saw no lock.
+    expect(readFileSync(join(src, 'credentials', CREDENTIAL_FILE), 'utf-8')).toContain(FAKE_TOKEN);
+    expect(readdirSync(join(src, 'oauth'))).toEqual([]);
+  });
+
+  test('copy mode, ephemeral home: the home holding a refreshed copy is kept and named', async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    const before = ephemeralHomes();
+
+    const run = await runCli(['--auth', 'copy', '--', 'x'], {
+      srcHome: src,
+      env: { FAKE_KIMI_REFRESH_SLOT: CREDENTIAL_SLOT },
+    });
+
+    expect(run.code).toBe(4);
+    const kept = ephemeralHomes().filter((dir) => !before.includes(dir));
+    expect(kept).toHaveLength(1);
+    cleanups.push(kept[0]!);
+    expect(run.stderr).toContain(basename(kept[0]!));
+    expect(readFileSync(join(kept[0]!, 'credentials', CREDENTIAL_FILE), 'utf-8')).toContain(
+      'fake-refreshed-access-token',
+    );
+  });
+
+  test('copy mode: a kept copy left stale by a source refresh is discarded by the next run', async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    const home = join(root, 'kept-home');
+
+    const keep = await runCli(['--home', home, '--auth', 'copy', '--keep-credentials', '--', 'x'], {
+      srcHome: src,
+    });
+    expect(keep.code).toBe(0);
+    // A link-mode run elsewhere refreshes the source.
+    const refresh = await runCli(['--', 'x'], {
+      srcHome: src,
+      env: { FAKE_KIMI_REFRESH_SLOT: CREDENTIAL_SLOT },
+    });
+    expect(refresh.code).toBe(0);
+
+    const reuse = await runCli(['--home', home, '--auth', 'copy', '--', 'x'], { srcHome: src });
+
+    expect(reuse.code).toBe(0);
+    expect(existsSync(join(home, 'credentials'))).toBe(false);
+    expect(readFileSync(join(src, 'credentials', CREDENTIAL_FILE), 'utf-8')).toContain(
+      'fake-refreshed-access-token',
+    );
+  });
 });
 
 describe('environment and credential boundary', () => {
@@ -350,6 +474,48 @@ describe('preload', () => {
 
     expect(run.code).toBe(2);
     expect(run.stderr).toContain('looks binary');
+  });
+
+  test.each([
+    ['--continue', ['--continue'], 'fresh session'],
+    ['--resume', ['--resume', 'session_a'], 'fresh session'],
+    ['a leading-dash --prime', ['--prime=-p'], 'starts with "-"'],
+  ] as const)('--preload with %s is refused before any home or kimi', async (_label, extra, message) => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    const preloadFile = join(root, 'fact.md');
+    writeFileSync(preloadFile, 'x');
+    const envOut = join(root, 'env.json');
+    const before = ephemeralHomes();
+
+    const run = await runCli(['--keep-home', '--preload', preloadFile, ...extra, '--', 'x'], {
+      srcHome: src,
+      env: { FAKE_KIMI_ENV_OUT: envOut, FAKE_KIMI_ENV_KEYS: 'KIMI_CODE_HOME' },
+    });
+
+    expect(run.code).toBe(2);
+    expect(run.stderr).toContain(message);
+    expect(existsSync(envOut)).toBe(false); // no primer, no provider turn
+    expect(ephemeralHomes().filter((dir) => !before.includes(dir))).toEqual([]);
+    expect(existsSync(join(src, 'sessions'))).toBe(false);
+  });
+
+  test('--preload with a piped leading-dash prompt is refused before the primer', async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    const preloadFile = join(root, 'fact.md');
+    writeFileSync(preloadFile, 'x');
+    const envOut = join(root, 'env.json');
+
+    const run = await runCli(['--preload', preloadFile], {
+      srcHome: src,
+      stdin: '-x\n',
+      env: { FAKE_KIMI_ENV_OUT: envOut, FAKE_KIMI_ENV_KEYS: 'KIMI_CODE_HOME' },
+    });
+
+    expect(run.code).toBe(2);
+    expect(run.stderr).toContain('starts with "-"');
+    expect(existsSync(envOut)).toBe(false);
   });
 
   test('primer failure propagates the child code', async () => {

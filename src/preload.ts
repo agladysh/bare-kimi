@@ -2,10 +2,13 @@ import { randomBytes } from 'node:crypto';
 import { appendFileSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import {
+  assertSafePrompt,
+  checkLaunchOptions,
   makeEphemeralHome,
   removeHome,
   runKimi,
   sourceHome,
+  type KimiCustodyError,
   type KimiRun,
   type LaunchOptions,
 } from './index.ts';
@@ -123,32 +126,52 @@ export class PrimerNoSessionError extends Error {
   }
 }
 
+/** Primer prompt used when the caller gives none. */
+export const DEFAULT_PRIME = 'Acknowledged.';
+
+/**
+ * Every check on a preloaded run that needs no filesystem, for both of its
+ * runs: the call to action and the primer prompt as in
+ * {@link checkLaunchOptions}, and no `resume` / `continueRecent` — preload
+ * always starts a fresh session, so either would be silently overridden.
+ * runPreloaded runs it first; a caller that does its own setup runs it before
+ * that setup.
+ */
+export function checkPreloadOptions(options: LaunchOptions, prime?: string): void {
+  checkLaunchOptions(options);
+  assertSafePrompt(prime ?? DEFAULT_PRIME);
+  if (options.resume !== undefined || options.continueRecent === true) {
+    throw new Error('preload starts a fresh session; it cannot be combined with resume or continue');
+  }
+}
+
 /**
  * Run `options.prompt` with `items` already in context: primer run (default
- * prompt "Acknowledged.") creates the session in a shared home, the items
- * are appended to its wire, and the call to action resumes it.
+ * prompt {@link DEFAULT_PRIME}) creates the session in a shared home, the
+ * items are appended to its wire, and the call to action resumes it.
  *
- * If the primer fails, its KimiRun is returned as-is (nonzero code, child
- * stderr in `stderr`) and no second run happens. Any `resume` /
- * `continueRecent` in `options` applies only to the primer-less path — this
- * function always creates a fresh session.
+ * Refuses, before any home or primer work, what {@link checkPreloadOptions}
+ * refuses. If the primer fails, its KimiRun is returned as-is (nonzero code,
+ * child stderr in `stderr`) and no second run happens.
  *
  * When `options.home` is omitted (or empty) both runs share one ephemeral
- * home, removed before this resolves; pass `home` to keep the preloaded
- * session. A relative `home` resolves as {@link LaunchOptions.home} says.
+ * home, removed before this resolves unless cleanup has to keep it (see
+ * {@link KimiCustodyError}); pass `home` to keep the preloaded session. A
+ * relative `home` resolves as {@link LaunchOptions.home} says.
  */
 export async function runPreloaded(
   options: LaunchOptions,
   items: readonly PreloadItem[],
   prime?: string,
 ): Promise<KimiRun> {
+  checkPreloadOptions(options, prime);
   const requested = options.home ?? '';
   const ephemeral = requested.length === 0;
   const home = ephemeral ? makeEphemeralHome() : resolve(requested);
   try {
     const primer = await runKimi({
       ...options,
-      prompt: prime ?? 'Acknowledged.',
+      prompt: prime ?? DEFAULT_PRIME,
       home,
       outputFormat: 'stream-json',
       resume: undefined,

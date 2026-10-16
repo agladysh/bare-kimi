@@ -103,6 +103,8 @@ export interface LaunchOptions {
   /**
    * Skill directories (`--skills-dir`, repeatable). Native semantics: this
    * REPLACES user and project skill discovery, it does not add to it.
+   * Passed to kimi verbatim, so a relative path is kimi's to resolve, in the
+   * child's `cwd` (likewise `addDir` and `extraArgs`).
    */
   readonly skillsDir?: string[];
   /**
@@ -113,7 +115,11 @@ export interface LaunchOptions {
   readonly noSkills?: boolean;
   /** Additional workspace directories (`--add-dir`, repeatable). */
   readonly addDir?: string[];
-  /** kimi binary. Default: `KIMI_BIN` env ?? `kimi` (PATH). */
+  /**
+   * kimi binary. Default: `KIMI_BIN` env ?? `kimi` (PATH). A bare name is
+   * looked up on PATH; a path containing `/` is this wrapper's own input and
+   * resolves against this process's working directory, like `home`.
+   */
   readonly kimiBin?: string;
   /** Drop the inherited process environment entirely (see {@link buildEnv} for what still gets set). */
   readonly noProcessEnv?: boolean;
@@ -156,13 +162,25 @@ export function LaunchConfig(o: LaunchOptions): LaunchConfig {
 }
 
 /**
- * Refuse a prompt kimi would parse as a flag. Called before any filesystem
- * work, so a refusal leaves nothing behind.
+ * Refuse a prompt starting with `-`. Whether kimi's parser would take such
+ * a value after `-p` as a flag was not re-verified for 2.1.0; refusing is
+ * the conservative choice. Called before any filesystem work, so a refusal
+ * leaves nothing behind.
  */
 export function assertSafePrompt(prompt: string): void {
   if (prompt.startsWith('-')) {
-    throw new Error('prompt starts with "-": kimi would parse it as a flag');
+    throw new Error('prompt starts with "-": kimi could parse it as a flag');
   }
+}
+
+/**
+ * Every check on launch options that needs no filesystem: prompt shape and
+ * option conflicts. spawnKimi runs it first; a caller that does its own setup
+ * (the CLI's --keep-home) runs it before that setup.
+ */
+export function checkLaunchOptions(options: LaunchOptions): LaunchConfig {
+  assertSafePrompt(options.prompt);
+  return LaunchConfig(options);
 }
 
 /**
@@ -197,9 +215,15 @@ export function buildArgv(config: LaunchConfig, kimiBin: string): string[] {
  * - `KIMI_DISABLE_OAUTH_LOCK` — opts out of the cross-process refresh lock;
  *   link mode's shared-lineage guarantee depends on that lock.
  * - `KIMI_MODEL_*` — the engine's env overlay can inject a whole
- *   provider+model+default_model over the assembled config.
+ *   provider+model+default_model over the assembled config. The prefix also
+ *   covers `KIMI_MODEL_THINKING_EFFORT` and `KIMI_MODEL_THINKING_KEEP`
+ *   (kimi 2.1.0 env-only overrides of the thinking effort and keep), so an
+ *   ambient value cannot silently replace the `[thinking]` table the run
+ *   home carries from the source config.
  *
- * All of these can be re-added deliberately via {@link LaunchOptions.extraEnv}.
+ * All of these can be re-added deliberately via {@link LaunchOptions.extraEnv}
+ * — e.g. `{ KIMI_MODEL_THINKING_EFFORT: 'high' }` to choose an effort for one
+ * run.
  */
 export function isScrubbedEnvVar(name: string): boolean {
   return (
@@ -282,17 +306,23 @@ export interface KimiSubprocess<
    * marker-stamped credential copy shredded unless `keepCredentials`.
    * Caller-owned data — a caller-supplied home itself, linked credential
    * directories' targets, session records — is never touched. A copy that
-   * no longer matches the source home (a refresh may have rotated its
-   * token) is kept, and dispose rejects saying so. Idempotent.
+   * may hold something the source lacks (a refresh changed it) is kept, and
+   * with it an ephemeral home; dispose then rejects with a
+   * {@link KimiCustodyError} naming what it kept. Idempotent.
    */
   readonly dispose: () => Promise<void>;
 }
 
 function resolveKimiBin(config: LaunchConfig, parentEnv: NodeJS.ProcessEnv): string {
   const fromEnv = parentEnv['KIMI_BIN'];
-  if (config.kimiBin.length > 0) return config.kimiBin;
-  if (fromEnv !== undefined && fromEnv.length > 0) return fromEnv;
-  return 'kimi';
+  const bin =
+    config.kimiBin.length > 0
+      ? config.kimiBin
+      : fromEnv !== undefined && fromEnv.length > 0
+        ? fromEnv
+        : 'kimi';
+  // Spawned with the child's cwd: a relative path would resolve there.
+  return bin.includes('/') ? resolvePath(bin) : bin;
 }
 
 /** Fresh empty directory inside the run home that `noSkills` points `--skills-dir` at. */
@@ -310,6 +340,24 @@ export class KimiSpawnError extends Error {
 }
 
 /**
+ * Cleanup did not complete, and something was kept on disk on purpose: a
+ * credentials copy that may hold the only current refresh token, and with it
+ * an ephemeral home. The message names what was kept. Thrown by dispose()
+ * with `run` undefined; thrown by runKimi()/runPreloaded() with the finished
+ * run attached, so its output and session id are not lost.
+ */
+export class KimiCustodyError extends Error {
+  constructor(
+    message: string,
+    readonly run: KimiRun | undefined,
+    override readonly cause?: unknown,
+  ) {
+    super(message);
+    this.name = 'KimiCustodyError';
+  }
+}
+
+/**
  * Spawn a kimi subprocess with the given launch options.
  *
  * The construction is factored out into {@link buildArgv} and {@link
@@ -322,8 +370,8 @@ export class KimiSpawnError extends Error {
  * {@link buildEnv}), and `stdin` (defaults to `ignore`).
  *
  * @throws {KimiSpawnError} when the binary cannot be executed. Home-assembly
- *   and option errors throw plain Errors; a failed setup never leaves an
- *   ephemeral home behind.
+ *   and option errors throw plain Errors before the child starts; a failed
+ *   setup never leaves an ephemeral home behind.
  */
 export function spawnKimi<
   In extends Bun.SpawnOptions.Writable,
@@ -333,8 +381,7 @@ export function spawnKimi<
   launchOptions: LaunchOptions,
   spawnOptions: Bun.Spawn.SpawnOptions<In, Out, Err> = {} as Bun.Spawn.SpawnOptions<In, Out, Err>,
 ): KimiSubprocess<In, Out, Err> {
-  assertSafePrompt(launchOptions.prompt); // before any filesystem work
-  const config = LaunchConfig(launchOptions);
+  const config = checkLaunchOptions(launchOptions); // before any filesystem work
 
   const cwd = config.cwd.length > 0 ? config.cwd : (spawnOptions.cwd ?? process.cwd());
   const ephemeral = config.home.length === 0;
@@ -388,10 +435,15 @@ export function spawnKimi<
           subprocess.kill();
           await subprocess.exited.catch(() => {});
         }
-        if (ephemeral) {
-          removeHome(home, src);
-        } else if (config.authMode === 'copy' && !config.keepCredentials) {
-          shredCopiedCredentials(home, src);
+        try {
+          if (ephemeral) {
+            removeHome(home, src);
+          } else if (config.authMode === 'copy' && !config.keepCredentials) {
+            shredCopiedCredentials(home, src);
+          }
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          throw new KimiCustodyError(`cleanup of run home ${home} did not complete: ${reason}`, undefined, error);
         }
       },
     };
@@ -417,7 +469,7 @@ export interface KimiRun {
   readonly signal: string | null;
   readonly stdout: string;
   readonly stderr: string;
-  /** The run home (removed already when it was ephemeral). */
+  /** The run home (removed already when it was ephemeral, unless cleanup had to keep it). */
   readonly home: string;
   /** Session id parsed from the stream-json resume hint, when available. */
   readonly sessionId: string | undefined;
@@ -465,7 +517,9 @@ async function readStream(stream: ReadableStream | number | undefined): Promise<
  *
  * A binary that cannot be executed resolves to `code: 127` with
  * `spawnError` set. Home-assembly and option errors are thrown, not
- * converted: they are caller mistakes, not run results.
+ * converted: they are caller mistakes, not run results. When the run
+ * finished but cleanup kept something, a {@link KimiCustodyError} carrying
+ * the run is thrown instead of returning it.
  */
 export async function runKimi(launchOptions: LaunchOptions): Promise<KimiRun> {
   let launched: KimiSubprocess<'ignore', 'pipe', 'pipe'>;
@@ -489,6 +543,7 @@ export async function runKimi(launchOptions: LaunchOptions): Promise<KimiRun> {
     };
   }
   const { subprocess, home } = launched;
+  let run: KimiRun;
   try {
     const [stdout, stderr] = await Promise.all([
       readStream(subprocess.stdout),
@@ -500,7 +555,7 @@ export async function runKimi(launchOptions: LaunchOptions): Promise<KimiRun> {
       launchOptions.outputFormat === 'stream-json'
         ? parseStreamJson(stdout)
         : { events: [], unparsed: [] };
-    return {
+    run = {
       code,
       signal,
       stdout,
@@ -511,7 +566,17 @@ export async function runKimi(launchOptions: LaunchOptions): Promise<KimiRun> {
       unparsed: parsed.unparsed,
       spawnError: undefined,
     };
-  } finally {
-    await launched.dispose();
+  } catch (error) {
+    // The run's own failure is the one reported; whatever cleanup keeps
+    // stays on disk regardless.
+    await launched.dispose().catch(() => {});
+    throw error;
   }
+  try {
+    await launched.dispose();
+  } catch (error) {
+    if (error instanceof KimiCustodyError) throw new KimiCustodyError(error.message, run, error.cause);
+    throw error;
+  }
+  return run;
 }

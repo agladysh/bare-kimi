@@ -8,10 +8,37 @@ worked example.
 source tree. It is not a release and is not published to any package
 registry. The recovered source has known defects in home assembly,
 authentication handling and thinking handling. A repair candidate for them
-is described in [CHANGELOG.md](CHANGELOG.md). Its author did not run its
-typecheck or tests, and no live run against kimi has been made with it.
-See [RECOVERY.md](RECOVERY.md) for how the history was reconstructed, what
-the checks on the recovered tree showed, and what is not known.
+is described in [CHANGELOG.md](CHANGELOG.md). It has not been run against a
+real kimi yet, only against the fake child in `test/`. See
+[RECOVERY.md](RECOVERY.md) for how the history was reconstructed, what the
+checks on the recovered tree showed, and what is not known.
+
+## What a run touches
+
+- **The run home** (`KIMI_CODE_HOME`): created with mode 0700 when missing.
+  An existing directory is used only when it is empty or already a run home,
+  and it keeps its permissions. Its `config.toml` carries, verbatim:
+  `default_model`, that model's `[models."…"]` table, its provider's
+  `[providers."…"]` tables, and the source's `[thinking]`, `[permission]`
+  and `[[hooks]]` tables. The source config is checked with smol-toml 1.6.1,
+  the TOML parser kimi 2.1.0 uses. It is refused before anything is written
+  if that parser rejects it, or if any of these tables is written in a form
+  that cannot be carried verbatim.
+  kimi itself creates a `device_id` in every new run home and sends it to
+  the provider, so each ephemeral run appears there as a new device.
+- **The source home**, in link mode (the default): `credentials/` and
+  `oauth/` are shared through directory symlinks. When kimi refreshes a
+  token it writes the new token into the source's `credentials/` (temporary
+  file, then rename), sets that directory to 0700, and takes its refresh lock
+  under the source's `oauth/`. bare-kimi creates the source's `oauth/` when
+  it is missing.
+- **Copy mode** copies the token files, stamped with their SHA-256. Cleanup
+  discards a copy only when it is provably unchanged, or identical to the
+  source. A changed copy may hold the only current refresh token, so it is
+  kept and the CLI exits 4.
+- **Not hermetic:** AGENTS.md files and skills still load, the parent
+  environment is inherited unless `--no-process-env`, and hooks from the
+  source config run as configured.
 
 ## Contents
 
@@ -33,9 +60,10 @@ the checks on the recovered tree showed, and what is not known.
 - `src/*.test.ts`, `test/` — black-box tests against a fake `kimi` child and
   synthetic homes. They contain no real credentials.
 
-Requires Bun ≥ 1.3. Code comments that describe verification against
-particular kimi / kimi-code versions are the original author's statements and
-were not re-verified during recovery.
+Requires Bun ≥ 1.3. Code comments that cite kimi-code `6451f1e` or kimi
+2.0.1 are the original author's statements and were not re-verified during
+recovery. Comments that cite kimi 2.1.0 come from reading the installed
+2.1.0 npm bundle. They say nothing about the current upstream source.
 
 ## License
 

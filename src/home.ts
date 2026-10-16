@@ -1,6 +1,6 @@
+import { createHash } from 'node:crypto';
 import {
   chmodSync,
-  copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -15,7 +15,8 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { parse as parseTomlText } from 'smol-toml';
 
 /**
  * Custody model for home assembly and credential donation.
@@ -25,24 +26,32 @@ import { basename, dirname, join, resolve } from 'node:path';
  * library, and the native `kimi` child (reads config.toml, reads and
  * refreshes credentials, writes sessions into the run home).
  *
- * - Inputs are paths. A relative path is resolved once, at entry, against
- *   the calling process's working directory. Everything after that —
- *   symlink targets, `KIMI_CODE_HOME`, identity checks — uses absolute
+ * - Inputs are paths. A relative home path is resolved once, at entry,
+ *   against the calling process's working directory. Everything after that
+ *   — symlink targets, `KIMI_CODE_HOME`, identity checks — uses absolute
  *   paths. The child may run in another cwd, where a relative home would
  *   name a different directory; a relative symlink target would resolve
  *   against the link's own directory.
- * - Identity is decided after resolving symlinks, so a run home that is the
- *   source home under another name is refused before anything is created,
- *   chmod'ed or written.
+ * - Identity is decided after resolving symlinks. A run home that is the
+ *   source home under another name, or that contains or is contained in it,
+ *   is refused before anything is created, chmod'ed or written.
  * - Every refusal happens before the first effect. An entry this library did
- *   not make — a real directory, a file, a symlink pointing elsewhere — is
- *   caller-owned and is never removed or re-pointed. A marker-stamped copy
- *   is library-made, but it is replaced or shredded only while it still
- *   matches the source byte for byte: after a refresh has rotated it, it may
- *   hold the only current refresh token.
+ *   not make — a real directory, a file, a symlink pointing anywhere but the
+ *   intended source — is caller-owned and is never removed or re-pointed.
+ *   An existing run-home directory keeps its permissions, and is used only
+ *   when it is empty or already an assembled home. A marker-stamped copy is
+ *   library-made, but is discarded only when it provably holds nothing the
+ *   source lacks (see {@link CREDENTIALS_MARKER}).
  * - Effects, in order: the source home's oauth/ is created when missing
- *   (link mode), the run home is created and set to 0700, credentials are
- *   donated, config.toml is written.
+ *   (link mode), a missing run home is created with mode 0700, credentials
+ *   are donated, config.toml is written.
+ *
+ * Native effects this library arranges but does not perform, as read from
+ * the installed kimi 2.1.0 bundle: in link mode a refresh writes the new
+ * token into the source home's credentials/ (tmp file + rename), sets that
+ * directory to 0700, and takes its lock under the source home's oauth/. Every
+ * new run home gets its own native device_id, which is sent to the provider,
+ * so each ephemeral run appears there as a new device.
  *
  * Not promised: hermeticity. The child still reads ambient AGENTS.md files
  * and skills, inherits the process environment unless told otherwise, and
@@ -95,51 +104,217 @@ export function sourceHome(
   return join(home, '.kimi-code');
 }
 
-function scalar(text: string, key: string): string | undefined {
-  const match = text.match(new RegExp(`^${key}\\s*=\\s*["']([^"']+)["']`, 'm'));
-  return match?.[1];
+// ---------------------------------------------------------------- config.toml
+
+type TomlTable = Record<string, unknown>;
+
+function isTable(value: unknown): value is TomlTable {
+  return (
+    typeof value === 'object' && value !== null && !Array.isArray(value) && !(value instanceof Date)
+  );
 }
 
 /**
- * Extract a TOML section by exact header line, including any immediately
- * following sub-table sections (`[header.x]`). Stops at the next unrelated
- * header. Not a TOML parser — sufficient for the machine-written
- * `providers`/`models`/`thinking` sections of a managed config.toml.
+ * Parse with smol-toml, pinned to the version kimi 2.1.0 bundles and calls
+ * (default options) for every read of its config.toml. Validating with the
+ * parser kimi itself uses means a config refused here is one kimi would
+ * also refuse or misread, and one accepted here reads the same to kimi.
+ * Bun's built-in TOML parser is not used: it accepts malformed input, such
+ * as an unterminated table header, that smol-toml rejects.
  */
-function extractSection(text: string, header: string): string | undefined {
-  const lines = text.split('\n');
-  const out: string[] = [];
-  let inside = false;
-  const subPrefix = `${header.slice(0, -1)}.`;
-  for (const line of lines) {
-    const isHeader = line.startsWith('[');
-    if (!inside) {
-      if (isHeader && line.trim() === header) {
-        inside = true;
-        out.push(line);
-      }
-      continue;
-    }
-    if (isHeader) {
-      const trimmed = line.trim();
-      if (trimmed.startsWith(subPrefix)) {
-        out.push(line);
-        continue;
-      }
-      break;
-    }
-    out.push(line);
+function parseToml(text: string, where: string): TomlTable {
+  let parsed: unknown;
+  try {
+    parsed = parseTomlText(text);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`${where} does not parse as TOML (${reason}); refusing`);
   }
-  return inside ? out.join('\n').trimEnd() : undefined;
+  if (!isTable(parsed)) throw new Error(`${where} does not parse as a TOML table; refusing`);
+  return parsed;
 }
 
-/** The lines before the first table header: TOML's root table. */
-function rootTable(text: string): string {
-  const header = text.search(/^\[/m);
-  return header === -1 ? text : text.slice(0, header);
+/**
+ * Structural equality of parsed TOML values. Dates compare by their TOML
+ * form (smol-toml's TomlDate keeps local dates and times distinct), numbers
+ * by Object.is (so `nan` equals `nan`), tables by their exact key sets.
+ */
+function sameTomlValue(a: unknown, b: unknown): boolean {
+  if (a instanceof Date || b instanceof Date) {
+    return a instanceof Date && b instanceof Date && a.toISOString() === b.toISOString();
+  }
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    const right: unknown[] = b;
+    return a.every((item: unknown, index) => sameTomlValue(item, right[index]));
+  }
+  if (isTable(a) || isTable(b)) {
+    if (!isTable(a) || !isTable(b)) return false;
+    const left: TomlTable = a;
+    const right: TomlTable = b;
+    const keys = Object.keys(left);
+    return (
+      keys.length === Object.keys(right).length &&
+      keys.every((key) => Object.hasOwn(right, key) && sameTomlValue(left[key], right[key]))
+    );
+  }
+  return Object.is(a, b);
 }
 
-/** Stamp left inside a credentials dir copied by this library. */
+const TOML_KEY = String.raw`(?:[A-Za-z0-9_-]+|"(?:[^"\\\n]|\\.)*"|'[^'\n]*')`;
+const TABLE_HEADER = new RegExp(
+  String.raw`^\s*(\[\[?)\s*(${TOML_KEY}(?:\s*\.\s*${TOML_KEY})*)\s*(\]\]?)\s*(?:#.*)?$`,
+);
+const TOML_KEYS = new RegExp(TOML_KEY, 'g');
+
+/**
+ * The key path of a `[table]` or `[[array.of.tables]]` header line, or
+ * undefined when the line is not one. A header whose key cannot be decoded
+ * yields an empty path, which nothing selects.
+ */
+function headerPath(line: string): string[] | undefined {
+  const match = TABLE_HEADER.exec(line);
+  if (match === null) return undefined;
+  const [, open, keys, close] = match;
+  if (open === undefined || keys === undefined || close === undefined) return undefined;
+  if (open.length !== close.length) return undefined;
+  const path: string[] = [];
+  for (const [key] of keys.matchAll(TOML_KEYS)) {
+    if (key.startsWith('"')) {
+      try {
+        path.push(JSON.parse(key));
+      } catch {
+        return [];
+      }
+    } else if (key.startsWith("'")) {
+      path.push(key.slice(1, -1));
+    } else {
+      path.push(key);
+    }
+  }
+  return path;
+}
+
+/** The text of each table: its header line through the line before the next header. */
+function tableBlocks(text: string): { path: readonly string[]; text: string }[] {
+  const blocks: { path: string[]; lines: string[] }[] = [];
+  for (const line of text.split('\n')) {
+    const path = headerPath(line);
+    if (path !== undefined) {
+      blocks.push({ path, lines: [line] });
+    } else {
+      blocks.at(-1)?.lines.push(line); // root-table lines are not carried
+    }
+  }
+  return blocks.map(({ path, lines }) => ({ path, text: lines.join('\n').trimEnd() }));
+}
+
+function isUnder(path: readonly string[], prefix: readonly string[]): boolean {
+  return prefix.length <= path.length && prefix.every((key, index) => path[index] === key);
+}
+
+/**
+ * Root tables carried whole when the source config has them:
+ * - `thinking` — the configured effort; without it a run uses the model's
+ *   default effort (kimi 2.1.0 keys: `enabled`, `effort`, `keep`);
+ * - `permission` — the deny/allow/ask rules. In `-p` mode native kimi forces
+ *   its auto permission mode, where configured deny rules are checked before
+ *   auto-approval; dropping them would approve what the operator denied;
+ * - `hooks` — native hooks, carried with the policy they may enforce. They
+ *   run in bare runs exactly as configured.
+ */
+const CARRIED_TABLES = ['thinking', 'permission', 'hooks'] as const;
+
+interface MinimalConfig {
+  readonly text: string;
+  readonly modelAlias: string;
+  readonly provider: string;
+}
+
+/**
+ * Build a run home's config.toml from the source config: `default_model`,
+ * the default model's `[models."<alias>"]` and its `[providers."<name>"]`
+ * (with sub-tables), and every {@link CARRIED_TABLES} table — each table
+ * copied as text, VERBATIM. Verbatim matters: the credential slot is
+ * `kimi-code[-env-<sha256({oauthHost, baseUrl})[:16]>]` — recompute the pair
+ * and the token is never read. (Verified 2026-09-24 for kimi 2.0.1:
+ * `packages/oauth/src/managed-kimi-code.ts` — mechanism identical to the
+ * 0.41.0-era measurement this library started from.)
+ *
+ * The text is split at header lines only; that is not a TOML parser, and a
+ * header-like line inside a multi-line string or array would split wrongly.
+ * So the semantics come from {@link parseToml} instead, which guarantees:
+ * - the whole source config parses under kimi 2.1.0's own TOML parser —
+ *   malformed content anywhere, carried or not, is refused, because what
+ *   the source means cannot be known;
+ * - `default_model` is read from the parsed root table;
+ * - the assembled text parses under the same parser, equals the source on
+ *   everything it carries, and carries nothing else. Any mismatch — a split
+ *   gone wrong, dotted keys or inline tables outside the carried tables' own
+ *   headers — is refused rather than dropped or altered.
+ * It does not guarantee that kimi's schema accepts the carried values, nor
+ * agreement with a different kimi version's parser. Other source settings
+ * are not carried.
+ */
+function minimalConfig(configText: string, where: string): MinimalConfig {
+  const source = parseToml(configText, where);
+  const modelAlias = source['default_model'];
+  if (typeof modelAlias !== 'string') {
+    throw new Error(`no default_model in the root table of ${where}`);
+  }
+  const models = source['models'];
+  const model = isTable(models) ? models[modelAlias] : undefined;
+  if (!isTable(model)) throw new Error(`no [models."${modelAlias}"] in ${where}`);
+  const provider = model['provider'];
+  if (typeof provider !== 'string') throw new Error(`no provider in [models."${modelAlias}"]`);
+  const providers = source['providers'];
+  const providerTable = isTable(providers) ? providers[provider] : undefined;
+  if (!isTable(providerTable)) throw new Error(`no [providers."${provider}"] in ${where}`);
+
+  const prefixes: (readonly string[])[] = [
+    ['providers', provider],
+    ['models', modelAlias],
+  ];
+  const expected: TomlTable = {
+    default_model: modelAlias,
+    providers: { [provider]: providerTable },
+    models: { [modelAlias]: model },
+  };
+  for (const key of CARRIED_TABLES) {
+    if (Object.hasOwn(source, key)) {
+      prefixes.push([key]);
+      expected[key] = source[key];
+    }
+  }
+
+  const sections = tableBlocks(configText)
+    .filter((block) => prefixes.some((prefix) => isUnder(block.path, prefix)))
+    .map((block) => block.text);
+  const text = `default_model = ${JSON.stringify(modelAlias)}\n\n${sections.join('\n\n')}\n`;
+
+  const carried = parseToml(text, `the config assembled from ${where}`);
+  for (const key of new Set([...Object.keys(expected), ...Object.keys(carried)])) {
+    if (!sameTomlValue(carried[key], expected[key])) {
+      throw new Error(
+        `${where}: \`${key}\` cannot be carried verbatim (written outside its own table ` +
+          'headers, e.g. as dotted keys or an inline table); refusing rather than dropping or altering it',
+      );
+    }
+  }
+  return { text, modelAlias, provider };
+}
+
+// ---------------------------------------------------------------- paths
+
+/**
+ * Stamp left inside a credentials dir copied by this library. It records the
+ * SHA-256 of every file as copied, so cleanup can tell a stale copy (the
+ * source was refreshed; the copy is unchanged and discardable) from a
+ * refreshed one (the copy changed and may hold the only current refresh
+ * token; it is kept). An empty marker from an earlier version, or one that
+ * does not parse, proves nothing: such a copy is discarded only where it is
+ * byte-identical to the source.
+ */
 export const CREDENTIALS_MARKER = '.bare-kimi-copied';
 
 /** Stamp left at the root of a home created by makeEphemeralHome(). */
@@ -176,20 +351,29 @@ function sameExisting(a: string, b: string): boolean {
   return left !== undefined && right !== undefined && left.dev === right.dev && left.ino === right.ino;
 }
 
+function isInside(child: string, parent: string): boolean {
+  const path = relative(parent, child);
+  return path.length > 0 && path !== '..' && !path.startsWith(`..${sep}`) && !isAbsolute(path);
+}
+
 /**
- * Refuse a run home that is the source home under another name: `..`
- * segments, symlinks anywhere on the path, or a case-insensitive spelling.
- * A run home must never double as its own source.
+ * Refuse a run home that is the source home under another name (`..`
+ * segments, symlinks anywhere on the path, a case-insensitive spelling), or
+ * that contains or lies inside the source home. A run home must never double
+ * as its own source, and neither may hold the other's files.
  */
 export function assertDistinctHomes(srcHome: string, runHome: string): void {
-  if (
-    resolve(srcHome) === resolve(runHome) ||
-    canonicalPath(srcHome) === canonicalPath(runHome) ||
-    sameExisting(srcHome, runHome)
-  ) {
+  const src = canonicalPath(srcHome);
+  const run = canonicalPath(runHome);
+  if (resolve(srcHome) === resolve(runHome) || src === run || sameExisting(srcHome, runHome)) {
     throw new Error('source and run home are the same directory; refusing');
   }
+  if (isInside(run, src) || isInside(src, run)) {
+    throw new Error('source and run home are nested inside one another; refusing');
+  }
 }
+
+// ---------------------------------------------------------------- credentials
 
 /** `path` is a symlink whose target is `target` (by path or by identity). */
 function isLinkTo(path: string, target: string): boolean {
@@ -207,27 +391,56 @@ function isMarkedCopy(path: string): boolean {
   );
 }
 
+function sha256(bytes: Uint8Array): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+/** Per-file digests written into {@link CREDENTIALS_MARKER}. */
+interface CopyStamp {
+  readonly version: 1;
+  readonly files: Readonly<Record<string, string>>;
+}
+
+/** The copy's stamp, or undefined when the marker is legacy or unreadable. */
+function readStamp(copy: string): CopyStamp | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(join(copy, CREDENTIALS_MARKER), 'utf-8'));
+  } catch {
+    return undefined;
+  }
+  if (!isTable(parsed) || parsed['version'] !== 1 || !isTable(parsed['files'])) return undefined;
+  const files = parsed['files'];
+  if (!Object.values(files).every((digest) => typeof digest === 'string')) return undefined;
+  return { version: 1, files: files as Record<string, string> };
+}
+
 /**
- * Refuse to discard a marker-stamped copy that no longer matches the source
- * byte for byte. A refresh in either home makes them differ, and the copy
- * may then hold the only current refresh token. Entries that are not
- * regular files count as differing.
+ * Refuse to discard a marker-stamped copy that may hold something the source
+ * lacks. A file is safe to lose when it is exactly as copied (its stamp
+ * matches) or byte-identical to the source's file; anything else — a
+ * refreshed token, a revoked tombstone, a new file, a non-file entry — may be
+ * the only current state of the login and is kept. A file the stamp lists
+ * but the copy lacks holds nothing to lose.
  */
-function assertCopyMatchesSource(srcCredentials: string, copy: string): void {
-  const differing = readdirSync(copy).filter((entry) => {
+function assertCopyDiscardable(srcCredentials: string, copy: string): void {
+  const stamp = readStamp(copy);
+  const kept = readdirSync(copy).filter((entry) => {
     if (entry === CREDENTIALS_MARKER) return false;
     const copied = join(copy, entry);
+    if (!lstatSync(copied).isFile()) return true;
+    const bytes = readFileSync(copied);
+    if (stamp !== undefined && Object.hasOwn(stamp.files, entry) && stamp.files[entry] === sha256(bytes)) {
+      return false;
+    }
     const source = join(srcCredentials, entry);
-    return (
-      !lstatSync(copied).isFile() ||
-      !existsSync(source) ||
-      !readFileSync(copied).equals(readFileSync(source))
-    );
+    return !(statSync(source, { throwIfNoEntry: false })?.isFile() === true && bytes.equals(readFileSync(source)));
   });
-  if (differing.length > 0) {
+  if (kept.length > 0) {
     throw new Error(
-      `refusing to discard credentials copy at ${copy}: ${differing.join(', ')} no longer match ` +
-        'the source home (a refresh may have rotated the token); move it aside by hand',
+      `refusing to discard credentials copy at ${copy}: ${kept.join(', ')} ` +
+        (stamp === undefined ? 'cannot be verified as unchanged' : 'changed since it was copied') +
+        ' and may hold the only current refresh token; move it aside by hand',
     );
   }
 }
@@ -239,25 +452,28 @@ interface LinkStep {
   readonly action: 'keep' | 'create' | 'replace-copy';
 }
 
+interface LinkDonation {
+  readonly mode: 'link';
+  readonly sourceOauth: string;
+  readonly credentials: LinkStep;
+  readonly oauth: LinkStep;
+}
+
+interface CopyDonation {
+  readonly mode: 'copy';
+  readonly from: string;
+  readonly to: string;
+  /** An existing, discardable copy is removed and made afresh. */
+  readonly replace: boolean;
+}
+
 /** A donation decided in full before any effect; refusals throw while planning. */
-type Donation =
-  | {
-      readonly mode: 'link';
-      readonly sourceOauth: string;
-      readonly credentials: LinkStep;
-      readonly oauth: LinkStep;
-    }
-  | {
-      readonly mode: 'copy';
-      readonly from: string;
-      readonly to: string;
-      readonly existing: boolean;
-    };
+type Donation = LinkDonation | CopyDonation;
 
 /**
  * Decide what to do with `path` so it becomes a directory symlink to
  * `target`. Only an existing link to the same target, or (when `copyOf` is
- * given) an unchanged marker-stamped copy, may already occupy it.
+ * given) a discardable marker-stamped copy, may already occupy it.
  */
 function planLink(target: string, path: string, copyOf?: string): LinkStep {
   const stat = lstatSync(path, { throwIfNoEntry: false });
@@ -270,45 +486,58 @@ function planLink(target: string, path: string, copyOf?: string): LinkStep {
     );
   }
   if (copyOf !== undefined && isMarkedCopy(path)) {
-    assertCopyMatchesSource(copyOf, path);
+    assertCopyDiscardable(copyOf, path);
     return { target, path, action: 'replace-copy' };
   }
   throw new Error(`refusing to replace caller-owned entry at ${path}`);
 }
 
-function planDonation(srcHome: string, dstHome: string, mode: AuthMode): Donation {
-  const src = resolve(srcHome);
-  const dst = resolve(dstHome);
-  assertDistinctHomes(src, dst);
-  const srcCredentials = join(src, 'credentials');
-  if (statSync(srcCredentials, { throwIfNoEntry: false })?.isDirectory() !== true) {
+function sourceCredentials(src: string): string {
+  const credentials = join(src, 'credentials');
+  if (statSync(credentials, { throwIfNoEntry: false })?.isDirectory() !== true) {
     throw new Error(`no credentials directory in source home ${src}`);
   }
-  const dstCredentials = join(dst, 'credentials');
+  return credentials;
+}
 
-  if (mode === 'copy') {
-    const stat = lstatSync(dstCredentials, { throwIfNoEntry: false });
-    if (stat === undefined) {
-      return { mode, from: srcCredentials, to: dstCredentials, existing: false };
-    }
-    if (!isMarkedCopy(dstCredentials)) {
-      throw new Error(`refusing to overwrite unmarked credentials entry at ${dstCredentials}`);
-    }
-    assertCopyMatchesSource(srcCredentials, dstCredentials);
-    return { mode, from: srcCredentials, to: dstCredentials, existing: true };
-  }
-
+/** Both links, into the same source: credentials/ and its refresh lock dir. */
+function planLinkDonation(src: string, dst: string): LinkDonation {
+  const credentials = sourceCredentials(src);
   const sourceOauth = join(src, 'oauth');
   const sourceOauthStat = statSync(sourceOauth, { throwIfNoEntry: false });
   if (sourceOauthStat !== undefined && !sourceOauthStat.isDirectory()) {
     throw new Error(`source home oauth entry is not a directory: ${sourceOauth}`);
   }
   return {
-    mode,
+    mode: 'link',
     sourceOauth,
-    credentials: planLink(srcCredentials, dstCredentials, srcCredentials),
+    credentials: planLink(credentials, join(dst, 'credentials'), credentials),
     oauth: planLink(sourceOauth, join(dst, 'oauth')),
   };
+}
+
+function planCopyDonation(src: string, dst: string): CopyDonation {
+  const from = sourceCredentials(src);
+  const to = join(dst, 'credentials');
+  if (lstatSync(join(dst, 'oauth'), { throwIfNoEntry: false })?.isSymbolicLink() === true) {
+    throw new Error(
+      `refusing to copy credentials into ${dst}: its oauth/ is a symlink, which would pair ` +
+        'a copied token with a shared lock',
+    );
+  }
+  if (lstatSync(to, { throwIfNoEntry: false }) === undefined) return { mode: 'copy', from, to, replace: false };
+  if (!isMarkedCopy(to)) {
+    throw new Error(`refusing to overwrite unmarked credentials entry at ${to}`);
+  }
+  assertCopyDiscardable(from, to);
+  return { mode: 'copy', from, to, replace: true };
+}
+
+function planDonation(srcHome: string, dstHome: string, mode: AuthMode): Donation {
+  const src = resolve(srcHome);
+  const dst = resolve(dstHome);
+  assertDistinctHomes(src, dst);
+  return mode === 'link' ? planLinkDonation(src, dst) : planCopyDonation(src, dst);
 }
 
 function applyLink(step: LinkStep): void {
@@ -324,6 +553,10 @@ function applyLink(step: LinkStep): void {
  * lock — silently defeating the shared refresh serialization that is the
  * point of link mode. Link targets are absolute but not symlink-resolved, so
  * a source home reached through a symlink stays reached through it.
+ *
+ * A copy is written from the same bytes its stamp was computed from, and the
+ * stamp goes in first, so an interrupted copy is still recognizably this
+ * library's and its files are verifiably unchanged.
  */
 function applyDonation(donation: Donation): void {
   if (donation.mode === 'link') {
@@ -332,74 +565,108 @@ function applyDonation(donation: Donation): void {
     applyLink(donation.oauth);
     return;
   }
-  // The marker goes in first, so an interrupted copy is still recognizably
-  // this library's and can be shredded.
-  if (!donation.existing) mkdirSync(donation.to, { recursive: true, mode: 0o700 });
-  chmodSync(donation.to, 0o700);
-  writeFileSync(join(donation.to, CREDENTIALS_MARKER), '', { mode: 0o600 });
+  const files: Record<string, string> = {};
+  const contents: [string, Buffer][] = [];
   for (const entry of readdirSync(donation.from)) {
     if (entry === CREDENTIALS_MARKER) continue;
     const from = join(donation.from, entry);
     if (!statSync(from).isFile()) continue;
+    const bytes = readFileSync(from);
+    files[entry] = sha256(bytes);
+    contents.push([entry, bytes]);
+  }
+  if (donation.replace) rmSync(donation.to, { recursive: true, force: true });
+  mkdirSync(donation.to, { recursive: true, mode: 0o700 });
+  chmodSync(donation.to, 0o700);
+  const stamp: CopyStamp = { version: 1, files };
+  writeFileSync(join(donation.to, CREDENTIALS_MARKER), `${JSON.stringify(stamp)}\n`, { mode: 0o600 });
+  for (const [entry, bytes] of contents) {
     const to = join(donation.to, entry);
-    copyFileSync(from, to);
+    writeFileSync(to, bytes, { mode: 0o600 });
     chmodSync(to, 0o600);
   }
 }
 
 /**
  * Give `dstHome` working authentication from `srcHome` according to `mode`.
- * Refuses, changing nothing, when the homes are the same directory or when
- * an entry it would replace is caller-owned or a changed copy.
+ * Refuses, changing nothing, when the homes are the same or nested, or when
+ * an entry it would replace is caller-owned, links elsewhere, or is a copy
+ * that may hold something the source lacks.
  */
 export function donateAuth(srcHome: string, dstHome: string, mode: AuthMode = 'link'): void {
   applyDonation(planDonation(srcHome, dstHome, mode));
 }
 
 /**
- * Re-donate authentication on a kept home whose previous donation is gone
- * (shredded copy or removed link). A no-op when `credentials` already
- * exists — hand-placed or `--keep-credentials` material is left alone —
- * except that in link mode a missing `oauth/` link next to this library's
- * own credentials link is restored, so refreshes keep the shared lock.
+ * Make a kept home's existing authentication usable from `srcHome`, or
+ * re-donate it when it is gone (shredded copy or removed link).
+ *
+ * - `credentials` missing: donate per `mode`.
+ * - `credentials` a symlink: it must be this source's link and `mode` must
+ *   be `link`; `oauth` must be the paired link into the same source, and is
+ *   restored when missing. Anything else is refused: a token and a lock from
+ *   different homes would refresh under a lock nobody else takes.
+ * - `credentials` a real directory (hand-placed or `--keep-credentials`
+ *   material): left alone, but an `oauth` symlink next to it is refused as
+ *   unpaired.
+ *
  * Returns whether it changed anything.
  */
 export function ensureAuth(srcHome: string, dstHome: string, mode: AuthMode = 'link'): boolean {
   const src = resolve(srcHome);
   const dst = resolve(dstHome);
   assertDistinctHomes(src, dst);
-  const credentials = join(dst, 'credentials');
-  if (lstatSync(credentials, { throwIfNoEntry: false }) === undefined) {
+  const credentials = lstatSync(join(dst, 'credentials'), { throwIfNoEntry: false });
+  if (credentials === undefined) {
     donateAuth(src, dst, mode);
     return true;
   }
-  if (
-    mode === 'link' &&
-    lstatSync(join(dst, 'oauth'), { throwIfNoEntry: false }) === undefined &&
-    isLinkTo(credentials, join(src, 'credentials'))
-  ) {
-    donateAuth(src, dst, mode);
-    return true;
+  if (credentials.isSymbolicLink()) {
+    if (mode !== 'link') {
+      throw new Error(`run home ${dst} has linked credentials, but copy mode was requested; refusing`);
+    }
+    const donation = planLinkDonation(src, dst);
+    applyDonation(donation);
+    return donation.oauth.action === 'create';
+  }
+  if (lstatSync(join(dst, 'oauth'), { throwIfNoEntry: false })?.isSymbolicLink() === true) {
+    throw new Error(
+      `run home ${dst} has a linked oauth/ but its own credentials/; refusing the unpaired lock`,
+    );
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------- homes
+
+/**
+ * An existing directory is assembled into only when it is empty, holds
+ * nothing but the ephemeral marker, or already holds a config.toml (an
+ * assembled home). Its permissions stay the caller's. Returns whether the
+ * run home still has to be created.
+ */
+function mustCreateRunHome(home: string): boolean {
+  const stat = statSync(home, { throwIfNoEntry: false });
+  if (stat === undefined) return true;
+  if (!stat.isDirectory()) throw new Error(`run home ${home} exists and is not a directory`);
+  const entries = readdirSync(home).filter((entry) => entry !== EPHEMERAL_MARKER);
+  if (entries.length > 0 && !entries.includes('config.toml')) {
+    throw new Error(
+      `refusing to assemble into ${home}: it is not empty and holds no config.toml, so it is not a run home`,
+    );
   }
   return false;
 }
 
 /**
  * Turn `dstHome` into a runnable minimal KIMI_CODE_HOME: authentication
- * donated from `srcHome` (link by default), and a config.toml carrying
- * `default_model` + the provider section + the model alias section + the
- * `[thinking]` section (when present) VERBATIM from `srcHome`'s config.toml.
- * Verbatim matters: the credential slot is
- * `kimi-code[-env-<sha256({oauthHost, baseUrl})[:16]>]` — recompute the pair
- * and the token is never read. (Verified 2026-09-24 for kimi 2.0.1:
- * `packages/oauth/src/managed-kimi-code.ts` — mechanism identical to the
- * 0.41.0-era measurement this library started from.) Without `[thinking]`
- * the run would use the model's default effort instead of the configured
- * one. Other root-table settings are not carried.
+ * donated from `srcHome` (link by default), and a config.toml built by
+ * {@link minimalConfig} from `srcHome`'s.
  *
  * config.toml is written as a regular file: the engine persists config via
  * tmp+rename, which would silently replace a symlink. An existing
- * config.toml that is not a regular file is refused.
+ * config.toml that is not a regular file is refused. A missing run home is
+ * created with mode 0700; an existing one keeps its mode.
  *
  * All refusals happen before the first effect (see the custody model above).
  */
@@ -412,31 +679,7 @@ export function assembleHome(
   const dst = resolve(dstHome);
   assertDistinctHomes(src, dst);
   const srcConfigPath = join(src, 'config.toml');
-  const configText = readFileSync(srcConfigPath, 'utf-8');
-
-  const modelAlias = scalar(configText, 'default_model');
-  if (modelAlias === undefined) {
-    throw new Error(`no default_model in ${srcConfigPath}`);
-  }
-  const modelSection = extractSection(configText, `[models."${modelAlias}"]`);
-  if (modelSection === undefined) {
-    throw new Error(`no [models."${modelAlias}"] in ${srcConfigPath}`);
-  }
-  const provider = scalar(modelSection, 'provider');
-  if (provider === undefined) {
-    throw new Error(`no provider in [models."${modelAlias}"]`);
-  }
-  const providerSection = extractSection(configText, `[providers."${provider}"]`);
-  if (providerSection === undefined) {
-    throw new Error(`no [providers."${provider}"] in ${srcConfigPath}`);
-  }
-  const thinkingSection = extractSection(configText, '[thinking]');
-  if (thinkingSection === undefined && /^\s*thinking\s*[.=]/m.test(rootTable(configText))) {
-    throw new Error(
-      `${srcConfigPath} configures thinking outside a [thinking] table; ` +
-        'refusing rather than dropping it',
-    );
-  }
+  const config = minimalConfig(readFileSync(srcConfigPath, 'utf-8'), srcConfigPath);
 
   const home = canonicalPath(dst);
   const configPath = join(dst, 'config.toml');
@@ -445,33 +688,31 @@ export function assembleHome(
     throw new Error(`refusing to replace ${configPath}: not a regular file`);
   }
   const donation = planDonation(src, dst, mode);
+  const create = mustCreateRunHome(home);
 
   // Effects start here; every refusal above left both homes untouched.
-  mkdirSync(home, { recursive: true, mode: 0o700 });
-  chmodSync(home, 0o700);
+  if (create) {
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    chmodSync(home, 0o700);
+  }
   applyDonation(donation);
+  writeFileSync(configPath, config.text, { mode: 0o600 });
 
-  const sections = [providerSection, modelSection];
-  if (thinkingSection !== undefined) sections.push(thinkingSection);
-  const config = `default_model = "${modelAlias}"\n\n${sections.join('\n\n')}\n`;
-  writeFileSync(configPath, config, { mode: 0o600 });
-
-  return { home: dst, configPath, modelAlias, provider };
+  return { home: dst, configPath, modelAlias: config.modelAlias, provider: config.provider };
 }
 
 /**
  * Remove `<home>/credentials` only when it is the marker-stamped copy
  * this library made. Linked or hand-prepared credentials have no marker and
- * are never touched. When `srcHome` is given, a copy that no longer matches
- * the source byte for byte is refused (thrown) and kept: a refresh inside it
- * may have left it holding the only current refresh token. Returns whether
- * it shredded.
+ * are never touched. When `srcHome` is given, a copy that may hold something
+ * the source lacks is refused (thrown) and kept — see
+ * {@link CREDENTIALS_MARKER}. Returns whether it shredded.
  */
 export function shredCopiedCredentials(home: string, srcHome?: string): boolean {
   const credentials = join(resolve(home), 'credentials');
   if (!isMarkedCopy(credentials)) return false;
   if (srcHome !== undefined) {
-    assertCopyMatchesSource(join(resolve(srcHome), 'credentials'), credentials);
+    assertCopyDiscardable(join(resolve(srcHome), 'credentials'), credentials);
   }
   rmSync(credentials, { recursive: true, force: true });
   return true;
@@ -501,9 +742,9 @@ export function makeEphemeralHome(): string {
  * ephemeral marker, so a library caller cannot turn this into rm -rf on an
  * arbitrary directory. Directory symlinks inside the home (link-mode
  * credentials) are unlinked, never traversed — the source home's credential
- * files are not touched. When `srcHome` is given, a credentials copy that no
- * longer matches it is refused as in shredCopiedCredentials, and the whole
- * home is kept.
+ * files are not touched. When `srcHome` is given, a credentials copy that may
+ * hold something the source lacks is refused as in shredCopiedCredentials,
+ * and the whole home is kept.
  */
 export function removeHome(home: string, srcHome?: string): void {
   if (!existsSync(join(home, EPHEMERAL_MARKER))) {

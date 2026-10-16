@@ -1,7 +1,9 @@
 #!/usr/bin/env bun
 import { parseArgs } from 'node:util';
 import {
+  checkLaunchOptions,
   exitCodeOf,
+  KimiCustodyError,
   KimiSpawnError,
   makeEphemeralHome,
   spawnKimi,
@@ -9,6 +11,7 @@ import {
   type OutputFormat,
 } from '../src/index.ts';
 import {
+  checkPreloadOptions,
   PrimerNoSessionError,
   readPreloadItem,
   runPreloaded,
@@ -23,8 +26,9 @@ operator's own login. Library first; this CLI is its worked example.
 Home and auth:
   --home DIR            Use DIR as the run home (kept). Reused as-is when it
                         already holds a config.toml; otherwise assembled from
-                        the source home. Refused when it is the source home
-                        under another name.
+                        the source home, if DIR is missing or empty (it keeps
+                        its permissions). Refused when it is, contains or lies
+                        inside the source home.
   --src-home DIR        Assemble/donate from DIR (default:
                         $KIMI_CODE_HOME_SOURCE ?? ~/.kimi-code). Forces
                         re-assembly of --home.
@@ -36,10 +40,11 @@ Home and auth:
                         its cross-process lock stay shared. copy duplicates
                         token files and forks the refresh lineage. Existing
                         entries that bare-kimi did not make (including
-                        symlinks pointing elsewhere) are never replaced.
+                        symlinks into another home) are never replaced.
   --keep-credentials    Copy mode: keep the donated copy after the run. A
-                        copy that no longer matches the source is always
-                        kept, and the run reports an error.
+                        copy changed since it was copied (a refresh may
+                        have left the only current token in it) is always
+                        kept, and the run exits 4.
   --keep-home           Keep even an ephemeral (mkdtemp'd) home.
 
 Run shape:
@@ -56,16 +61,23 @@ Run shape:
   --no-skills           Load no file-based skills (empty --skills-dir).
   --add-dir DIR         Additional workspace directory (repeatable).
   --kimi-bin PATH       kimi binary (default: $KIMI_BIN ?? kimi on PATH).
+                        A relative PATH resolves against the current
+                        directory.
   --kimi-arg ARG        Forward ARG verbatim to kimi (repeatable).
+                        --skills-dir, --add-dir and --kimi-arg go to kimi
+                        verbatim; kimi resolves relative paths in --cwd.
   --no-process-env      Do not inherit the parent environment.
   --preload FILE        Give the run FILE's contents as synthetic past
                         (repeatable; see README — costs input tokens on
                         every resumed turn, it is not free).
   --prime TEXT          Primer prompt for --preload (default "Acknowledged.").
+                        --preload always starts a fresh session, so it
+                        cannot be combined with --resume or --continue.
   -v, --version         Print bare-kimi version.
   -h, --help            This text.
 
-The prompt may not start with "-": kimi would read it as a flag.
+The prompt (and --prime) may not start with "-": kimi could read it as a
+flag. Every option check happens before any home is made or kimi starts.
 
 Ambient boundary (measured, not a bug): AGENTS.md files (run home,
 ~/.agents, git-root → cwd walk) and skills still load in print mode. For a
@@ -73,11 +85,17 @@ fully bare run use a cwd with no AGENTS.md up its git root.
 
 Permissions: -p forces kimi's native auto permission mode; -y/--yolo,
 --auto and --plan conflict with -p and cannot be used. bare-kimi passes no
-permission flags and never weakens configured policy.
+permission flags. An assembled run home carries the source config's
+[permission] and [[hooks]] tables verbatim, with no rule added, removed or
+reinterpreted. A source config that kimi's own TOML parser rejects, or whose
+permission, hooks, thinking, model or provider settings cannot be carried
+verbatim, is refused before any effect.
+A home reused as-is runs with its own config.
 
 Exit codes: the child's exit code (128+N on signal); 127 when kimi cannot
 be spawned; 2 for bare-kimi usage/setup errors; 3 when a primer run
-produced no session id.`;
+produced no session id; 4 when the run ended but cleanup kept something
+(named on stderr), e.g. a credentials copy holding a refreshed token.`;
 
 interface Cli {
   options: LaunchOptions;
@@ -207,19 +225,32 @@ async function main(): Promise<number> {
     return 2;
   }
 
+  // The library's own checks, before this CLI makes anything (--keep-home).
+  try {
+    if (cli.preload.length > 0) {
+      checkPreloadOptions(options, cli.prime);
+    } else {
+      checkLaunchOptions(options);
+    }
+  } catch (error) {
+    console.error(`bare-kimi: ${error instanceof Error ? error.message : String(error)}`);
+    return 2;
+  }
+
+  let items;
+  try {
+    items = cli.preload.map(readPreloadItem);
+  } catch (error) {
+    console.error(`bare-kimi: ${error instanceof Error ? error.message : String(error)}`);
+    return 2;
+  }
+
   // --keep-home: make the ephemeral home caller-supplied so the SDK keeps it.
   if (cli.keepHome && options.home === undefined) {
     options = { ...options, home: makeEphemeralHome() };
   }
 
-  if (cli.preload.length > 0) {
-    let items;
-    try {
-      items = cli.preload.map(readPreloadItem);
-    } catch (error) {
-      console.error(`bare-kimi: ${error instanceof Error ? error.message : String(error)}`);
-      return 2;
-    }
+  if (items.length > 0) {
     try {
       const run = await runPreloaded(options, items, cli.prime);
       process.stdout.write(run.stdout);
@@ -231,6 +262,12 @@ async function main(): Promise<number> {
         process.stderr.write(error.primer.stderr);
         console.error('bare-kimi: primer run produced no session id');
         return 3;
+      }
+      if (error instanceof KimiCustodyError && error.run !== undefined) {
+        process.stdout.write(error.run.stdout);
+        process.stderr.write(error.run.stderr);
+        report(error.run.code, error.run.home, options);
+        return custodyKept(error);
       }
       console.error(`bare-kimi: ${error instanceof Error ? error.message : String(error)}`);
       return 2;
@@ -252,16 +289,29 @@ async function main(): Promise<number> {
   const onSigterm = (): void => forward('SIGTERM');
   process.on('SIGINT', onSigint);
   process.on('SIGTERM', onSigterm);
+  let code = 1; // replaced once the child has exited
+  let cleanup: unknown;
   try {
     await subprocess.exited;
-    const { code } = exitCodeOf(subprocess);
+    code = exitCodeOf(subprocess).code;
     report(code, launched.home, options);
-    return code;
   } finally {
     process.off('SIGINT', onSigint);
     process.off('SIGTERM', onSigterm);
-    await dispose();
+    cleanup = await dispose().then(
+      () => undefined,
+      (error: unknown) => error ?? new Error('cleanup failed'),
+    );
   }
+  if (cleanup instanceof KimiCustodyError) return custodyKept(cleanup);
+  if (cleanup !== undefined) throw cleanup;
+  return code;
+}
+
+/** The run ended, but cleanup kept something on purpose; say what and where. */
+function custodyKept(error: KimiCustodyError): number {
+  console.error(`bare-kimi: ${error.message}`);
+  return 4;
 }
 
 function report(code: number, home: string, options: LaunchOptions): void {
