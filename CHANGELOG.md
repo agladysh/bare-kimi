@@ -2,12 +2,21 @@
 
 ## Unreleased — repair candidate
 
-Written by Claude (an AI coding agent) after recovery, in six rounds.
+Written by Claude (an AI coding agent) after recovery, in seven rounds.
 Earlier states of this candidate, including the fifth round's library
 changes, passed their typecheck and test suite when those were run
-separately. The sixth round changed only the optional native probe and its
-documentation. It has not been run by its author. Nothing here has been run
-against a real kimi.
+separately. The sixth and seventh rounds changed only the optional native
+probe and its documentation. No kimi has been launched by the probe; see
+below for what its one run showed.
+
+### Write-control correction
+
+Independent reception found that a write in the read-denied decoy home could
+fail on read permission alone. The current probe uses a third owned, readable
+directory outside the root and every denied-read path for its write control.
+All three directories are retained. Earlier descriptions of two directories
+and a combined read/write decoy describe the superseded probe. Network
+isolation covers direct socket connects, not IPC delegation to external services.
 
 ### Native evidence
 
@@ -228,6 +237,30 @@ The current version:
 - clears its timers, so it exits once done, and skips non-directories when
   counting wire journals.
 
+The third version was run once, unsandboxed, against an installed kimi
+2.1.0. It refused in its preflight, before launching kimi. Observed in the
+sandbox:
+- the provider answered;
+- the write outside the root and the decoy read were refused with `EPERM`;
+- the decoy loopback port and the never-routed address both failed with
+  `ECONNREFUSED`, which it did not accept as a denial.
+
+That refusal was correct as far as it went. One hypothesis is that this
+platform reports a sandbox network denial as `ECONNREFUSED`, since an
+unroutable address refusing at once is not how a real network behaves. But
+that run had no unsandboxed comparison, so a harness fault (for example the
+decoy listener not accepting) could not be excluded. The current version
+does not simply accept `ECONNREFUSED`. It runs the same check unsandboxed
+before and after the sandboxed run, as positive controls: both loopback
+listeners must connect, and a write and a read in the decoy home must
+succeed. Sandboxed, the provider port must connect over the same raw socket
+call. Only against that contrast is `ECONNREFUSED` from the decoy listener
+taken as this platform's observed sandbox denial, and the never-routed
+address must then fail with the same code. A failing control refuses the
+run. The write check now targets the probe's own decoy home instead of an
+extra path in the temp dir. Each preflight run's raw output, and the
+verdict, are written before judging.
+
 In more detail:
 - **Isolation:** macOS only, from an unsandboxed shell. The probe runs
   bare-kimi and kimi under `sandbox-exec`:
@@ -235,10 +268,17 @@ In more detail:
   - file writes only under its temp root;
   - reads of the real native homes, and of a synthetic decoy home, denied.
 
-  A preflight inside the same sandbox must show the provider port answering,
-  a listening decoy port and a never-routed address refused, a write outside
-  the root refused, a read of the decoy home refused, and an owned process
-  group. Otherwise the probe refuses before kimi is launched.
+  A preflight compares unsandboxed controls (before and after) with the
+  sandboxed run. It must show:
+  - the provider port connecting in both;
+  - a live decoy listener reached by the controls but refused in the
+    sandbox;
+  - a never-routed address refused in the same way;
+  - a write and a read in the decoy home allowed unsandboxed and refused in
+    the sandbox;
+  - an owned process group.
+
+  Otherwise the probe refuses before kimi is launched.
 - **Custody:** two directories are created in the system temp dir and left
   for inspection: the temp root (runs, raw output, report) and the decoy
   home (one non-secret file). The report lists the real homes it denied by

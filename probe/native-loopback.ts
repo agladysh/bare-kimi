@@ -30,14 +30,25 @@
  *     and any `KIMI_CODE_HOME`/`KIMI_CODE_HOME_SOURCE` this shell selects),
  *     computed at run time, and for a synthetic decoy home.
  *
- *   A preflight inside the same sandbox must show all of the following
- *   before kimi is launched, or the probe refuses (exit 2):
- *   - the provider port answers;
- *   - another loopback port and a never-routed address are refused;
- *   - a write outside the root is refused;
- *   - reading the decoy home's file is refused (proving the read denial
- *     without touching a real home);
- *   - the child owns its own process group.
+ *   Before kimi is launched, a preflight compares three runs of the same
+ *   check, with the same environment: unsandboxed, sandboxed, unsandboxed
+ *   again. The unsandboxed runs are the positive controls. They must
+ *   connect to both the provider port and a live decoy listener on another
+ *   loopback port, write in a separate readable directory and read the decoy file. They never
+ *   connect off the host and never read a real home. Sandboxed, the run must:
+ *   - reach the provider over HTTP and over the same raw connect;
+ *   - fail to connect to the decoy listener, which the controls reached
+ *     just before and after, with EPERM/EACCES, or with ECONNREFUSED. The
+ *     latter is accepted only through this contrast, as the platform's
+ *     observed way of reporting a sandbox denial, never on its own;
+ *   - fail to reach a never-routed address with EPERM/EACCES, or with the
+ *     same code the decoy listener got;
+ *   - be refused (EPERM/EACCES) a write in the separate readable directory and a read of the decoy
+ *     file, which proves the read denial without touching a real home.
+ *
+ *   Every child must also own its own process group. If any of this is not
+ *   shown, including a control that fails (a harness fault that would make
+ *   sandboxed failures meaningless), the probe refuses (exit 2).
  * - Every child runs in its own process group, which the probe owns. At a
  *   deadline the group gets SIGTERM, then SIGKILL after a grace period;
  *   output is collected as it arrives and the drain is bounded. Whether the
@@ -70,19 +81,23 @@
  * the run home, and where the configured thinking effort appears in the
  * requests kimi sent.
  *
- * Custody: the probe creates two directories in the system temp dir and
- * leaves both for inspection, naming them on success, refusal and failure:
+ * Custody: the probe creates three directories in the system temp dir and
+ * leaves them for inspection, naming them on success, refusal and failure:
  * - the temp root `bare-kimi-probe-*`, which holds everything the runs
- *   write, the report, and each run's raw stdout/stderr (written before
- *   anything is judged), plus the preflight's;
+ *   write, the report, each run's raw stdout/stderr (written before anything
+ *   is judged), each preflight run's raw output, and `preflight-verdict.json`;
  * - the decoy home `bare-kimi-probe-decoy-home-*`, which holds one
- *   non-secret file. It lies outside the root on purpose: the read denial
- *   must be shown on a path the write allowance does not also cover.
+ *   non-secret file for the denied-read control;
+ * - `bare-kimi-probe-write-check-*`, outside the root and every denied-read
+ *   path. Controls write and remove `write-check` here, so read denial
+ *   cannot stand in for write isolation.
  *
- * The preflight's own attempt to write outside the root targets one more
- * path in the temp dir. It is expected to be refused, and is removed again
- * if the attempt succeeds. The report lists the real native homes it denied
- * by absolute path; keep it private.
+ * The write-control directory is outside every denied-read path; it is also
+ * retained and named in created. Direct socket isolation does not cover IPC
+ * delegation to external system services.
+ *
+ * The report lists the real native homes it denied by absolute path; keep it
+ * private.
  *
  * Exit codes: 0 when the control held (the report may still mark other
  * findings inconclusive), 1 when it did not or the probe failed, 2 when the
@@ -499,23 +514,30 @@ function sandboxProfile(root: string, port: number, deniedReads: readonly string
 }
 
 /**
- * Runs inside the sandbox with the same profile and environment as the real
- * runs: the provider port must answer; a listening decoy on another loopback
- * port and TEST-NET-1 (RFC 5737, never routed) must both be refused by the
- * sandbox itself; a write outside the root must be refused; and reading the
- * synthetic decoy home, denied exactly as the real native homes are, must be
- * refused. That proves the read denial works without touching a real home.
+ * The isolation check, run three times with the same environment and the
+ * same code: unsandboxed before (`PROBE_MODE=control`), sandboxed with the
+ * real profile (`PROBE_MODE=sandboxed`), and unsandboxed after. Each run
+ * reports, for the provider port and for a live decoy listener on another
+ * loopback port, the outcome of the same raw TCP connect; whether it could
+ * write a file in the decoy home (outside the root, owned by the probe); and
+ * whether it could read the decoy home's file. Only the sandboxed run also
+ * tries TEST-NET-1 (RFC 5737, never routed). An unsandboxed run never
+ * connects off the host and never reads a real home. Every connect records
+ * how long it took.
  */
 const PREFLIGHT = `
 const { connect } = await import('node:net');
 const { readFileSync, writeFileSync, rmSync } = await import('node:fs');
 const attempt = (host, port) => new Promise((done) => {
+  const started = Date.now();
+  const finish = (result) => done({ result, ms: Date.now() - started });
   const socket = connect({ host, port });
-  const timer = setTimeout(() => { socket.destroy(); done('timeout'); }, 3000);
-  socket.on('connect', () => { clearTimeout(timer); socket.destroy(); done('connected'); });
-  socket.on('error', (error) => { clearTimeout(timer); done(error.code ?? String(error)); });
+  const timer = setTimeout(() => { socket.destroy(); finish('timeout'); }, 3000);
+  socket.on('connect', () => { clearTimeout(timer); socket.destroy(); finish('connected'); });
+  socket.on('error', (error) => { clearTimeout(timer); finish(error.code ?? String(error)); });
 });
-const out = {};
+const sandboxed = process.env.PROBE_MODE === 'sandboxed';
+const out = { mode: process.env.PROBE_MODE };
 try {
   const response = await fetch('http://127.0.0.1:' + process.env.PROBE_PORT + '/health');
   out.provider = (await response.text()) === 'ok';
@@ -523,11 +545,12 @@ try {
   out.provider = false;
   out.providerError = String(error);
 }
+out.providerTcp = await attempt('127.0.0.1', Number(process.env.PROBE_PORT));
 out.otherLoopback = await attempt('127.0.0.1', Number(process.env.PROBE_DECOY_PORT));
-out.egress = await attempt('192.0.2.1', 80);
+if (sandboxed) out.egress = await attempt('192.0.2.1', 80);
 try {
-  writeFileSync(process.env.PROBE_OUTSIDE, 'x');
-  rmSync(process.env.PROBE_OUTSIDE, { force: true });
+  writeFileSync(process.env.PROBE_WRITE_TARGET, 'x');
+  rmSync(process.env.PROBE_WRITE_TARGET, { force: true });
   out.write = 'allowed';
 } catch (error) {
   out.write = error.code ?? String(error);
@@ -556,6 +579,88 @@ function makeDecoyHome(): { dir: string; file: string } {
 }
 
 const DENIED = new Set(['EPERM', 'EACCES']);
+
+/** A connect outcome from the preflight script: 'connected', 'timeout' or an error code. */
+function connectResult(report: Json, key: string): string | undefined {
+  const value = report[key];
+  return isRecord(value) && typeof value['result'] === 'string' ? value['result'] : undefined;
+}
+
+interface IsolationVerdict {
+  /** Why isolation is not shown; empty when it is. */
+  readonly failures: readonly string[];
+  /** How the sandbox refused the live decoy listener, when it did. */
+  readonly networkDenial: string | undefined;
+  /** `errno` when that code is a permission error; `contrast` when only the paired controls make it one. */
+  readonly networkDenialBasis: 'errno' | 'contrast' | undefined;
+}
+
+/**
+ * Judge the three preflight reports.
+ *
+ * The unsandboxed controls, before and after, must reach both loopback
+ * listeners, write in a separate readable directory and read the decoy file. Otherwise the
+ * harness itself is broken (a listener not accepting, a path not writable)
+ * and no sandboxed failure can be attributed to the sandbox.
+ *
+ * Sandboxed, the provider must answer over HTTP and over the same raw
+ * connect, and the write and the read must fail with EPERM or EACCES. The
+ * live decoy listener must fail to connect:
+ * - with EPERM or EACCES: a sandbox denial by its error code;
+ * - with ECONNREFUSED: accepted only through the contrast. The same listener
+ *   accepted the same connect just before and just after, unsandboxed, and
+ *   the allowed port connected from inside the sandbox. So in this run the
+ *   refusal came from the sandbox, which is how this platform was observed
+ *   to report it. ECONNREFUSED is never taken as proof on its own;
+ * - with anything else, or not failing: not shown.
+ *
+ * TEST-NET-1 cannot be controlled unsandboxed (that would be a real off-host
+ * connect). It must fail with EPERM/EACCES, or with the very code the
+ * sandbox was shown to give the decoy listener.
+ */
+function judgeIsolation(before: unknown, sandboxed: unknown, after: unknown): IsolationVerdict {
+  const failures: string[] = [];
+  for (const [label, control] of [
+    ['control before', before],
+    ['control after', after],
+  ] as const) {
+    if (!isRecord(control)) {
+      failures.push(`${label}: no report`);
+      continue;
+    }
+    if (control['provider'] !== true) failures.push(`${label}: provider did not answer`);
+    if (connectResult(control, 'providerTcp') !== 'connected') failures.push(`${label}: provider port did not connect`);
+    if (connectResult(control, 'otherLoopback') !== 'connected') failures.push(`${label}: decoy listener did not connect`);
+    if (control['write'] !== 'allowed') failures.push(`${label}: could not write in the decoy home`);
+    if (control['decoyRead'] !== 'allowed') failures.push(`${label}: could not read the decoy file`);
+  }
+  if (!isRecord(sandboxed)) {
+    return { failures: [...failures, 'sandboxed: no report'], networkDenial: undefined, networkDenialBasis: undefined };
+  }
+  if (sandboxed['provider'] !== true) failures.push('sandboxed: provider did not answer');
+  if (connectResult(sandboxed, 'providerTcp') !== 'connected') failures.push('sandboxed: provider port did not connect');
+  if (!DENIED.has(String(sandboxed['write']))) failures.push(`sandboxed: write outside the root gave ${String(sandboxed['write'])}`);
+  if (!DENIED.has(String(sandboxed['decoyRead']))) failures.push(`sandboxed: decoy read gave ${String(sandboxed['decoyRead'])}`);
+
+  const controlsHeld = failures.length === 0;
+  const decoy = connectResult(sandboxed, 'otherLoopback');
+  let networkDenial: string | undefined;
+  let networkDenialBasis: 'errno' | 'contrast' | undefined;
+  if (decoy !== undefined && DENIED.has(decoy)) {
+    networkDenial = decoy;
+    networkDenialBasis = 'errno';
+  } else if (decoy === 'ECONNREFUSED' && controlsHeld) {
+    networkDenial = decoy;
+    networkDenialBasis = 'contrast';
+  } else {
+    failures.push(`sandboxed: decoy listener gave ${String(decoy)}, not shown to be a sandbox denial`);
+  }
+  const egress = connectResult(sandboxed, 'egress');
+  if (egress === undefined || !(DENIED.has(egress) || (networkDenial !== undefined && egress === networkDenial))) {
+    failures.push(`sandboxed: TEST-NET-1 gave ${String(egress)}, not the sandbox's shown denial`);
+  }
+  return { failures, networkDenial, networkDenialBasis };
+}
 
 /** No AGENTS.md or Git repository above the probe's cwd: kimi would load them. */
 function assertNoAmbientInstructions(dir: string): void {
@@ -917,6 +1022,14 @@ async function main(): Promise<number> {
   const decoyHome = makeDecoyHome();
   created.push(decoyHome.dir);
   const deniedReads = [...nativeHomes(root), decoyHome.dir];
+  const writeCheckDir = realpathSync(mkdtempSync(join(tmpdir(), 'bare-kimi-probe-write-check-')));
+  created.push(writeCheckDir);
+  for (const denied of deniedReads) {
+    const rel = relative(denied, writeCheckDir);
+    if (rel === '' || (rel !== '..' && !rel.startsWith('../') && !isAbsolute(rel))) {
+      throw new Refusal('the write-control directory overlaps a denied-read path');
+    }
+  }
   releaseGroupsOnExit();
 
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: handle });
@@ -937,38 +1050,40 @@ async function main(): Promise<number> {
       KIMI_CODE_NO_AUTO_UPDATE: '1',
     };
 
-    const preflight = await runOwned(
-      [SANDBOX_EXEC, '-p', profile, process.execPath, '-e', PREFLIGHT],
-      {
-        ...env,
-        PROBE_PORT: String(port),
-        PROBE_DECOY_PORT: String(decoyPort),
-        PROBE_OUTSIDE: join(tmpdir(), `bare-kimi-probe-escape-${process.pid}`),
-        PROBE_DECOY_FILE: decoyHome.file,
-      },
-      root,
-      PREFLIGHT_DEADLINE_MS,
-    );
-    writeFileSync(join(root, 'preflight.stdout.txt'), preflight.stdout);
-    writeFileSync(join(root, 'preflight.stderr.txt'), preflight.stderr);
-    if (preflight.groupNotOwned) throw new Refusal('the probe cannot own a process group for its children');
-    let isolation: unknown;
-    try {
-      isolation = JSON.parse(preflight.stdout);
-    } catch {
-      isolation = undefined;
-    }
-    if (
-      preflight.timedOut ||
-      !isRecord(isolation) ||
-      isolation['provider'] !== true ||
-      !DENIED.has(String(isolation['otherLoopback'])) ||
-      !DENIED.has(String(isolation['egress'])) ||
-      !DENIED.has(String(isolation['write'])) ||
-      !DENIED.has(String(isolation['decoyRead']))
-    ) {
+    const preflightEnv = {
+      ...env,
+      PROBE_PORT: String(port),
+      PROBE_DECOY_PORT: String(decoyPort),
+      PROBE_WRITE_TARGET: join(writeCheckDir, 'write-check'),
+      PROBE_DECOY_FILE: decoyHome.file,
+    };
+    /** One preflight run; raw output is on disk before anything is judged. */
+    const preflightRun = async (name: string, mode: 'control' | 'sandboxed'): Promise<unknown> => {
+      const cmd =
+        mode === 'sandboxed'
+          ? [SANDBOX_EXEC, '-p', profile, process.execPath, '-e', PREFLIGHT]
+          : [process.execPath, '-e', PREFLIGHT];
+      const run = await runOwned(cmd, { ...preflightEnv, PROBE_MODE: mode }, root, PREFLIGHT_DEADLINE_MS);
+      writeFileSync(join(root, `preflight-${name}.stdout.txt`), run.stdout);
+      writeFileSync(join(root, `preflight-${name}.stderr.txt`), run.stderr);
+      if (run.groupNotOwned) throw new Refusal('the probe cannot own a process group for its children');
+      if (run.timedOut) return undefined;
+      try {
+        return JSON.parse(run.stdout);
+      } catch {
+        return undefined;
+      }
+    };
+    const before = await preflightRun('control-before', 'control');
+    const sandboxed = await preflightRun('sandboxed', 'sandboxed');
+    const after = await preflightRun('control-after', 'control');
+    const verdict = judgeIsolation(before, sandboxed, after);
+    const isolation = { before, sandboxed, after, ...verdict };
+    writeFileSync(join(root, 'preflight-verdict.json'), `${JSON.stringify(isolation, null, 2)}\n`);
+    if (verdict.failures.length > 0) {
       throw new Refusal(
-        `sandbox preflight did not prove isolation (no native launch): ${preflight.stdout.trim() || preflight.stderr.trim()}`,
+        `sandbox preflight did not prove isolation (no native launch): ${verdict.failures.join('; ')} ` +
+          `(reports: ${JSON.stringify({ before, sandboxed, after })})`,
       );
     }
 

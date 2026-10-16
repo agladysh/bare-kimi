@@ -83,9 +83,12 @@ recovery. Comments that cite kimi 2.1.0 come from reading the installed
 a provider. It is not part of `bun test`. It runs bare-kimi against a
 loopback stand-in for an OpenAI-compatible provider, under macOS
 `sandbox-exec`: network only to that provider's port, writes confined to a
-temp root, and reads of the real native homes denied. The read denial is
-shown on a synthetic decoy home created outside the temp root; both
-directories are left for inspection. It refuses before launching kimi when
+temp root, and reads of the real native homes denied. The isolation is
+shown by comparing unsandboxed controls with the sandboxed run: a live
+decoy loopback listener, a read in a synthetic decoy home, and a write in a
+separate readable directory outside the root all work unsandboxed and must be
+refused sandboxed. All three directories are left for inspection. Network
+isolation covers direct socket connects, not IPC delegation to external services. It refuses before launching kimi when
 that isolation cannot be shown, or when the kimi executable is not named
 explicitly. Each finding rests on its own scenario's evidence, gated on a
 positive control, and is otherwise reported as inconclusive. Enforcement
