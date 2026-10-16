@@ -4,11 +4,14 @@ Run `kimi` (Kimi Code CLI) headless against an isolated `KIMI_CODE_HOME`, on
 the operator's own login. Library first; the CLI (`bin/bare-kimi.ts`) is its
 worked example.
 
-**Status: 0.2.0, the first maintained release; early (pre-1.0).** Not
-published to any package registry. The source was recovered from an
-unfinished tree (see [RECOVERY.md](RECOVERY.md)) and then repaired;
-[CHANGELOG.md](CHANGELOG.md) lists what changed and on what evidence. What
-has been exercised:
+**Status: 0.2.1, a documentation-only patch to 0.2.0, the first maintained
+release; early (pre-1.0).** Released from Git and not published to any
+package registry. The code is the same as in 0.2.0. The patch corrects
+claims about the native probe that the `v0.2.0` tag still carries; see the
+erratum in [CHANGELOG.md](CHANGELOG.md), which also lists what 0.2.0
+changed and on what evidence. The project began as an unfinished tree that
+was recovered into Git ([RECOVERY.md](RECOVERY.md)) and then repaired for
+0.2.0. What has been exercised:
 - the test suite, against a fake `kimi` child and synthetic homes;
 - one run of the optional probe below: five scenarios, each running an
   installed kimi 2.1.0 in `-p` mode (the preload scenario twice, primer and
@@ -41,7 +44,7 @@ The Git release contains the TypeScript source; no package registry or
 machine-wide installation is needed to run its worked CLI:
 
 ```sh
-git clone --branch v0.2.0 https://github.com/agladysh/bare-kimi.git
+git clone --branch v0.2.1 https://github.com/agladysh/bare-kimi.git
 cd bare-kimi
 bun install --frozen-lockfile
 bun bin/bare-kimi.ts --help
@@ -49,6 +52,22 @@ bun bin/bare-kimi.ts --help
 
 An actual run uses the existing source-home login. The containment and
 login-sharing conditions above apply to both the library and the CLI.
+
+## Use as a Git dependency
+
+A Bun project can depend on the tagged Git source directly. Nothing is
+published to a package registry; the dependency is this repository at the
+tag:
+
+```sh
+bun add github:agladysh/bare-kimi#v0.2.1
+```
+
+The import under Library use below then resolves to that source. The
+package exports its TypeScript files as they are and calls Bun's APIs, so
+it runs only under Bun. A consumer that type-checks it with `tsc` needs
+settings like this repository's `tsconfig.json`, in particular
+`allowImportingTsExtensions` and Bun's types.
 
 ## Library use
 

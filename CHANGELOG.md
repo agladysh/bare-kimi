@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.2.1 — 16 October 2026, documentation only
+
+This patch changes only documentation and the package version. The library,
+the CLI, the tests, the native probe, the lockfile and `LICENSE` (the
+downloaded SPDX MIT text) are the same as in 0.2.0. Like 0.2.0, this is a Git
+release and is not published to a package registry. Publishing it does not
+mean any project has adopted it.
+
+### Erratum to 0.2.0
+
+The `v0.2.0` tag (commit `3e9715e`) has not moved and still holds the text
+as released. Measurements and reviews made against that tag still apply to
+it. The 0.2.0 entry below was edited after the tag in these places:
+
+- **Process groups.** In its one completed run, the native probe reported
+  its own process groups absent. Its check treats every inspection error,
+  `EPERM` included, as absence, so the run did not show that the groups had
+  ended. This qualification was committed to `main` in `f09a119`, after the
+  tag, so readers of the tag do not see it. 0.2.1 carries the qualification
+  and marks it in the 0.2.0 entry as added after the tag. 0.2.1 also corrects
+  a known-limits line that still said the probe proved its groups ended, and
+  two probe descriptions that relied on the same check. Nobody has yet
+  rechecked the groups with a typed check or replayed the probe. Kimi starts
+  tool commands in their own groups, so it is also unverified that every
+  descendant process was cleaned up.
+- **Wording.** Passages that called the release "this candidate" now name
+  0.2.0 or the states before its release.
+
+### Other documentation changes
+
+- README: the status line describes the project as maintained, with its
+  recovery as history. The clone instructions name `v0.2.1`, and a new
+  section shows how a Bun project can depend on the tagged Git source.
+- RECOVERY.md separates three stages: the reconstruction, which ran no
+  checks; the checks run later on the final recovered commit; and the 0.2.0
+  release.
+- `package.json`: version 0.2.1.
+
+The evidence and limits stated for 0.2.0 still apply. No real login has been
+exercised, and other kimi versions, other modes and the interactive UI are
+not covered.
+
 ## 0.2.0 — 16 October 2026, the first maintained release
 
 The recovered tree on `main` (package version 0.1.0) was never released:
@@ -69,7 +111,7 @@ versions that were rejected or refused.
 
 ## Change record
 
-Earlier states of this candidate, including the fifth round's library
+Earlier states of this release, including the fifth round's library
 changes, passed their typecheck and test suite when those were run
 separately. Later rounds changed only the optional native probe, the
 documentation and the CLI help text; the released tree passed its typecheck
@@ -117,7 +159,7 @@ with `decision` and `pattern` (e.g. `pattern = "Bash(rm *)"`), or a
 `deny = ["Bash"]` is passed through untransformed, fails the rule schema,
 and makes 2.1.0 drop the whole `[permission]` section with only a warning.
 That happens natively too; bare-kimi carries such text as written. Earlier
-tests in this candidate used string entries while calling them
+tests written before release used string entries while calling them
 schema-shaped; their fixtures are corrected.
 
 **Permission rules are carried, and were observed not to be enforced.** By
@@ -140,8 +182,8 @@ this wrapper's.
 - **Permission rules and hooks were dropped.** `[permission]` (including
   `[[permission.rules]]`) and `[[hooks]]` are now carried verbatim, in source
   order. The CLI help says what is carried and refused, and that carried
-  permission rules are not protection. An earlier source comment in this
-  candidate claimed enforcement. It was corrected first to "unproven", and
+  permission rules are not protection. A source comment written before release
+  claimed enforcement. It was corrected first to "unproven", and
   then, after the native run, to what was observed.
 - **A `config.toml` was taken as proof of ownership.** That file name is
   common to many tools. Any directory holding one was reused as a run home:
@@ -160,8 +202,8 @@ this wrapper's.
     changed, it is rewritten from the source (tmp file + rename). When it was
     edited to something else, it is refused, neither run nor overwritten.
 
-  **Migration:** a run home kept by an earlier state of this candidate has
-  no stamp and is refused. Remove it and let bare-kimi assemble it again.
+  **Migration:** a run home kept by an earlier state, before 0.2.0, has no
+  stamp and is refused. Remove it and let bare-kimi assemble it again.
 - **Config extraction matched text, not structure.** The source config is
   now parsed with smol-toml. `default_model` comes from the root table, and
   tables are selected by their parsed key path. Tables are still copied as
@@ -283,7 +325,8 @@ kimi could hang it. The second version:
   finding;
 - runs every child in a process group it owns: SIGTERM, then SIGKILL after
   a grace period, a bounded drain, output kept, and whether the group was
-  gone recorded rather than assumed;
+  gone recorded rather than assumed (that record proved unreliable; see the
+  qualification under the fourth version's run);
 - allows only the provider's own loopback port, and denies reads of the
   real native homes, computed at run time;
 - requires the kimi executable to be named, and records its real path.
@@ -306,7 +349,8 @@ The third version:
   judging anything, and names both created directories on success, refusal
   and failure;
 - attributes requests by a per-scenario provider path (`/s/<name>/v1`), and
-  stops running scenarios once a process group outlives SIGKILL;
+  stops running scenarios once its group check reports a process group
+  outliving SIGKILL;
 - clears its timers, so it exits once done, and skips non-directories when
   counting wire journals.
 
@@ -384,7 +428,8 @@ against installed kimi 2.1.0. Its preflight showed:
 Then all five scenarios finished with exit 0, each with version 2.1.0, a
 session id and one wire journal. No synthetic source home gained
 `sessions/`, the probe reported its process groups absent, and no request
-was unattributed. **Qualification, 16 October 2026 (UTC+00:00):** that group
+was unattributed. **Qualification, 16 October 2026 (UTC+00:00), added after
+the `v0.2.0` tag:** that group
 check maps every inspection error to absence; it did not establish emptiness.
 A typed recheck and replay remain owed. Kimi starts tool commands in their
 own groups, which leaves complete descendant cleanup unverified.
@@ -449,9 +494,12 @@ observed:
 - No real login has been exercised: the managed provider, OAuth, and
   link-mode refresh and its shared lock against a real account.
 - The native probe did not exercise copy mode or temporary run homes (it
-  used kept homes), did not compare a real home before and after, did not
-  test the read denial on real home paths, and proves only that its own
-  process groups ended, not every descendant.
+  used kept homes), did not compare a real home before and after, and did
+  not test the read denial on real home paths. It also did not show that
+  its own process groups ended (corrected in 0.2.1; this line first said it
+  proved they had). Its group check treated inspection errors, including
+  `EPERM`, as absence. Cleanup of every descendant process is unverified
+  too.
 - Checks and effects are not atomic against a concurrent writer to the same
   homes.
 - A copy and its source refreshed independently cannot both be kept current.

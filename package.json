@@ -1,6 +1,6 @@
 {
   "name": "@agladysh/bare-kimi",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Run kimi (Kimi Code CLI) headless against an isolated KIMI_CODE_HOME, on the operator's own login. Library first; the CLI is its worked example.",
   "license": "MIT",
   "type": "module",
