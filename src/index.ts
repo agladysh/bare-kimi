@@ -1,11 +1,9 @@
 import { mkdirSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
 import {
-  assembleHome,
   assertDistinctHomes,
-  ensureAuth,
-  isAssembledHome,
   makeEphemeralHome,
+  prepareRunHome,
   removeHome,
   shredCopiedCredentials,
   sourceHome,
@@ -24,11 +22,13 @@ export {
   ensureAuth,
   isAssembledHome,
   makeEphemeralHome,
+  prepareRunHome,
   removeHome,
   shredCopiedCredentials,
   sourceHome,
   CREDENTIALS_MARKER,
   EPHEMERAL_MARKER,
+  HOME_STAMP,
   type AssembledHome,
   type AuthMode,
 } from './home.ts';
@@ -58,24 +58,29 @@ export type OutputFormat = 'text' | 'stream-json';
 
 export interface LaunchOptions {
   /**
-   * The call to action. Must not start with `-`: kimi would parse it as a
-   * flag even though it follows `-p`.
+   * The call to action. Must not start with `-` (see {@link assertSafePrompt}).
    */
   readonly prompt: string;
   /** Working directory of the run. Sessions bind to it: a resume must happen in the same cwd. */
   readonly cwd?: string;
   /**
    * Run home. When omitted, a fresh ephemeral home is mkdtemp'd and removed
-   * by dispose(). A caller-supplied home is kept; if it already holds a
-   * config.toml it is used as-is (a prepared home is never overwritten),
-   * otherwise it is assembled from the source home. A relative path resolves
-   * against this process's working directory, not against `cwd`.
+   * by dispose(). A caller-supplied home is kept. It must be missing, empty,
+   * or a home bare-kimi assembled from the same source (it carries
+   * {@link HOME_STAMP}); anything else is refused before any effect. Its
+   * config.toml follows the source's settings: kept byte for byte (comments
+   * included) while they agree, rewritten when the source changed, refused
+   * when it was edited to something else. See {@link prepareRunHome}. A
+   * relative path resolves against this process's working directory, not
+   * against `cwd`.
    */
   readonly home?: string;
   /**
-   * Source home to assemble/donate from. Passing it forces re-assembly of a
-   * caller-supplied `home`. Default: `KIMI_CODE_HOME_SOURCE` ?? `~/.kimi-code`.
-   * A relative path resolves like `home`.
+   * Source home to assemble/donate from. Passing it also re-donates
+   * authentication in full (an unchanged bare-kimi credential copy may be
+   * replaced). Default: `KIMI_CODE_HOME_SOURCE` ?? `~/.kimi-code`, the latter
+   * refused when an ambient `KIMI_CODE_HOME` names another home (see
+   * {@link sourceHome}). A relative path resolves like `home`.
    */
   readonly srcHome?: string;
   /**
@@ -242,6 +247,15 @@ export interface EnvContext {
   readonly parentEnv?: NodeJS.ProcessEnv;
   /** A spawn-options env layer, applied between the inherited layer and extraEnv. */
   readonly spawnEnv?: Record<string, string | undefined>;
+  /**
+   * The source home this run donated from. Exported to the child as
+   * `KIMI_CODE_HOME_SOURCE`, so a bare-kimi started inside the run (from a
+   * hook or a tool) donates from the same login. Without it that nested
+   * bare-kimi would see `KIMI_CODE_HOME` (this run home) next to the
+   * `~/.kimi-code` fallback and refuse (see sourceHome). kimi itself does not
+   * read the variable.
+   */
+  readonly source?: string;
 }
 
 /**
@@ -250,12 +264,15 @@ export interface EnvContext {
  * 1. inherited `parentEnv` (unless `noProcessEnv`), minus the scrubbed
  *    variables and any inherited `KIMI_CODE_HOME`;
  * 2. `spawnEnv`;
- * 3. `extraEnv`;
- * 4. defaults, only when still unset: `KIMI_DISABLE_TELEMETRY=1`,
+ * 3. `KIMI_CODE_HOME_SOURCE` = `source`, when given — replacing an
+ *    inherited value, which may name a different home than the one this run
+ *    actually used;
+ * 4. `extraEnv` (which may set `KIMI_CODE_HOME_SOURCE` on purpose);
+ * 5. defaults, only when still unset: `KIMI_DISABLE_TELEMETRY=1`,
  *    `KIMI_CODE_NO_AUTO_UPDATE=1` — the update preflight can otherwise spawn
  *    a global package-manager install from a headless run
  *    (kimi-code @ 6451f1e `apps/kimi-code/src/cli/update/preflight.ts`);
- * 5. `KIMI_CODE_HOME` = the run home — forced, never empty, never
+ * 6. `KIMI_CODE_HOME` = the run home — forced, never empty, never
  *    overridable: pointing the child at the run home is what makes it bare.
  *    (An empty value would be adopted by the engine but treated as unset by
  *    the CLI/OAuth paths; this function never emits one.)
@@ -280,6 +297,7 @@ export function buildEnv(config: LaunchConfig, context: EnvContext): Record<stri
       env[name] = value;
     }
   }
+  if (context.source !== undefined) env['KIMI_CODE_HOME_SOURCE'] = context.source;
   Object.assign(env, config.extraEnv);
   env['KIMI_DISABLE_TELEMETRY'] = env['KIMI_DISABLE_TELEMETRY'] ?? '1';
   env['KIMI_CODE_NO_AUTO_UPDATE'] = env['KIMI_CODE_NO_AUTO_UPDATE'] ?? '1';
@@ -392,11 +410,7 @@ export function spawnKimi<
   try {
     const src = resolvePath(sourceHome(config.srcHome.length > 0 ? config.srcHome : undefined));
     assertDistinctHomes(src, home);
-    if (config.srcHome.length > 0 || !isAssembledHome(home)) {
-      assembleHome(src, home, config.authMode);
-    } else {
-      ensureAuth(src, home, config.authMode);
-    }
+    prepareRunHome(src, home, config.authMode, { reassemble: config.srcHome.length > 0 });
 
     let argvConfig = config;
     if (config.noSkills) {
@@ -405,7 +419,7 @@ export function spawnKimi<
       argvConfig = { ...config, skillsDir: [...config.skillsDir, emptySkills] };
     }
 
-    const env = buildEnv(config, { home, spawnEnv: spawnOptions.env });
+    const env = buildEnv(config, { home, spawnEnv: spawnOptions.env, source: src });
     const cmd = buildArgv(argvConfig, resolveKimiBin(config, process.env));
 
     let subprocess: Bun.Subprocess<In, Out, Err>;

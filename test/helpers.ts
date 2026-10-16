@@ -120,6 +120,41 @@ export async function runCli(args: string[], options: CliEnv): Promise<CliRun> {
   return { code, stdout, stderr };
 }
 
+export interface DeadlineRun {
+  /** The child was still running at the deadline and was killed. */
+  readonly timedOut: boolean;
+  readonly code: number;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+/**
+ * Run `cmd` as a child and SIGKILL it at `deadlineMs`. For work that a
+ * defective dependency could turn into an endless loop: the loop then stays
+ * in the child, and the test fails on `timedOut` instead of hanging.
+ */
+export async function runWithDeadline(cmd: string[], deadlineMs: number): Promise<DeadlineRun> {
+  const child = Bun.spawn({ cmd, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    child.kill('SIGKILL');
+  }, deadlineMs);
+  try {
+    const [stdout, stderr] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+    const code = await child.exited;
+    return { timedOut, code, stdout, stderr };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Runs assembleHome once in its own process; see test/assemble-child.ts. */
+export const ASSEMBLE_CHILD = resolve(import.meta.dir, 'assemble-child.ts');
+
 /** The tracked fake child, by absolute path (for library tests' `kimiBin`). */
 export const FAKE_KIMI = join(FAKE_BIN_DIR, 'kimi');
 

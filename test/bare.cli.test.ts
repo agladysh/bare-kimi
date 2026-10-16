@@ -253,6 +253,19 @@ describe('home custody', () => {
     expect(existsSync(join(kept[0]!, 'config.toml'))).toBe(true);
   });
 
+  test('--keep-home leaves no empty home behind when setup is refused', async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    writeFileSync(join(src, 'config.toml'), '\n[broken\n', { flag: 'a' });
+    const before = ephemeralHomes();
+
+    const run = await runCli(['--keep-home', '--', 'x'], { srcHome: src });
+
+    expect(run.code).toBe(2);
+    expect(run.stderr).toContain('does not parse as TOML');
+    expect(ephemeralHomes().filter((dir) => !before.includes(dir))).toEqual([]);
+  });
+
   test('copy mode duplicates then shreds credentials; source untouched', async () => {
     const root = temp('bare-kimi-test-');
     const src = makeSourceHome(root);
@@ -286,6 +299,75 @@ describe('home custody', () => {
     const copied = join(home, 'credentials', 'kimi-code-env-0e4f99c69cc27850.json');
     expect(existsSync(copied)).toBe(true);
     expect(lstatSync(copied).isSymbolicLink()).toBe(false);
+  });
+
+  test("--home naming another tool's directory with a config.toml is refused; nothing is planted", async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    const site = join(root, 'site');
+    mkdirSync(site);
+    const config = 'baseURL = "https://example.org/"\n';
+    writeFileSync(join(site, 'config.toml'), config);
+    const envOut = join(root, 'env.json');
+    const env = { FAKE_KIMI_ENV_OUT: envOut, FAKE_KIMI_ENV_KEYS: 'KIMI_CODE_HOME' };
+
+    const reuse = await runCli(['--home', site, '--', 'x'], { srcHome: src, env });
+    const assemble = await runCli(['--home', site, '--src-home', src, '--', 'x'], { srcHome: src, env });
+
+    for (const run of [reuse, assemble]) {
+      expect(run.code).toBe(2);
+      expect(run.stderr).toContain('has no .bare-kimi-home');
+    }
+    expect(readdirSync(site)).toEqual(['config.toml']); // no credentials, oauth, sessions or device_id
+    expect(readFileSync(join(site, 'config.toml'), 'utf-8')).toBe(config);
+    expect(existsSync(envOut)).toBe(false);
+  });
+
+  test('a kept home follows a source policy change; the child sees the new rule', async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    const home = join(root, 'kept-home');
+    const seen = join(root, 'seen-config.toml');
+
+    const first = await runCli(['--home', home, '--', 'x'], { srcHome: src });
+    expect(first.code).toBe(0);
+    writeFileSync(
+      join(src, 'config.toml'),
+      '\n[[permission.rules]]\ndecision = "deny"\npattern = "Bash(rm *)"\n',
+      { flag: 'a' },
+    );
+
+    const second = await runCli(['--home', home, '--', 'x'], {
+      srcHome: src,
+      env: { FAKE_KIMI_CONFIG_OUT: seen },
+    });
+
+    expect(second.code).toBe(0);
+    expect(readFileSync(seen, 'utf-8')).toContain(
+      '[[permission.rules]]\ndecision = "deny"\npattern = "Bash(rm *)"',
+    );
+  });
+
+  test('a kept home whose config.toml was edited is refused before kimi', async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    const home = join(root, 'kept-home');
+    const first = await runCli(['--home', home, '--', 'x'], { srcHome: src });
+    expect(first.code).toBe(0);
+    const configPath = join(home, 'config.toml');
+    writeFileSync(configPath, '\n[[permission.rules]]\ndecision = "allow"\npattern = "Bash"\n', { flag: 'a' });
+    const edited = readFileSync(configPath, 'utf-8');
+    const envOut = join(root, 'env.json');
+
+    const run = await runCli(['--home', home, '--', 'x'], {
+      srcHome: src,
+      env: { FAKE_KIMI_ENV_OUT: envOut, FAKE_KIMI_ENV_KEYS: 'KIMI_CODE_HOME' },
+    });
+
+    expect(run.code).toBe(2);
+    expect(run.stderr).toContain('edited since bare-kimi wrote it');
+    expect(readFileSync(configPath, 'utf-8')).toBe(edited);
+    expect(existsSync(envOut)).toBe(false);
   });
 
   test('--home naming a non-empty directory that is not a run home is refused before kimi', async () => {
@@ -443,6 +525,27 @@ describe('environment and credential boundary', () => {
     expect(raw).not.toContain(FAKE_TOKEN);
     expect(run.stdout).not.toContain(FAKE_TOKEN);
     expect(run.stderr).not.toContain(FAKE_TOKEN);
+  });
+
+  test('the child is told the source this run used, not an inherited one', async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    const decoy = join(temp('bare-kimi-decoy-'), 'elsewhere');
+    const envOut = join(root, 'env.json');
+
+    const run = await runCli(['--src-home', src, '--', 'x'], {
+      srcHome: src,
+      env: {
+        KIMI_CODE_HOME_SOURCE: decoy,
+        FAKE_KIMI_ENV_OUT: envOut,
+        FAKE_KIMI_ENV_KEYS: 'KIMI_CODE_HOME,KIMI_CODE_HOME_SOURCE',
+      },
+    });
+
+    expect(run.code).toBe(0);
+    const recorded = JSON.parse(readFileSync(envOut, 'utf-8'));
+    expect(recorded['KIMI_CODE_HOME_SOURCE']).toBe(src);
+    expect(recorded['KIMI_CODE_HOME']).not.toBe(src);
   });
 });
 

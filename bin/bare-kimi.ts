@@ -1,11 +1,14 @@
 #!/usr/bin/env bun
+import { readdirSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import {
   checkLaunchOptions,
+  EPHEMERAL_MARKER,
   exitCodeOf,
   KimiCustodyError,
   KimiSpawnError,
   makeEphemeralHome,
+  removeHome,
   spawnKimi,
   type LaunchOptions,
   type OutputFormat,
@@ -24,14 +27,20 @@ Runs kimi -p (Kimi Code CLI) against an isolated KIMI_CODE_HOME on the
 operator's own login. Library first; this CLI is its worked example.
 
 Home and auth:
-  --home DIR            Use DIR as the run home (kept). Reused as-is when it
-                        already holds a config.toml; otherwise assembled from
-                        the source home, if DIR is missing or empty (it keeps
-                        its permissions). Refused when it is, contains or lies
-                        inside the source home.
+  --home DIR            Use DIR as the run home (kept). DIR must be missing,
+                        empty, or a home bare-kimi assembled from the same
+                        source (it carries .bare-kimi-home); anything else
+                        is refused, even with a config.toml in it. An
+                        existing DIR keeps its permissions. Its config.toml
+                        follows the source: kept as is (comments too) while
+                        the settings agree, rewritten when the source
+                        changed, refused when edited to something else.
+                        Refused when it is, contains or lies inside the
+                        source home.
   --src-home DIR        Assemble/donate from DIR (default:
-                        $KIMI_CODE_HOME_SOURCE ?? ~/.kimi-code). Forces
-                        re-assembly of --home.
+                        $KIMI_CODE_HOME_SOURCE ?? ~/.kimi-code, refused when
+                        KIMI_CODE_HOME names another home). Also re-donates
+                        credentials in full.
                         Relative --home/--src-home resolve against the
                         current directory, not --cwd.
   --auth link|copy      How the run home receives credentials. Default link:
@@ -85,17 +94,22 @@ fully bare run use a cwd with no AGENTS.md up its git root.
 
 Permissions: -p forces kimi's native auto permission mode; -y/--yolo,
 --auto and --plan conflict with -p and cannot be used. bare-kimi passes no
-permission flags. An assembled run home carries the source config's
-[permission] and [[hooks]] tables verbatim, with no rule added, removed or
-reinterpreted. A source config that kimi's own TOML parser rejects, or whose
-permission, hooks, thinking, model or provider settings cannot be carried
-verbatim, is refused before any effect.
-A home reused as-is runs with its own config.
+permission flags. A run home carries the source config's [permission] and
+[[hooks]] tables verbatim, with no rule added, removed or reinterpreted.
+That is all bare-kimi promises: whether kimi enforces configured permission
+rules in -p mode is unproven (a static reading of kimi 2.1.0 found no code
+loading them). Hooks are loaded. kimi drops a whole config section that
+fails its schema, with only a warning: one invalid [[hooks]] entry disables
+every hook. A source config that fails TOML parsing, or whose permission,
+hooks, thinking, model or provider settings cannot be carried verbatim, is
+refused before any effect. None of this is an OS sandbox.
 
 Exit codes: the child's exit code (128+N on signal); 127 when kimi cannot
 be spawned; 2 for bare-kimi usage/setup errors; 3 when a primer run
-produced no session id; 4 when the run ended but cleanup kept something
-(named on stderr), e.g. a credentials copy holding a refreshed token.`;
+produced no session id; 4 when the run ended but cleanup kept something,
+e.g. a credentials copy holding a refreshed token. A child that itself
+exits 2, 3 or 4 is passed through unchanged; bare-kimi's own outcomes are
+always named on stderr ("bare-kimi: ..."), which tells them apart.`;
 
 interface Cli {
   options: LaunchOptions;
@@ -246,8 +260,10 @@ async function main(): Promise<number> {
   }
 
   // --keep-home: make the ephemeral home caller-supplied so the SDK keeps it.
+  let madeHome: string | undefined;
   if (cli.keepHome && options.home === undefined) {
-    options = { ...options, home: makeEphemeralHome() };
+    madeHome = makeEphemeralHome();
+    options = { ...options, home: madeHome };
   }
 
   if (items.length > 0) {
@@ -270,6 +286,7 @@ async function main(): Promise<number> {
         return custodyKept(error);
       }
       console.error(`bare-kimi: ${error instanceof Error ? error.message : String(error)}`);
+      discardUnusedHome(madeHome);
       return 2;
     }
   }
@@ -279,6 +296,7 @@ async function main(): Promise<number> {
     launched = spawnKimi(options, { stdin: 'ignore', stdout: 'inherit', stderr: 'inherit' });
   } catch (error) {
     console.error(`bare-kimi: ${error instanceof Error ? error.message : String(error)}`);
+    discardUnusedHome(madeHome);
     return error instanceof KimiSpawnError ? 127 : 2;
   }
   const { subprocess, dispose } = launched;
@@ -306,6 +324,20 @@ async function main(): Promise<number> {
   if (cleanup instanceof KimiCustodyError) return custodyKept(cleanup);
   if (cleanup !== undefined) throw cleanup;
   return code;
+}
+
+/**
+ * A --keep-home home that a refusal left holding nothing but its ephemeral
+ * marker has no custody to keep; remove it rather than leak it. Anything
+ * more in it (an assembled home, a run's sessions) stays, as asked.
+ */
+function discardUnusedHome(home: string | undefined): void {
+  if (home === undefined) return;
+  try {
+    if (readdirSync(home).every((entry) => entry === EPHEMERAL_MARKER)) removeHome(home);
+  } catch {
+    // best effort: a leftover empty temp dir is harmless
+  }
 }
 
 /** The run ended, but cleanup kept something on purpose; say what and where. */

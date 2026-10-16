@@ -8,7 +8,7 @@ import {
   removeHome,
   runKimi,
   sourceHome,
-  type KimiCustodyError,
+  KimiCustodyError,
   type KimiRun,
   type LaunchOptions,
 } from './index.ts';
@@ -155,9 +155,12 @@ export function checkPreloadOptions(options: LaunchOptions, prime?: string): voi
  * child stderr in `stderr`) and no second run happens.
  *
  * When `options.home` is omitted (or empty) both runs share one ephemeral
- * home, removed before this resolves unless cleanup has to keep it (see
- * {@link KimiCustodyError}); pass `home` to keep the preloaded session. A
- * relative `home` resolves as {@link LaunchOptions.home} says.
+ * home, removed before this resolves; pass `home` to keep the preloaded
+ * session. When that removal does not complete (e.g. a credentials copy in
+ * it changed and is kept), the finished run is thrown inside a
+ * {@link KimiCustodyError} naming the home, rather than returned as if the
+ * home were gone. A relative `home` resolves as {@link LaunchOptions.home}
+ * says.
  */
 export async function runPreloaded(
   options: LaunchOptions,
@@ -165,31 +168,51 @@ export async function runPreloaded(
   prime?: string,
 ): Promise<KimiRun> {
   checkPreloadOptions(options, prime);
+  const src = resolve(sourceHome(options.srcHome));
   const requested = options.home ?? '';
   const ephemeral = requested.length === 0;
   const home = ephemeral ? makeEphemeralHome() : resolve(requested);
+  let run: KimiRun;
   try {
-    const primer = await runKimi({
-      ...options,
-      prompt: prime ?? DEFAULT_PRIME,
-      home,
-      outputFormat: 'stream-json',
-      resume: undefined,
-      continueRecent: false,
-    });
-    if (primer.code !== 0) return primer;
-    const sessionId = primer.sessionId;
-    if (sessionId === undefined) throw new PrimerNoSessionError(primer);
-    appendPreload(findWire(home, sessionId), items);
-    return await runKimi({ ...options, home, resume: sessionId });
-  } finally {
+    run = await primeAndRun(options, items, prime, home);
+  } catch (error) {
     if (ephemeral) {
       try {
-        // Keeps the home when a credentials copy in it changed during the run.
-        removeHome(home, sourceHome(options.srcHome));
+        removeHome(home, src);
       } catch {
-        // best effort; a leftover temp dir is better than masking the run result
+        // The run's own failure is the one reported; what cleanup keeps stays on disk.
       }
     }
+    throw error;
   }
+  if (ephemeral) {
+    try {
+      removeHome(home, src);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new KimiCustodyError(`cleanup of run home ${home} did not complete: ${reason}`, run, error);
+    }
+  }
+  return run;
+}
+
+async function primeAndRun(
+  options: LaunchOptions,
+  items: readonly PreloadItem[],
+  prime: string | undefined,
+  home: string,
+): Promise<KimiRun> {
+  const primer = await runKimi({
+    ...options,
+    prompt: prime ?? DEFAULT_PRIME,
+    home,
+    outputFormat: 'stream-json',
+    resume: undefined,
+    continueRecent: false,
+  });
+  if (primer.code !== 0) return primer;
+  const sessionId = primer.sessionId;
+  if (sessionId === undefined) throw new PrimerNoSessionError(primer);
+  appendPreload(findWire(home, sessionId), items);
+  return runKimi({ ...options, home, resume: sessionId });
 }

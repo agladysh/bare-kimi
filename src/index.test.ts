@@ -11,6 +11,7 @@ import {
   checkLaunchOptions,
   isScrubbedEnvVar,
   runKimi,
+  sourceHome,
 } from './index.ts';
 import { checkPreloadOptions, runPreloaded } from './preload.ts';
 import {
@@ -194,6 +195,27 @@ describe('buildEnv', () => {
     expect(env['PATH']).toBeUndefined();
     expect(env['KIMI_CODE_HOME']).toBe('/h');
     expect(env['KIMI_DISABLE_TELEMETRY']).toBe('1');
+  });
+
+  test('exports the run source as KIMI_CODE_HOME_SOURCE, replacing an inherited one', () => {
+    const env = buildEnv(base, {
+      home: '/run/home',
+      source: '/the/source',
+      parentEnv: { KIMI_CODE_HOME_SOURCE: '/some/other/source' },
+    });
+    expect(env['KIMI_CODE_HOME_SOURCE']).toBe('/the/source');
+
+    const deliberate = buildEnv(
+      LaunchConfig({ prompt: 'x', extraEnv: { KIMI_CODE_HOME_SOURCE: '/chosen' } }),
+      { home: '/run/home', source: '/the/source', parentEnv: {} },
+    );
+    expect(deliberate['KIMI_CODE_HOME_SOURCE']).toBe('/chosen');
+
+    // A nested bare-kimi sees this run home as KIMI_CODE_HOME and the source
+    // next to it, so sourceHome takes the source instead of refusing.
+    expect(sourceHome(undefined, { HOME: '/h', KIMI_CODE_HOME: env['KIMI_CODE_HOME'], KIMI_CODE_HOME_SOURCE: env['KIMI_CODE_HOME_SOURCE'] })).toBe(
+      '/the/source',
+    );
   });
 
   test('refuses an empty run home', () => {

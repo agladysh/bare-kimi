@@ -8,6 +8,7 @@ import {
   readFileSync,
   readdirSync,
   readlinkSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -15,20 +16,29 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { isAbsolute, join } from 'node:path';
+import { basename, dirname, isAbsolute, join } from 'node:path';
 import { parse as parseToml } from 'smol-toml';
 import {
   CREDENTIALS_MARKER,
+  HOME_STAMP,
   assembleHome,
   donateAuth,
   ensureAuth,
   isAssembledHome,
   makeEphemeralHome,
+  prepareRunHome,
   removeHome,
   shredCopiedCredentials,
   sourceHome,
 } from './home.ts';
-import { CREDENTIAL_FILE, FAKE_TOKEN, makeSourceHome, makeTempDir } from '../test/helpers.ts';
+import {
+  ASSEMBLE_CHILD,
+  CREDENTIAL_FILE,
+  FAKE_TOKEN,
+  makeSourceHome,
+  makeTempDir,
+  runWithDeadline,
+} from '../test/helpers.ts';
 
 const cleanups: string[] = [];
 
@@ -122,18 +132,27 @@ describe('assembleHome (link mode, the default)', () => {
     expect(readlinkSync(join(dst, 'oauth'))).toBe(join(src, 'oauth'));
   });
 
-  test('refuses to replace a config.toml symlink; its target is untouched', () => {
+  test('refuses a config.toml symlink, stamped home or not; its target is untouched', () => {
     const root = temp('bare-kimi-home-');
     const src = makeSourceHome(root);
-    const dst = join(root, 'run-home');
     const callerConfig = join(root, 'caller-config.toml');
     writeFileSync(callerConfig, 'mine\n');
-    mkdirSync(dst);
-    symlinkSync(callerConfig, join(dst, 'config.toml'));
 
-    expect(() => assembleHome(src, dst)).toThrow('not a regular file');
+    const unstamped = join(root, 'unstamped');
+    mkdirSync(unstamped);
+    symlinkSync(callerConfig, join(unstamped, 'config.toml'));
+    expect(() => assembleHome(src, unstamped)).toThrow('has no .bare-kimi-home');
+    expect(lstatSync(join(unstamped, 'credentials'), { throwIfNoEntry: false })).toBeUndefined();
+
+    const stamped = join(root, 'stamped');
+    assembleHome(src, stamped);
+    rmSync(join(stamped, 'config.toml'));
+    symlinkSync(callerConfig, join(stamped, 'config.toml'));
+    expect(() => assembleHome(src, stamped)).toThrow('not a regular file');
+    expect(() => prepareRunHome(src, stamped)).toThrow('not a regular file');
+
     expect(readFileSync(callerConfig, 'utf-8')).toBe('mine\n');
-    expect(lstatSync(join(dst, 'credentials'), { throwIfNoEntry: false })).toBeUndefined();
+    expect(lstatSync(join(stamped, 'config.toml')).isSymbolicLink()).toBe(true);
   });
 
   test('creates a missing source oauth/ dir so the refresh lock is shared', () => {
@@ -159,7 +178,9 @@ describe('assembleHome (link mode, the default)', () => {
     const root = temp('bare-kimi-home-');
     const src = makeSourceHome(root);
     const dst = join(root, 'run-home');
-    mkdirSync(join(dst, 'credentials'), { recursive: true });
+    assembleHome(src, dst);
+    unlinkSync(join(dst, 'credentials'));
+    mkdirSync(join(dst, 'credentials'));
     writeFileSync(join(dst, 'credentials', 'hand-placed.json'), '{}');
 
     expect(() => assembleHome(src, dst)).toThrow('caller-owned');
@@ -169,22 +190,26 @@ describe('assembleHome (link mode, the default)', () => {
   test('refuses to re-point a caller-owned symlink; nothing else changes', () => {
     const root = temp('bare-kimi-home-');
     const src = makeSourceHome(root);
+    const dst = join(root, 'run-home');
+    assembleHome(src, dst);
+    const config = readFileSync(join(dst, 'config.toml'), 'utf-8');
+    unlinkSync(join(dst, 'oauth'));
     rmSync(join(src, 'oauth'), { recursive: true });
     const other = join(root, 'other-credentials');
     mkdirSync(other);
     writeFileSync(join(other, 'mine.json'), '{}');
-    const dst = join(root, 'run-home');
-    mkdirSync(dst);
+    unlinkSync(join(dst, 'credentials'));
     symlinkSync(other, join(dst, 'credentials'), 'dir');
 
     expect(() => assembleHome(src, dst)).toThrow('caller-owned symlink');
+    expect(() => prepareRunHome(src, dst)).toThrow('caller-owned symlink');
     expect(() => donateAuth(src, dst)).toThrow('caller-owned symlink');
     expect(() => ensureAuth(src, dst)).toThrow('caller-owned symlink');
 
     expect(readlinkSync(join(dst, 'credentials'))).toBe(other);
     expect(readFileSync(join(other, 'mine.json'), 'utf-8')).toBe('{}');
     expect(lstatSync(join(dst, 'oauth'), { throwIfNoEntry: false })).toBeUndefined();
-    expect(existsSync(join(dst, 'config.toml'))).toBe(false);
+    expect(readFileSync(join(dst, 'config.toml'), 'utf-8')).toBe(config);
     expect(existsSync(join(src, 'oauth'))).toBe(false);
   });
 
@@ -241,13 +266,15 @@ describe('assembleHome config.toml', () => {
   test('carries permission rules and hooks verbatim, in order, and nothing between them', () => {
     const root = temp('bare-kimi-home-');
     const src = makeSourceHome(root);
-    // Shapes follow kimi 2.1.0's config schema; the assembler carries them
-    // without interpreting them.
+    // Rule shapes kimi 2.1.0 accepts: a `deny` entry as a table (`tool` +
+    // `match`), and `[[permission.rules]]` with `decision` + `pattern`. (A bare
+    // string entry, `deny = ["Bash"]`, fails its schema, and 2.1.0 drops the
+    // whole section.) The assembler carries them without interpreting them.
     const source = editConfig(
       src,
       (text) => `${text}
 [permission]
-deny = ["Bash(rm -rf *)"]
+deny = [{ tool = "Bash", match = "rm -rf *" }]
 
 [unrelated.between]
 x = 1
@@ -267,7 +294,7 @@ timeout = 30
 
     const config = readFileSync(assembleHome(src, join(root, 'run-home')).configPath, 'utf-8');
 
-    expect(config).toContain('[permission]\ndeny = ["Bash(rm -rf *)"]');
+    expect(config).toContain('[permission]\ndeny = [{ tool = "Bash", match = "rm -rf *" }]');
     expect(config).toContain(
       '[[permission.rules]]\ndecision = "deny"\npattern = "Bash(curl *)"\nreason = "no network"',
     );
@@ -282,7 +309,7 @@ timeout = 30
   });
 
   test.each([
-    ['permission as root dotted keys', 'permission.deny = ["Bash"]\n'],
+    ['permission as root dotted keys', 'permission.deny = [{ tool = "Bash" }]\n'],
     ['hooks as a root inline array', 'hooks = [{ event = "PreToolUse", command = "./guard.sh" }]\n'],
     ['thinking as root dotted keys', 'thinking.effort = "low"\n'],
   ])('refuses %s rather than dropping them, before any effect', (_label, line) => {
@@ -353,6 +380,25 @@ command = """
     });
   });
 
+  test('a CRLF config with commented table headers is carried, not refused', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    const source = editConfig(src, (text) =>
+      `${text}\n[thinking] # effort\nenabled = true\neffort = "low"\n`
+        .replace('[models."kimi-code/k3"]', '[models."kimi-code/k3"] # the default model')
+        .replaceAll('\n', '\r\n'),
+    );
+
+    const config = readFileSync(assembleHome(src, join(root, 'run-home')).configPath, 'utf-8');
+
+    expect(config).toContain('[models."kimi-code/k3"] # the default model');
+    expect(config).toContain('[thinking] # effort');
+    const parsedSource = parseToml(source);
+    const parsedConfig = parseToml(config);
+    expect(parsedConfig['thinking']).toEqual(parsedSource['thinking']);
+    expect(parsedConfig['models']).toEqual(parsedSource['models']);
+  });
+
   test('refuses a source config that is not valid TOML', () => {
     const root = temp('bare-kimi-home-');
     const src = makeSourceHome(root);
@@ -367,8 +413,14 @@ command = """
   // two readings or ignoring a tail. kimi 2.1.0's parser rejects them, so
   // nothing about the source's meaning, carried or not, can be trusted.
   test.each([
-    ['a duplicate key in a carried table', '\n[permission]\ndeny = ["Bash(rm *)"]\ndeny = ["Bash(curl *)"]\n'],
-    ['a carried table defined twice', '\n[permission]\ndeny = ["Bash(rm *)"]\n\n[permission]\nallow = ["Read"]\n'],
+    [
+      'a duplicate key in a carried table',
+      '\n[permission]\ndeny = [{ tool = "Bash", match = "rm *" }]\ndeny = [{ tool = "Bash", match = "curl *" }]\n',
+    ],
+    [
+      'a carried table defined twice',
+      '\n[permission]\ndeny = [{ tool = "Bash", match = "rm *" }]\n\n[permission]\nallow = [{ tool = "Read" }]\n',
+    ],
     ['trailing junk after a value in an uncarried table', '\n[other]\nkeep = "me" junk\n'],
     ['a key-less line at the end', '\n= "orphan"\n'],
     ['an unterminated multi-line string at the end', '\n[[hooks]]\nevent = "PreToolUse"\ncommand = """\nunterminated\n'],
@@ -462,6 +514,209 @@ describe('run-home custody', () => {
     expect(existsSync(join(root, 'config.toml'))).toBe(false);
     expect(readFileSync(join(src, 'config.toml'), 'utf-8')).toBe(config);
   });
+});
+
+describe('run-home ownership', () => {
+  /** A directory some other tool owns, holding its own config.toml. */
+  function foreignHome(root: string): { dir: string; config: string } {
+    const dir = join(root, 'site');
+    mkdirSync(dir);
+    const config = 'baseURL = "https://example.org/"\ntitle = "not kimi"\n';
+    writeFileSync(join(dir, 'config.toml'), config);
+    return { dir, config };
+  }
+
+  test("another tool's directory with a config.toml is refused, untouched", () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    const { dir, config } = foreignHome(root);
+
+    expect(() => prepareRunHome(src, dir)).toThrow('has no .bare-kimi-home');
+    expect(() => assembleHome(src, dir)).toThrow('has no .bare-kimi-home');
+    expect(() => prepareRunHome(src, dir, 'copy')).toThrow('has no .bare-kimi-home');
+
+    expect(readFileSync(join(dir, 'config.toml'), 'utf-8')).toBe(config);
+    expect(readdirSync(dir)).toEqual(['config.toml']);
+    expect(isAssembledHome(dir)).toBe(false);
+  });
+
+  test('a home assembled here is stamped with its canonical source', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    const dst = join(root, 'run-home');
+    assembleHome(src, dst);
+
+    const stamp = JSON.parse(readFileSync(join(dst, HOME_STAMP), 'utf-8'));
+    expect(stamp.version).toBe(1);
+    expect(stamp.source).toBe(realpathSync(src));
+    expect(stamp.config).toMatch(/^[0-9a-f]{64}$/);
+    expect(isAssembledHome(dst)).toBe(true);
+  });
+
+  test('reuse keeps a config.toml whose settings still agree, comments and all', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    const dst = join(root, 'run-home');
+    assembleHome(src, dst);
+    writeFileSync(join(dst, 'config.toml'), '# a note\n', { flag: 'a' });
+    const edited = readFileSync(join(dst, 'config.toml'), 'utf-8');
+
+    prepareRunHome(src, dst);
+    assembleHome(src, dst);
+
+    expect(readFileSync(join(dst, 'config.toml'), 'utf-8')).toBe(edited);
+  });
+
+  test('reuse follows a source whose policy changed: an unedited config.toml is rewritten', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    const dst = join(root, 'run-home');
+    assembleHome(src, dst);
+    const stampBefore = readFileSync(join(dst, HOME_STAMP), 'utf-8');
+    editConfig(
+      src,
+      (text) => `${text}\n[[permission.rules]]\ndecision = "deny"\npattern = "Bash(rm *)"\n`,
+    );
+
+    prepareRunHome(src, dst);
+
+    const config = readFileSync(join(dst, 'config.toml'), 'utf-8');
+    expect(config).toContain('[[permission.rules]]\ndecision = "deny"\npattern = "Bash(rm *)"');
+    expect(readFileSync(join(dst, HOME_STAMP), 'utf-8')).not.toBe(stampBefore);
+    // Stable from then on.
+    prepareRunHome(src, dst);
+    expect(readFileSync(join(dst, 'config.toml'), 'utf-8')).toBe(config);
+  });
+
+  test('an edited config.toml is refused, not run and not overwritten', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    const dst = join(root, 'run-home');
+    assembleHome(src, dst);
+    const configPath = join(dst, 'config.toml');
+    writeFileSync(configPath, readFileSync(configPath, 'utf-8').replace('max_context_size = 262144', 'max_context_size = 1'));
+    const edited = readFileSync(configPath, 'utf-8');
+    unlinkSync(join(dst, 'oauth'));
+
+    expect(() => prepareRunHome(src, dst)).toThrow('edited since bare-kimi wrote it');
+    expect(() => assembleHome(src, dst)).toThrow('edited since bare-kimi wrote it');
+    // Even when the source changed too.
+    editConfig(src, (text) => `${text}\n[[permission.rules]]\ndecision = "deny"\npattern = "Bash"\n`);
+    expect(() => prepareRunHome(src, dst)).toThrow('edited since bare-kimi wrote it');
+
+    expect(readFileSync(configPath, 'utf-8')).toBe(edited);
+    expect(lstatSync(join(dst, 'oauth'), { throwIfNoEntry: false })).toBeUndefined();
+  });
+
+  test('a stamped home from another source is refused', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    const otherSrc = makeSourceHome(temp('bare-kimi-other-'));
+    const dst = join(root, 'run-home');
+    assembleHome(src, dst);
+    const config = readFileSync(join(dst, 'config.toml'), 'utf-8');
+
+    expect(() => prepareRunHome(otherSrc, dst)).toThrow('was assembled from');
+    expect(() => assembleHome(otherSrc, dst)).toThrow('was assembled from');
+    expect(readFileSync(join(dst, 'config.toml'), 'utf-8')).toBe(config);
+    expect(readlinkSync(join(dst, 'credentials'))).toBe(join(src, 'credentials'));
+  });
+
+  test('a stamp that does not read as one is refused, not guessed at', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    const dst = join(root, 'run-home');
+    assembleHome(src, dst);
+    writeFileSync(join(dst, HOME_STAMP), '{"version":2}\n');
+
+    expect(() => prepareRunHome(src, dst)).toThrow('is not a stamp');
+    expect(() => isAssembledHome(dst)).toThrow('is not a stamp');
+  });
+});
+
+describe('sourceHome and an ambient KIMI_CODE_HOME', () => {
+  test('the ~/.kimi-code fallback is refused when KIMI_CODE_HOME names another home', () => {
+    expect(() => sourceHome(undefined, { HOME: '/h', KIMI_CODE_HOME: '/elsewhere' })).toThrow(
+      'KIMI_CODE_HOME is /elsewhere',
+    );
+    expect(sourceHome(undefined, { HOME: '/h', KIMI_CODE_HOME: '/h/.kimi-code' })).toBe('/h/.kimi-code');
+    // An explicit choice is never second-guessed.
+    expect(sourceHome('/x', { HOME: '/h', KIMI_CODE_HOME: '/elsewhere' })).toBe('/x');
+    expect(
+      sourceHome(undefined, { HOME: '/h', KIMI_CODE_HOME: '/elsewhere', KIMI_CODE_HOME_SOURCE: '/y' }),
+    ).toBe('/y');
+  });
+});
+
+/** Whether the temp directory's filesystem ignores case in names. */
+const CASE_INSENSITIVE_TMP = (() => {
+  const dir = makeTempDir('bare-kimi-case-');
+  try {
+    return existsSync(join(dirname(dir), basename(dir).toUpperCase()));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+})();
+
+describe('case-insensitive spellings', () => {
+  test.skipIf(!CASE_INSENSITIVE_TMP)(
+    'a run home under another case of the source home is the same or nested by identity',
+    () => {
+      const root = temp('bare-kimi-home-');
+      const src = makeSourceHome(root);
+      const shouted = join(root, 'SRC-HOME');
+
+      expect(() => assembleHome(src, shouted)).toThrow('same directory');
+      expect(() => assembleHome(src, join(shouted, 'run'))).toThrow('nested');
+      expect(existsSync(join(src, 'run'))).toBe(false);
+      expect(existsSync(join(src, HOME_STAMP))).toBe(false);
+    },
+  );
+});
+
+describe('TOML parser advisories (isolated child under a deadline)', () => {
+  // Each case runs assembleHome in a child that is killed at the deadline, so
+  // a parser with the defect fails the test instead of hanging the runner.
+  const DEADLINE_MS = 15_000;
+
+  test(
+    'a comment-terminated inline table at end of file is refused, not looped on',
+    async () => {
+      const root = temp('bare-kimi-home-');
+      const src = makeSourceHome(root);
+      // No newline after the comment, and no ',' or '}' earlier in the file:
+      // the shape that sent smol-toml <= 1.7.0 into an endless rescan.
+      editConfig(src, (text) => `${text}\n[advisory]\nx = {a = 1 #`);
+      const dst = join(root, 'run-home');
+
+      const run = await runWithDeadline([process.execPath, ASSEMBLE_CHILD, src, dst], DEADLINE_MS);
+
+      expect(run.timedOut).toBe(false);
+      expect(JSON.parse(run.stdout)).toEqual({ ok: false, error: expect.stringContaining('does not parse as TOML') });
+      expect(existsSync(dst)).toBe(false);
+    },
+    DEADLINE_MS * 2,
+  );
+
+  test(
+    'many plain keys parse in bounded time',
+    async () => {
+      const root = temp('bare-kimi-home-');
+      const src = makeSourceHome(root);
+      // 300k dot-free keys: smol-toml <= 1.8.0 rescanned to the end of the
+      // document for every key, which is quadratic (minutes here).
+      const keys = Array.from({ length: 300_000 }, (_, index) => `k${index} = ${index}`).join('\n');
+      editConfig(src, (text) => `${text}\n[bulk]\n${keys}\n`);
+      const dst = join(root, 'run-home');
+
+      const run = await runWithDeadline([process.execPath, ASSEMBLE_CHILD, src, dst], DEADLINE_MS);
+
+      expect(run.timedOut).toBe(false);
+      expect(JSON.parse(run.stdout)).toEqual({ ok: true });
+      expect(readFileSync(join(dst, 'config.toml'), 'utf-8')).not.toContain('[bulk]');
+    },
+    DEADLINE_MS * 2,
+  );
 });
 
 describe('path resolution and aliasing', () => {

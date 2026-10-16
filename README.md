@@ -20,10 +20,22 @@ checks on the recovered tree showed, and what is not known.
   and it keeps its permissions. Its `config.toml` carries, verbatim:
   `default_model`, that model's `[models."…"]` table, its provider's
   `[providers."…"]` tables, and the source's `[thinking]`, `[permission]`
-  and `[[hooks]]` tables. The source config is checked with smol-toml 1.6.1,
-  the TOML parser kimi 2.1.0 uses. It is refused before anything is written
-  if that parser rejects it, or if any of these tables is written in a form
-  that cannot be carried verbatim.
+  and `[[hooks]]` tables. The source config is checked with smol-toml, the
+  TOML parser family kimi uses, pinned to a release without the known
+  denial-of-service defects of the version kimi 2.1.0 bundles. It is refused
+  before anything is written if the parser rejects it, or if any of these
+  tables is written in a form that cannot be carried verbatim. Carrying
+  `[permission]` is all that is promised: a static reading of kimi 2.1.0
+  found no code that loads configured permission rules, so their enforcement
+  is unproven. Hooks are loaded. kimi drops a config section that fails its
+  schema as a whole, so one invalid `[[hooks]]` entry disables every hook.
+- **Ownership:** a run home bare-kimi assembled carries `.bare-kimi-home`,
+  which records its source home and the settings it wrote. A missing or empty
+  directory is assembled; a stamped home from the same source is reused.
+  Anything else is refused, including another tool's directory that happens
+  to hold a `config.toml`. A reused home's `config.toml` is kept while its
+  settings match the source (comments survive), rewritten when the source
+  changed, and refused when it was edited to something else.
   kimi itself creates a `device_id` in every new run home and sends it to
   the provider, so each ephemeral run appears there as a new device.
 - **The source home**, in link mode (the default): `credentials/` and
@@ -64,6 +76,29 @@ Requires Bun ≥ 1.3. Code comments that cite kimi-code `6451f1e` or kimi
 2.0.1 are the original author's statements and were not re-verified during
 recovery. Comments that cite kimi 2.1.0 come from reading the installed
 2.1.0 npm bundle. They say nothing about the current upstream source.
+
+## Optional native probe
+
+`probe/native-loopback.ts` observes an installed kimi without credentials or
+a provider. It is not part of `bun test`. It runs bare-kimi against a
+loopback stand-in for an OpenAI-compatible provider, under macOS
+`sandbox-exec`: network only to that provider's port, writes confined to a
+temp root, and reads of the real native homes denied. It refuses before
+launching kimi when that isolation cannot be shown, or when the kimi
+executable is not named explicitly. Each finding rests on its own
+scenario's evidence and is otherwise reported as inconclusive:
+- whether a schema-shaped deny rule stops a scripted tool call;
+- whether a string-form rule is dropped;
+- whether hooks fire;
+- whether an invalid hook drops the hooks section;
+- whether preload reaches the model;
+- where the thinking effort is sent.
+
+No result from it is recorded here yet.
+
+A nested bare-kimi (started from a hook or tool inside a run) donates from
+the same source home: the child environment carries
+`KIMI_CODE_HOME_SOURCE`.
 
 ## License
 

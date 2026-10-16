@@ -9,10 +9,12 @@ import {
   readFileSync,
   readlinkSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
+  type Stats,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -35,16 +37,23 @@ import { parse as parseTomlText } from 'smol-toml';
  * - Identity is decided after resolving symlinks. A run home that is the
  *   source home under another name, or that contains or is contained in it,
  *   is refused before anything is created, chmod'ed or written.
+ * - Ownership is explicit. A run home this library assembled carries
+ *   {@link HOME_STAMP}: the canonical source home it came from and a digest
+ *   of the settings in the config.toml it wrote. Only an empty directory or
+ *   a stamped home is used; a stamped home only with the same source, and
+ *   only while its config.toml still holds what was written (comments may
+ *   change) or what the source now yields. A `config.toml` alone proves
+ *   nothing: it is a common file name.
  * - Every refusal happens before the first effect. An entry this library did
  *   not make — a real directory, a file, a symlink pointing anywhere but the
  *   intended source — is caller-owned and is never removed or re-pointed.
- *   An existing run-home directory keeps its permissions, and is used only
- *   when it is empty or already an assembled home. A marker-stamped copy is
- *   library-made, but is discarded only when it provably holds nothing the
- *   source lacks (see {@link CREDENTIALS_MARKER}).
- * - Effects, in order: the source home's oauth/ is created when missing
- *   (link mode), a missing run home is created with mode 0700, credentials
- *   are donated, config.toml is written.
+ *   An existing run-home directory keeps its permissions. A marker-stamped
+ *   copy is library-made, but is discarded only when it provably holds
+ *   nothing the source lacks (see {@link CREDENTIALS_MARKER}).
+ * - Effects, in order: a missing run home is created with mode 0700 and
+ *   stamped, the source home's oauth/ is created when missing (link mode),
+ *   credentials are donated, config.toml is written (tmp file + rename) when
+ *   missing or when the source's settings changed, and the stamp is updated.
  *
  * Native effects this library arranges but does not perform, as read from
  * the installed kimi 2.1.0 bundle: in link mode a refresh writes the new
@@ -89,6 +98,11 @@ export interface AssembledHome {
  * `KIMI_CODE_HOME_SOURCE`, else `~/.kimi-code`. Deliberately NOT
  * `KIMI_CODE_HOME`: that variable names the RUN home, and a run home must
  * never double as its own source.
+ *
+ * The `~/.kimi-code` fallback is refused when the environment's
+ * `KIMI_CODE_HOME` names a different directory: that environment selected
+ * another home for native kimi, and silently donating from `~/.kimi-code`
+ * would run on a login it did not select.
  */
 export function sourceHome(
   explicit?: string,
@@ -101,7 +115,15 @@ export function sourceHome(
   if (home === undefined || home.length === 0) {
     throw new Error('no source home: pass srcHome, set KIMI_CODE_HOME_SOURCE, or set HOME');
   }
-  return join(home, '.kimi-code');
+  const fallback = join(home, '.kimi-code');
+  const selected = env['KIMI_CODE_HOME'];
+  if (selected !== undefined && selected.length > 0 && !sameDirectory(selected, fallback)) {
+    throw new Error(
+      `KIMI_CODE_HOME is ${selected}, but the source home would default to ${fallback}; ` +
+        'set KIMI_CODE_HOME_SOURCE or pass the source home explicitly',
+    );
+  }
+  return fallback;
 }
 
 // ---------------------------------------------------------------- config.toml
@@ -115,12 +137,14 @@ function isTable(value: unknown): value is TomlTable {
 }
 
 /**
- * Parse with smol-toml, pinned to the version kimi 2.1.0 bundles and calls
- * (default options) for every read of its config.toml. Validating with the
- * parser kimi itself uses means a config refused here is one kimi would
- * also refuse or misread, and one accepted here reads the same to kimi.
- * Bun's built-in TOML parser is not used: it accepts malformed input, such
- * as an unterminated table header, that smol-toml rejects.
+ * Parse with smol-toml, the parser kimi 2.1.0 bundles and calls (default
+ * options) for every read of its config.toml. kimi 2.1.0 bundles 1.6.1,
+ * which has published denial-of-service defects (an infinite loop on some
+ * malformed input; quadratic time on many keys); this library pins a later
+ * release with both fixed, so it may parse some documents that 1.6.1 would
+ * hang on or reject. Bun's built-in TOML parser is not used: it accepts
+ * malformed input, such as an unterminated table header, that smol-toml
+ * rejects.
  */
 function parseToml(text: string, where: string): TomlTable {
   let parsed: unknown;
@@ -135,30 +159,30 @@ function parseToml(text: string, where: string): TomlTable {
 }
 
 /**
- * Structural equality of parsed TOML values. Dates compare by their TOML
- * form (smol-toml's TomlDate keeps local dates and times distinct), numbers
- * by Object.is (so `nan` equals `nan`), tables by their exact key sets.
+ * A parsed TOML value as one canonical string: two values have the same
+ * string exactly when they mean the same. Dates by their TOML form
+ * (smol-toml's TomlDate keeps local dates and times distinct), numbers so
+ * that `nan` equals `nan` and `-0.0` stays distinct, tables with sorted keys.
+ * Comments and layout are not part of a parsed value, so they never count.
  */
-function sameTomlValue(a: unknown, b: unknown): boolean {
-  if (a instanceof Date || b instanceof Date) {
-    return a instanceof Date && b instanceof Date && a.toISOString() === b.toISOString();
+function canonicalToml(value: unknown): string {
+  if (value instanceof Date) return `date:${value.toISOString()}`;
+  if (Array.isArray(value)) return `[${value.map((item: unknown) => canonicalToml(item)).join(',')}]`;
+  if (isTable(value)) {
+    const table: TomlTable = value;
+    const entries = Object.keys(table)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalToml(table[key])}`);
+    return `{${entries.join(',')}}`;
   }
-  if (Array.isArray(a) || Array.isArray(b)) {
-    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
-    const right: unknown[] = b;
-    return a.every((item: unknown, index) => sameTomlValue(item, right[index]));
-  }
-  if (isTable(a) || isTable(b)) {
-    if (!isTable(a) || !isTable(b)) return false;
-    const left: TomlTable = a;
-    const right: TomlTable = b;
-    const keys = Object.keys(left);
-    return (
-      keys.length === Object.keys(right).length &&
-      keys.every((key) => Object.hasOwn(right, key) && sameTomlValue(left[key], right[key]))
-    );
-  }
-  return Object.is(a, b);
+  if (typeof value === 'number') return `number:${Object.is(value, -0) ? '-0' : String(value)}`;
+  if (typeof value === 'bigint') return `bigint:${value.toString()}`;
+  return `${typeof value}:${JSON.stringify(value) ?? ''}`;
+}
+
+/** Digest of a parsed config's settings, as recorded in {@link HOME_STAMP}. */
+function settingsDigest(table: TomlTable): string {
+  return sha256(canonicalToml(table));
 }
 
 const TOML_KEY = String.raw`(?:[A-Za-z0-9_-]+|"(?:[^"\\\n]|\\.)*"|'[^'\n]*')`;
@@ -173,7 +197,8 @@ const TOML_KEYS = new RegExp(TOML_KEY, 'g');
  * yields an empty path, which nothing selects.
  */
 function headerPath(line: string): string[] | undefined {
-  const match = TABLE_HEADER.exec(line);
+  // CRLF files: `.` in a trailing comment does not match `\r`.
+  const match = TABLE_HEADER.exec(line.endsWith('\r') ? line.slice(0, -1) : line);
   if (match === null) return undefined;
   const [, open, keys, close] = match;
   if (open === undefined || keys === undefined || close === undefined) return undefined;
@@ -217,11 +242,21 @@ function isUnder(path: readonly string[], prefix: readonly string[]): boolean {
  * Root tables carried whole when the source config has them:
  * - `thinking` — the configured effort; without it a run uses the model's
  *   default effort (kimi 2.1.0 keys: `enabled`, `effort`, `keep`);
- * - `permission` — the deny/allow/ask rules. In `-p` mode native kimi forces
- *   its auto permission mode, where configured deny rules are checked before
- *   auto-approval; dropping them would approve what the operator denied;
- * - `hooks` — native hooks, carried with the policy they may enforce. They
- *   run in bare runs exactly as configured.
+ * - `permission` — the deny/allow/ask rules, carried so a bare run is
+ *   configured exactly as a native run on the source home. This promises a
+ *   faithful carry only, not enforcement. kimi 2.1.0 accepts the section,
+ *   and its `-p` policy chain checks rule-state deny rules before
+ *   auto-approval, but a static reading of the 2.1.0 bundle found no path
+ *   that loads configured rules into that state. Whether 2.1.0 enforces them
+ *   is unproven until observed in a native run;
+ * - `hooks` — native hooks, which 2.1.0 does load from config; they run in
+ *   bare runs exactly as configured.
+ *
+ * kimi 2.1.0 validates each config section against its own schema and drops
+ * a section that fails as a whole, printing only a warning
+ * (`Ignored invalid config section '<name>'`): one invalid `[[hooks]]` entry
+ * disables every hook. This library carries such a section verbatim; it does
+ * not validate kimi's schema.
  */
 const CARRIED_TABLES = ['thinking', 'permission', 'hooks'] as const;
 
@@ -229,6 +264,8 @@ interface MinimalConfig {
   readonly text: string;
   readonly modelAlias: string;
   readonly provider: string;
+  /** {@link settingsDigest} of `text`. */
+  readonly digest: string;
 }
 
 /**
@@ -294,14 +331,14 @@ function minimalConfig(configText: string, where: string): MinimalConfig {
 
   const carried = parseToml(text, `the config assembled from ${where}`);
   for (const key of new Set([...Object.keys(expected), ...Object.keys(carried)])) {
-    if (!sameTomlValue(carried[key], expected[key])) {
+    if (canonicalToml(carried[key]) !== canonicalToml(expected[key])) {
       throw new Error(
         `${where}: \`${key}\` cannot be carried verbatim (written outside its own table ` +
           'headers, e.g. as dotted keys or an inline table); refusing rather than dropping or altering it',
       );
     }
   }
-  return { text, modelAlias, provider };
+  return { text, modelAlias, provider, digest: settingsDigest(carried) };
 }
 
 // ---------------------------------------------------------------- paths
@@ -344,16 +381,57 @@ function canonicalPath(path: string): string {
   }
 }
 
+/** stat() that follows symlinks and reports any failure as absence. */
+function statIfPresent(path: string): Stats | undefined {
+  try {
+    return statSync(path);
+  } catch {
+    return undefined;
+  }
+}
+
 /** Both paths exist and are the same filesystem object. */
 function sameExisting(a: string, b: string): boolean {
-  const left = statSync(a, { throwIfNoEntry: false });
-  const right = statSync(b, { throwIfNoEntry: false });
+  const left = statIfPresent(a);
+  const right = statIfPresent(b);
   return left !== undefined && right !== undefined && left.dev === right.dev && left.ino === right.ino;
+}
+
+/**
+ * Where `path` stands relative to the existing directory `ancestor`, by
+ * filesystem identity: `same` when `path` is it, `inside` when one of
+ * `path`'s existing ancestors is it. Identity, unlike spelling, also sees
+ * through case-insensitive names and hard-to-spot aliases, including for a
+ * `path` that does not exist yet.
+ */
+function placeByIdentity(path: string, ancestor: string): 'same' | 'inside' | undefined {
+  const target = statIfPresent(ancestor);
+  if (target === undefined) return undefined;
+  let current = resolve(path);
+  for (let first = true; ; first = false) {
+    const stat = statIfPresent(current);
+    if (stat !== undefined && stat.dev === target.dev && stat.ino === target.ino) {
+      return first ? 'same' : 'inside';
+    }
+    const parent = dirname(current);
+    if (parent === current) return undefined;
+    current = parent;
+  }
 }
 
 function isInside(child: string, parent: string): boolean {
   const path = relative(parent, child);
   return path.length > 0 && path !== '..' && !path.startsWith(`..${sep}`) && !isAbsolute(path);
+}
+
+/** The two paths name the same directory, by spelling or by identity. */
+function sameDirectory(a: string, b: string): boolean {
+  if (resolve(a) === resolve(b) || placeByIdentity(a, b) === 'same') return true;
+  try {
+    return canonicalPath(a) === canonicalPath(b);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -365,10 +443,19 @@ function isInside(child: string, parent: string): boolean {
 export function assertDistinctHomes(srcHome: string, runHome: string): void {
   const src = canonicalPath(srcHome);
   const run = canonicalPath(runHome);
-  if (resolve(srcHome) === resolve(runHome) || src === run || sameExisting(srcHome, runHome)) {
+  if (
+    resolve(srcHome) === resolve(runHome) ||
+    src === run ||
+    placeByIdentity(runHome, srcHome) === 'same'
+  ) {
     throw new Error('source and run home are the same directory; refusing');
   }
-  if (isInside(run, src) || isInside(src, run)) {
+  if (
+    isInside(run, src) ||
+    isInside(src, run) ||
+    placeByIdentity(runHome, srcHome) === 'inside' ||
+    placeByIdentity(srcHome, runHome) === 'inside'
+  ) {
     throw new Error('source and run home are nested inside one another; refusing');
   }
 }
@@ -391,8 +478,8 @@ function isMarkedCopy(path: string): boolean {
   );
 }
 
-function sha256(bytes: Uint8Array): string {
-  return createHash('sha256').update(bytes).digest('hex');
+function sha256(data: string | Uint8Array): string {
+  return createHash('sha256').update(data).digest('hex');
 }
 
 /** Per-file digests written into {@link CREDENTIALS_MARKER}. */
@@ -616,89 +703,205 @@ export function ensureAuth(srcHome: string, dstHome: string, mode: AuthMode = 'l
   const src = resolve(srcHome);
   const dst = resolve(dstHome);
   assertDistinctHomes(src, dst);
+  const donation = planEnsure(src, dst, mode);
+  if (donation === undefined) return false;
+  applyDonation(donation);
+  return true;
+}
+
+/** ensureAuth's decision, made before any effect; undefined when nothing is to change. */
+function planEnsure(src: string, dst: string, mode: AuthMode): Donation | undefined {
   const credentials = lstatSync(join(dst, 'credentials'), { throwIfNoEntry: false });
-  if (credentials === undefined) {
-    donateAuth(src, dst, mode);
-    return true;
-  }
+  if (credentials === undefined) return planDonation(src, dst, mode);
   if (credentials.isSymbolicLink()) {
     if (mode !== 'link') {
       throw new Error(`run home ${dst} has linked credentials, but copy mode was requested; refusing`);
     }
     const donation = planLinkDonation(src, dst);
-    applyDonation(donation);
-    return donation.oauth.action === 'create';
+    const complete = donation.oauth.action === 'keep' && existsSync(donation.sourceOauth);
+    return complete ? undefined : donation;
   }
   if (lstatSync(join(dst, 'oauth'), { throwIfNoEntry: false })?.isSymbolicLink() === true) {
     throw new Error(
       `run home ${dst} has a linked oauth/ but its own credentials/; refusing the unpaired lock`,
     );
   }
-  return false;
+  return undefined;
 }
 
 // ---------------------------------------------------------------- homes
 
 /**
- * An existing directory is assembled into only when it is empty, holds
- * nothing but the ephemeral marker, or already holds a config.toml (an
- * assembled home). Its permissions stay the caller's. Returns whether the
- * run home still has to be created.
+ * Stamp at the root of every run home this library assembled: proof of
+ * ownership, the canonical source home it was assembled from, and the
+ * digest of the settings in the config.toml it last wrote.
  */
-function mustCreateRunHome(home: string): boolean {
-  const stat = statSync(home, { throwIfNoEntry: false });
-  if (stat === undefined) return true;
-  if (!stat.isDirectory()) throw new Error(`run home ${home} exists and is not a directory`);
-  const entries = readdirSync(home).filter((entry) => entry !== EPHEMERAL_MARKER);
-  if (entries.length > 0 && !entries.includes('config.toml')) {
-    throw new Error(
-      `refusing to assemble into ${home}: it is not empty and holds no config.toml, so it is not a run home`,
-    );
+export const HOME_STAMP = '.bare-kimi-home';
+
+interface HomeStamp {
+  readonly version: 1;
+  /** Canonical path of the source home. */
+  readonly source: string;
+  /** {@link settingsDigest} of the config.toml this library last wrote. */
+  readonly config: string;
+}
+
+/** The home's stamp; undefined when there is none. A stamp that does not read as one is refused. */
+function readHomeStamp(home: string): HomeStamp | undefined {
+  const path = join(home, HOME_STAMP);
+  const stat = lstatSync(path, { throwIfNoEntry: false });
+  if (stat === undefined) return undefined;
+  if (!stat.isFile()) throw new Error(`${path} is not a regular file; refusing`);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf-8'));
+  } catch {
+    parsed = undefined;
   }
-  return false;
+  const source = isTable(parsed) ? parsed['source'] : undefined;
+  const config = isTable(parsed) ? parsed['config'] : undefined;
+  if (!isTable(parsed) || parsed['version'] !== 1 || typeof source !== 'string' || typeof config !== 'string') {
+    throw new Error(`${path} is not a stamp this version of bare-kimi wrote; refusing`);
+  }
+  return { version: 1, source, config };
+}
+
+/** Replace `path` with `text` in one rename, so no reader sees half of it. */
+function writeFileAtomic(path: string, text: string): void {
+  const tmp = `${path}.tmp.${process.pid}`;
+  writeFileSync(tmp, text, { mode: 0o600 });
+  renameSync(tmp, path);
+}
+
+function writeHomeStamp(home: string, stamp: HomeStamp): void {
+  writeFileAtomic(join(home, HOME_STAMP), `${JSON.stringify(stamp)}\n`);
+}
+
+/** What preparing a run home will do, decided in full before any effect. */
+interface RunHomePlan {
+  /** Canonical run-home path, for the effects that follow. */
+  readonly home: string;
+  readonly create: boolean;
+  /** The home's stamp as found; undefined for a new or empty home. */
+  readonly stamp: HomeStamp | undefined;
+  readonly writeConfig: boolean;
 }
 
 /**
- * Turn `dstHome` into a runnable minimal KIMI_CODE_HOME: authentication
- * donated from `srcHome` (link by default), and a config.toml built by
- * {@link minimalConfig} from `srcHome`'s.
+ * Decide how the run home relates to `source` (canonical) and `config` (what
+ * the source yields now). Refuses:
+ * - an existing non-directory;
+ * - a non-empty directory without {@link HOME_STAMP} — this library did not
+ *   assemble it, whatever it holds;
+ * - a stamped home from another source;
+ * - a config.toml that is not a regular file, or no longer parses;
+ * - a config.toml whose settings differ both from what was last written
+ *   (it was edited) and from what the source yields now.
  *
- * config.toml is written as a regular file: the engine persists config via
- * tmp+rename, which would silently replace a symlink. An existing
- * config.toml that is not a regular file is refused. A missing run home is
- * created with mode 0700; an existing one keeps its mode.
+ * A config.toml whose settings equal the source's is kept byte for byte
+ * (comments survive). One that still holds exactly what was last written,
+ * while the source changed, is rewritten from the source.
+ */
+function planRunHome(dst: string, source: string, config: MinimalConfig): RunHomePlan {
+  const home = canonicalPath(dst);
+  const stat = statIfPresent(home);
+  if (stat === undefined) return { home, create: true, stamp: undefined, writeConfig: true };
+  if (!stat.isDirectory()) throw new Error(`run home ${home} exists and is not a directory`);
+  const stamp = readHomeStamp(home);
+  if (stamp === undefined) {
+    const entries = readdirSync(home).filter((entry) => entry !== EPHEMERAL_MARKER);
+    if (entries.length > 0) {
+      throw new Error(
+        `refusing to use ${home}: it is not empty and has no ${HOME_STAMP}, ` +
+          'so it is not a run home bare-kimi assembled',
+      );
+    }
+    return { home, create: false, stamp, writeConfig: true };
+  }
+  if (stamp.source !== source) {
+    throw new Error(`run home ${home} was assembled from ${stamp.source}, not ${source}; refusing`);
+  }
+  const configPath = join(home, 'config.toml');
+  const current = lstatSync(configPath, { throwIfNoEntry: false });
+  if (current === undefined) return { home, create: false, stamp, writeConfig: true };
+  if (!current.isFile()) throw new Error(`refusing to use ${configPath}: not a regular file`);
+  const digest = settingsDigest(parseToml(readFileSync(configPath, 'utf-8'), configPath));
+  if (digest === config.digest) return { home, create: false, stamp, writeConfig: false };
+  if (digest === stamp.config) return { home, create: false, stamp, writeConfig: true };
+  throw new Error(
+    `refusing to use ${configPath}: its settings were edited since bare-kimi wrote it, ` +
+      'and they differ from what the source home now yields',
+  );
+}
+
+/**
+ * Make `runHome` a KIMI_CODE_HOME ready to run on `srcHome`'s login and
+ * settings: create or reuse it (see {@link planRunHome}), donate
+ * authentication, and bring its config.toml in line with the source's —
+ * `default_model`, that model's and its provider's tables and the carried
+ * tables (see {@link minimalConfig}). A source whose settings changed since
+ * the last run is followed, not ignored: an unedited config.toml is
+ * rewritten from it.
+ *
+ * Authentication: with `reassemble`, donation runs as in {@link donateAuth}
+ * (an unchanged bare-kimi copy may be replaced, e.g. by a link); otherwise as
+ * in {@link ensureAuth} (present credentials are used as they are, once
+ * their pairing with the source checks out). A new or empty home always gets
+ * a full donation.
+ *
+ * config.toml is written as a regular file by tmp + rename: kimi persists
+ * config the same way, which would silently replace a symlink. A missing run
+ * home is created with mode 0700; an existing one keeps its mode.
  *
  * All refusals happen before the first effect (see the custody model above).
+ */
+export function prepareRunHome(
+  srcHome: string,
+  runHome: string,
+  mode: AuthMode = 'link',
+  options: { readonly reassemble?: boolean } = {},
+): AssembledHome {
+  const src = resolve(srcHome);
+  const dst = resolve(runHome);
+  assertDistinctHomes(src, dst);
+  const source = canonicalPath(src);
+  const srcConfigPath = join(src, 'config.toml');
+  const config = minimalConfig(readFileSync(srcConfigPath, 'utf-8'), srcConfigPath);
+  const plan = planRunHome(dst, source, config);
+  const donation =
+    plan.stamp === undefined || options.reassemble === true
+      ? planDonation(src, dst, mode)
+      : planEnsure(src, dst, mode);
+
+  // Effects start here; every refusal above left both homes untouched.
+  if (plan.create) {
+    mkdirSync(plan.home, { recursive: true, mode: 0o700 });
+    chmodSync(plan.home, 0o700);
+  }
+  if (plan.stamp === undefined) {
+    // Stamped first: an interrupted assembly leaves a home that is still ours.
+    writeHomeStamp(plan.home, { version: 1, source, config: config.digest });
+  }
+  if (donation !== undefined) applyDonation(donation);
+  const configPath = join(dst, 'config.toml');
+  if (plan.writeConfig) writeFileAtomic(join(plan.home, 'config.toml'), config.text);
+  if (plan.stamp !== undefined && plan.stamp.config !== config.digest) {
+    writeHomeStamp(plan.home, { version: 1, source, config: config.digest });
+  }
+
+  return { home: dst, configPath, modelAlias: config.modelAlias, provider: config.provider };
+}
+
+/**
+ * {@link prepareRunHome} with `reassemble`: turn `dstHome` into a runnable
+ * minimal KIMI_CODE_HOME from `srcHome`, donating authentication in full.
  */
 export function assembleHome(
   srcHome: string,
   dstHome: string,
   mode: AuthMode = 'link',
 ): AssembledHome {
-  const src = resolve(srcHome);
-  const dst = resolve(dstHome);
-  assertDistinctHomes(src, dst);
-  const srcConfigPath = join(src, 'config.toml');
-  const config = minimalConfig(readFileSync(srcConfigPath, 'utf-8'), srcConfigPath);
-
-  const home = canonicalPath(dst);
-  const configPath = join(dst, 'config.toml');
-  const existingConfig = lstatSync(join(home, 'config.toml'), { throwIfNoEntry: false });
-  if (existingConfig !== undefined && !existingConfig.isFile()) {
-    throw new Error(`refusing to replace ${configPath}: not a regular file`);
-  }
-  const donation = planDonation(src, dst, mode);
-  const create = mustCreateRunHome(home);
-
-  // Effects start here; every refusal above left both homes untouched.
-  if (create) {
-    mkdirSync(home, { recursive: true, mode: 0o700 });
-    chmodSync(home, 0o700);
-  }
-  applyDonation(donation);
-  writeFileSync(configPath, config.text, { mode: 0o600 });
-
-  return { home: dst, configPath, modelAlias: config.modelAlias, provider: config.provider };
+  return prepareRunHome(srcHome, dstHome, mode, { reassemble: true });
 }
 
 /**
@@ -719,12 +922,12 @@ export function shredCopiedCredentials(home: string, srcHome?: string): boolean 
 }
 
 /**
- * A home counts as assembled once it has a config.toml. Used to decide
- * whether a caller-supplied home is a prepared home (use as-is) or a fresh
- * dir to assemble into.
+ * A home counts as assembled when it carries {@link HOME_STAMP}, i.e. this
+ * library assembled it. A config.toml alone does not count. A stamp that is
+ * not one this version wrote is refused (thrown), not guessed at.
  */
 export function isAssembledHome(home: string): boolean {
-  return existsSync(join(home, 'config.toml'));
+  return readHomeStamp(resolve(home)) !== undefined;
 }
 
 /**
