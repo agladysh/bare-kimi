@@ -510,14 +510,13 @@ export function LaunchConfig(o: LaunchOptions): LaunchConfig {
 }
 
 /**
- * Refuse a prompt starting with `-`. Whether kimi's parser would take such
- * a value after `-p` as a flag was not re-verified for 2.1.0; refusing is
- * the conservative choice. Called before any filesystem work, so a refusal
- * leaves nothing behind.
+ * Refuse a prompt starting with `-` as conservative wrapper policy.
+ * kimi 2.1.0 takes the next argument after `-p` as its value, including a
+ * leading dash. Called before filesystem work, so refusal leaves nothing behind.
  */
 export function assertSafePrompt(prompt: string): void {
   if (prompt.startsWith('-')) {
-    throw new Error('prompt starts with "-": kimi could parse it as a flag');
+    throw new Error('prompt starts with "-": refused by bare-kimi policy');
   }
 }
 

@@ -152,8 +152,8 @@ Run shape:
   -v, --version         Print bare-kimi version.
   -h, --help            This text.
 
-The prompt (and --prime) may not start with "-": kimi could read it as a
-flag. Every option check happens before any home is made or kimi starts.
+The prompt (and --prime) may not start with "-": conservative bare-kimi
+policy. Every option check happens before any home is made or kimi starts.
 
 Ambient boundary (measured, not a bug): AGENTS.md files (run home,
 ~/.agents, git-root → cwd walk) and skills still load in print mode. For a
@@ -496,7 +496,7 @@ function describeRouting(assembled: AssembledHome, options: LaunchOptions, run: 
       assembled.configuredEffort === null ? "the model's default effort" : `effort "${assembled.configuredEffort}"`;
     effort = `no effort pinned; config.toml gives new sessions ${configured} from the source's [thinking]`;
   }
-  const alias = options.model === undefined ? 'the alias it stored' : 'runs on this alias, which --model names';
+  const alias = options.model === undefined ? 'the alias it stored' : 'this alias, which --model names';
   // Observed: a resume keeps its stored effort over a changed [thinking]. Not observed: over a changed model table.
   const kept =
     assembled.effortSupport === 'withdrawn'
