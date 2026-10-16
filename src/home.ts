@@ -78,7 +78,8 @@ import { parse as parseTomlText } from 'smol-toml';
  *   is genuinely shared with every native run on the source home.
  *   Verified 2026-09-24 against kimi-code @ 6451f1e (installed kimi 2.0.1):
  *   `packages/oauth/src/storage.ts`, `packages/oauth/src/oauth-manager.ts`.
- * - `copy`: credential files are copied in (sketch behavior). A refresh
+ * - `copy`: credential files are copied in, stamped with their digests (see
+ *   {@link CREDENTIALS_MARKER}). A refresh
  *   inside the copy rotates the shared refresh token server-side and the
  *   source home's copy goes stale — use only for throwaway forensics, never
  *   as a default.
@@ -244,19 +245,28 @@ function isUnder(path: readonly string[], prefix: readonly string[]): boolean {
  *   default effort (kimi 2.1.0 keys: `enabled`, `effort`, `keep`);
  * - `permission` — the deny/allow/ask rules, carried so a bare run is
  *   configured exactly as a native run on the source home. This promises a
- *   faithful carry only, not enforcement. kimi 2.1.0 accepts the section,
- *   and its `-p` policy chain checks rule-state deny rules before
- *   auto-approval, but a static reading of the 2.1.0 bundle found no path
- *   that loads configured rules into that state. Whether 2.1.0 enforces them
- *   is unproven until observed in a native run;
- * - `hooks` — native hooks, which 2.1.0 does load from config; they run in
- *   bare runs exactly as configured.
+ *   faithful carry only, and is NOT protection. In a native run of installed
+ *   kimi 2.1.0 in `-p` mode (a loopback test provider, the repository's
+ *   optional probe), a schema-valid `[[permission.rules]]` deny rule for
+ *   `Bash` was carried and accepted without a section-drop warning, yet did
+ *   not stop a `Bash` call (it ran: "Command executed successfully."). That
+ *   matches the static reading: the rule state the policy chain consults is
+ *   filled by a method nothing in the bundle calls. This is one observed
+ *   case in one version and mode, not a statement about other versions,
+ *   modes or the interactive UI. Do not rely on carried rules to contain a
+ *   bare run: confine it from outside (an OS sandbox, a container, a
+ *   restricted account);
+ * - `hooks` — native hooks, which 2.1.0 loads from config and runs: in the
+ *   same native run a `PreToolUse` hook fired. They run in bare runs exactly
+ *   as configured.
  *
  * kimi 2.1.0 validates each config section against its own schema and drops
  * a section that fails as a whole, printing only a warning
- * (`Ignored invalid config section '<name>'`): one invalid `[[hooks]]` entry
- * disables every hook. This library carries such a section verbatim; it does
- * not validate kimi's schema.
+ * (`Ignored invalid config section '<name>'`). Observed in the same native
+ * run: a string `deny = ["Bash"]` rule dropped the whole `[permission]`
+ * section, and one invalid `[[hooks]]` entry dropped the whole hooks section,
+ * so the valid hook beside it did not fire. This library carries such a
+ * section verbatim; it does not validate kimi's schema.
  */
 const CARRIED_TABLES = ['thinking', 'permission', 'hooks'] as const;
 
@@ -281,7 +291,9 @@ interface MinimalConfig {
  * The text is split at header lines only; that is not a TOML parser, and a
  * header-like line inside a multi-line string or array would split wrongly.
  * So the semantics come from {@link parseToml} instead, which guarantees:
- * - the whole source config parses under kimi 2.1.0's own TOML parser —
+ * - the whole source config parses under smol-toml (the parser family kimi
+ *   uses; this library pins a newer release than kimi 2.1.0 bundles, see
+ *   {@link parseToml}) —
  *   malformed content anywhere, carried or not, is refused, because what
  *   the source means cannot be known;
  * - `default_model` is read from the parsed root table;
@@ -290,8 +302,8 @@ interface MinimalConfig {
  *   gone wrong, dotted keys or inline tables outside the carried tables' own
  *   headers — is refused rather than dropped or altered.
  * It does not guarantee that kimi's schema accepts the carried values, nor
- * agreement with a different kimi version's parser. Other source settings
- * are not carried.
+ * agreement with the parser release kimi itself bundles. Other source
+ * settings are not carried.
  */
 function minimalConfig(configText: string, where: string): MinimalConfig {
   const source = parseToml(configText, where);

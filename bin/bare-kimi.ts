@@ -92,17 +92,28 @@ Ambient boundary (measured, not a bug): AGENTS.md files (run home,
 ~/.agents, git-root → cwd walk) and skills still load in print mode. For a
 fully bare run use a cwd with no AGENTS.md up its git root.
 
+Environment: the child inherits this environment (unless --no-process-env)
+minus KIMI_CODE_BASE_URL, KIMI_CODE_OAUTH_HOST, KIMI_OAUTH_HOST,
+KIMI_DISABLE_OAUTH_LOCK, every KIMI_MODEL_* variable (including the
+thinking-effort overrides) and any KIMI_CODE_HOME. bare-kimi then sets
+KIMI_CODE_HOME to the run home and KIMI_CODE_HOME_SOURCE to the source home,
+and KIMI_DISABLE_TELEMETRY=1 and KIMI_CODE_NO_AUTO_UPDATE=1 unless already
+set. A dropped variable cannot be restored from the CLI (the library's
+extraEnv can, except KIMI_CODE_HOME).
+
 Permissions: -p forces kimi's native auto permission mode; -y/--yolo,
 --auto and --plan conflict with -p and cannot be used. bare-kimi passes no
 permission flags. A run home carries the source config's [permission] and
 [[hooks]] tables verbatim, with no rule added, removed or reinterpreted.
-That is all bare-kimi promises: whether kimi enforces configured permission
-rules in -p mode is unproven (a static reading of kimi 2.1.0 found no code
-loading them). Hooks are loaded. kimi drops a whole config section that
-fails its schema, with only a warning: one invalid [[hooks]] entry disables
-every hook. A source config that fails TOML parsing, or whose permission,
-hooks, thinking, model or provider settings cannot be carried verbatim, is
-refused before any effect. None of this is an OS sandbox.
+That is all bare-kimi promises, and it is not protection: in a native test
+of kimi 2.1.0 in -p mode, a valid deny rule for Bash was accepted without a
+section-drop warning but did not stop a Bash call. To contain a run, confine
+it from outside (an OS sandbox, a container, a restricted account). Hooks
+are loaded and run. kimi drops a whole config section that fails its
+schema, with only a warning: one invalid [[hooks]] entry disables every
+hook. A source config that fails TOML parsing, or whose permission, hooks,
+thinking, model or provider settings cannot be carried verbatim, is refused
+before any effect.
 
 Exit codes: the child's exit code (128+N on signal); 127 when kimi cannot
 be spawned; 2 for bare-kimi usage/setup errors; 3 when a primer run

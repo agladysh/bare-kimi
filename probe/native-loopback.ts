@@ -34,8 +34,9 @@
  *   check, with the same environment: unsandboxed, sandboxed, unsandboxed
  *   again. The unsandboxed runs are the positive controls. They must
  *   connect to both the provider port and a live decoy listener on another
- *   loopback port, write in a separate readable directory and read the decoy file. They never
- *   connect off the host and never read a real home. Sandboxed, the run must:
+ *   loopback port, write in a separate readable directory and read the
+ *   decoy file. They never connect off the host and never read a real home.
+ *   Sandboxed, the run must:
  *   - reach the provider over HTTP and over the same raw connect;
  *   - fail to connect to the decoy listener, which the controls reached
  *     just before and after, with EPERM/EACCES, or with ECONNREFUSED. The
@@ -43,8 +44,9 @@
  *     observed way of reporting a sandbox denial, never on its own;
  *   - fail to reach a never-routed address with EPERM/EACCES, or with the
  *     same code the decoy listener got;
- *   - be refused (EPERM/EACCES) a write in the separate readable directory and a read of the decoy
- *     file, which proves the read denial without touching a real home.
+ *   - be refused (EPERM/EACCES) a write in the separate readable directory
+ *     and a read of the decoy file, which shows the read denial without
+ *     touching a real home.
  *
  *   Every child must also own its own process group. If any of this is not
  *   shown, including a control that fails (a harness fault that would make
@@ -92,8 +94,9 @@
  *   path. Controls write and remove `write-check` here, so read denial
  *   cannot stand in for write isolation.
  *
- * The write-control directory is outside every denied-read path; it is also
- * retained and named in created. Direct socket isolation does not cover IPC
+ * The write-control directory is outside every denied-read path; it is
+ * retained, and named in the report and summary on success and in the
+ * failure message otherwise. Direct socket isolation does not cover IPC
  * delegation to external system services.
  *
  * The report lists the real native homes it denied by absolute path; keep it
@@ -137,8 +140,9 @@ const DRAIN_MS = 5_000;
 class Refusal extends Error {}
 
 /**
- * Directories this probe created (the temp root, then the decoy home), in
- * order, so they are named on success, refusal and failure alike.
+ * Directories this probe created (the temp root, the decoy home, then the
+ * write-control directory), in order, so they are named on success, refusal
+ * and failure alike.
  */
 const created: string[] = [];
 
@@ -519,8 +523,9 @@ function sandboxProfile(root: string, port: number, deniedReads: readonly string
  * real profile (`PROBE_MODE=sandboxed`), and unsandboxed after. Each run
  * reports, for the provider port and for a live decoy listener on another
  * loopback port, the outcome of the same raw TCP connect; whether it could
- * write a file in the decoy home (outside the root, owned by the probe); and
- * whether it could read the decoy home's file. Only the sandboxed run also
+ * write a file in the write-control directory (outside the root and every
+ * denied-read path, owned by the probe); and whether it could read the
+ * decoy home's file. Only the sandboxed run also
  * tries TEST-NET-1 (RFC 5737, never routed). An unsandboxed run never
  * connects off the host and never reads a real home. Every connect records
  * how long it took.
@@ -599,8 +604,8 @@ interface IsolationVerdict {
  * Judge the three preflight reports.
  *
  * The unsandboxed controls, before and after, must reach both loopback
- * listeners, write in a separate readable directory and read the decoy file. Otherwise the
- * harness itself is broken (a listener not accepting, a path not writable)
+ * listeners, write in the separate write-control directory and read the
+ * decoy file. Otherwise the harness itself is broken (a listener not accepting, a path not writable)
  * and no sandboxed failure can be attributed to the sandbox.
  *
  * Sandboxed, the provider must answer over HTTP and over the same raw
@@ -631,7 +636,7 @@ function judgeIsolation(before: unknown, sandboxed: unknown, after: unknown): Is
     if (control['provider'] !== true) failures.push(`${label}: provider did not answer`);
     if (connectResult(control, 'providerTcp') !== 'connected') failures.push(`${label}: provider port did not connect`);
     if (connectResult(control, 'otherLoopback') !== 'connected') failures.push(`${label}: decoy listener did not connect`);
-    if (control['write'] !== 'allowed') failures.push(`${label}: could not write in the decoy home`);
+    if (control['write'] !== 'allowed') failures.push(`${label}: could not write in the write-control directory`);
     if (control['decoyRead'] !== 'allowed') failures.push(`${label}: could not read the decoy file`);
   }
   if (!isRecord(sandboxed)) {
@@ -989,9 +994,11 @@ function findings(observations: readonly Observation[]): Record<string, Finding>
       : control.effortPaths.length > 0
         ? { status: 'sent', evidence: `"${EFFORT}" sent at ${control.effortPaths.join(', ')}` }
         : { status: 'not-seen', evidence: `"${EFFORT}" not in the control's first request` };
+  // Only the presence of sessions/ is checked: this is not a claim that the
+  // source homes were otherwise left unchanged.
   out['source-homes'] = observations.every((o) => !o.sourceSessions)
-    ? { status: 'untouched', evidence: 'no sessions written to any source home' }
-    : { status: 'written', evidence: 'sessions appeared in a source home' };
+    ? { status: 'no-sessions-observed', evidence: 'no sessions/ directory appeared in any source home' }
+    : { status: 'sessions-observed', evidence: 'a sessions/ directory appeared in a source home' };
   out['process-groups'] = observations.every((o) => !o.run.groupRemained)
     ? { status: 'ended', evidence: 'every run group was gone afterwards' }
     : { status: 'remained', evidence: 'a run group still had processes after SIGKILL' };
@@ -1102,6 +1109,7 @@ async function main(): Promise<number> {
       kimi,
       root,
       decoyHome: decoyHome.dir,
+      writeCheckDir,
       isolation: { preflight: isolation, deniedReads, providerPort: port },
       stoppedAfter,
       findings: findings(observations),
@@ -1110,7 +1118,11 @@ async function main(): Promise<number> {
     };
     writeFileSync(join(root, 'report.json'), `${JSON.stringify(report, null, 2)}\n`);
     console.log(
-      JSON.stringify({ root, decoyHome: decoyHome.dir, report: join(root, 'report.json'), findings: report.findings }, null, 2),
+      JSON.stringify(
+        { root, decoyHome: decoyHome.dir, writeCheckDir, report: join(root, 'report.json'), findings: report.findings },
+        null,
+        2,
+      ),
     );
     return report.findings['control']?.status === 'held' ? 0 : 1;
   } finally {

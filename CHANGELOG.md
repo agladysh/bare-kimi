@@ -1,22 +1,89 @@
 # Changelog
 
-## Unreleased — repair candidate
+## 0.2.0 — 16 October 2026, the first maintained release
 
-Written by Claude (an AI coding agent) after recovery, in seven rounds.
+The recovered tree on `main` (package version 0.1.0) was never released:
+no earlier Git tag or registry package was found. This is the first
+release. It is a Git release; it is not published to a package registry.
+
+### Release notes
+
+bare-kimi runs Kimi Code (`kimi -p`) against a run home of its own, using
+the operator's existing login. This release repairs the recovered source
+and changes how run homes are owned:
+
+- **Faithful configuration.** A run home's `config.toml` carries, verbatim:
+  the default model and its provider, and the source's `[thinking]`,
+  `[permission]` and `[[hooks]]` tables. A source config is checked with
+  smol-toml 1.9.1 and parsed back after assembly. Anything that cannot be
+  carried without change is refused before any effect.
+- **Explicit home ownership.** Run homes are stamped (`.bare-kimi-home`).
+  Only missing, empty or stamped directories are used. A reused home follows
+  source changes and refuses local edits to its settings.
+- **Credential custody.** Link mode shares `credentials/` and `oauth/` with
+  the source home. Copy mode stamps copies with file digests, and never
+  discards a copy that may hold the only current refresh token.
+- **Safer runs.** All refusals happen before the first effect: aliases,
+  nesting, ambient-environment mismatches, preload misuse and caller-owned
+  entries. A cleanup refusal keeps the finished run (`KimiCustodyError`,
+  CLI exit 4).
+
+**Behavior of kimi itself, observed in one probe run (installed kimi 2.1.0,
+`-p` mode, an `openai`-protocol loopback test provider with a dummy API key,
+synthetic homes, on macOS):**
+- carried `[[hooks]]` ran;
+- the carried thinking effort was sent to that provider as
+  `reasoning_effort` (the managed Kimi provider's request format was not
+  observed);
+- preloaded text reached the resumed request;
+- in every scenario the stream-json `system.version` and
+  `session.resume_hint` lines parsed (other line types were not judged);
+- each scenario left one wire journal in its run home, and no `sessions/`
+  directory appeared in its synthetic source home.
+
+A carried, schema-valid deny rule for `Bash` did **not** stop a `Bash` call.
+Carried permission rules are not protection. Confine a run from outside (see
+the README's Containment section). Invalid sections are dropped whole: a
+string rule drops all of `[permission]`, and one invalid hook drops every
+hook.
+
+**Not covered by this release's evidence:**
+- a real login: the managed Kimi Code provider, OAuth, and link-mode refresh
+  and its lock against a real account;
+- other kimi versions, other modes, and the interactive UI;
+- any consumer's adoption. Publishing this release adopts it nowhere.
+
+**Breaking against the recovered tree:**
+- a directory holding a `config.toml` is no longer taken as a run home;
+- a home kept by earlier states has no stamp and is refused (remove it);
+- `isAssembledHome` throws on an unreadable stamp;
+- the exit code 4 is new.
+
+**Authorship.** Kimi Code (an AI coding agent) wrote the original source.
+Codex (an AI agent) recovered it into Git. Claude (an AI coding agent) wrote
+the repairs and the probe, in rounds prompted by independent reviews. Codex,
+as root, applied one reviewer's prescription to the probe (the separate
+write-control directory below), ran the checks and the native probe, and
+kept the evidence. The record below keeps each round, including probe
+versions that were rejected or refused.
+
+## Change record
+
 Earlier states of this candidate, including the fifth round's library
 changes, passed their typecheck and test suite when those were run
-separately. The sixth and seventh rounds changed only the optional native
-probe and its documentation. No kimi has been launched by the probe; see
-below for what its one run showed.
+separately. Later rounds changed only the optional native probe, the
+documentation and the CLI help text; the released tree passed its typecheck
+and test suite.
 
-### Write-control correction
+### Write-control correction (applied by root)
 
 Independent reception found that a write in the read-denied decoy home could
-fail on read permission alone. The current probe uses a third owned, readable
-directory outside the root and every denied-read path for its write control.
-All three directories are retained. Earlier descriptions of two directories
-and a combined read/write decoy describe the superseded probe. Network
-isolation covers direct socket connects, not IPC delegation to external services.
+fail on read permission alone. Before the fourth probe version was run, root
+replaced that write target with a third owned, readable directory outside
+the root and every denied-read path. All three directories are retained.
+The descriptions of the second and third versions below, with two
+directories, are historical. Network isolation covers direct socket
+connections, not IPC delegation to external services.
 
 ### Native evidence
 
@@ -53,13 +120,17 @@ That happens natively too; bare-kimi carries such text as written. Earlier
 tests in this candidate used string entries while calling them
 schema-shaped; their fixtures are corrected.
 
-**Permission rules are carried, not proven enforced.** The rule state that
-the policy chain checks changes only through one method, and nothing in the
-2.1.0 bundle calls it. By static reading, configured `[permission]` rules are
-therefore inert in 2.1.0 `-p` mode, natively as well as through bare-kimi.
-Dynamic dispatch cannot be ruled out without running kimi. bare-kimi promises
-only a faithful carry, and `probe/native-loopback.ts` (below) is prepared to
-settle the question by observation. It has not run.
+**Permission rules are carried, and were observed not to be enforced.** By
+static reading, the rule state that the policy chain checks changes only
+through one method, and nothing in the 2.1.0 bundle calls it. The native
+probe then observed the same thing: in installed kimi 2.1.0 `-p` mode, a
+schema-valid deny rule for `Bash`, accepted without a section-drop warning,
+did not stop a scripted `Bash` call. Its tool result read "Command executed
+successfully." This is one case in one version and mode, matching the
+static reading. It is not a statement about other versions, modes or the
+interactive UI. bare-kimi promises only a faithful carry, and must not be
+relied on for containment. Fixing rule enforcement is kimi's concern, not
+this wrapper's.
 
 ### Fixed
 
@@ -68,9 +139,10 @@ settle the question by observation. It has not run.
   included unchanged.
 - **Permission rules and hooks were dropped.** `[permission]` (including
   `[[permission.rules]]`) and `[[hooks]]` are now carried verbatim, in source
-  order. The CLI help says what is carried and refused, and that enforcement
-  of permission rules is unproven. An earlier source comment in this
-  candidate claimed enforcement; it is corrected.
+  order. The CLI help says what is carried and refused, and that carried
+  permission rules are not protection. An earlier source comment in this
+  candidate claimed enforcement. It was corrected first to "unproven", and
+  then, after the native run, to what was observed.
 - **A `config.toml` was taken as proof of ownership.** That file name is
   common to many tools. Any directory holding one was reused as a run home:
   credentials were linked into it, its config was used or overwritten, and a
@@ -197,12 +269,13 @@ settle the question by observation. It has not run.
 ### Optional native probe (not part of the test suite)
 
 `probe/native-loopback.ts` checks native behavior without credentials or a
-provider. It has not been run.
+provider. Its third version refused in preflight. Its fourth version, with
+root's write-control correction, completed (see the end of this section).
 
 The first version was reviewed, rejected and never run. Its deny scenario
 used a string rule that 2.1.0 drops as invalid. It inferred enforcement from
 a missing canary alone. And its deadline killed only one process, so a hung
-kimi could hang it. The current version:
+kimi could hang it. The second version:
 - uses a schema-shaped rule, and observes the string form separately;
 - judges each scenario on its own evidence: the scripted call sent, a tool
   result returned, a refusal reported, and the config sections kimi said it
@@ -220,7 +293,7 @@ enforcement without evidence. Its "withheld by omission" and "enforced"
 verdicts were not gated on the control. "Enforced" matched any
 `denied|permission` text, which a shell `Permission denied` would satisfy.
 And the read denial of the real homes was declared but never shown to work.
-The current version:
+The third version:
 - gates "enforced" and "withheld by omission" on the control having held;
 - counts "enforced" only on kimi 2.1.0's exact rule refusal for this
   scenario's own rule, `Tool "Bash" was denied by permission rule. Reason:
@@ -249,24 +322,25 @@ That refusal was correct as far as it went. One hypothesis is that this
 platform reports a sandbox network denial as `ECONNREFUSED`, since an
 unroutable address refusing at once is not how a real network behaves. But
 that run had no unsandboxed comparison, so a harness fault (for example the
-decoy listener not accepting) could not be excluded. The current version
-does not simply accept `ECONNREFUSED`. It runs the same check unsandboxed
-before and after the sandboxed run, as positive controls: both loopback
-listeners must connect, and a write and a read in the decoy home must
-succeed. Sandboxed, the provider port must connect over the same raw socket
-call. Only against that contrast is `ECONNREFUSED` from the decoy listener
-taken as this platform's observed sandbox denial, and the never-routed
-address must then fail with the same code. A failing control refuses the
-run. The write check now targets the probe's own decoy home instead of an
-extra path in the temp dir. Each preflight run's raw output, and the
-verdict, are written before judging.
+decoy listener not accepting) could not be excluded. The fourth version, the
+one later run, does not simply accept `ECONNREFUSED`. It runs the same check
+unsandboxed before and after the sandboxed run, as positive controls: both
+loopback listeners must connect, a write in the separate write-control
+directory must succeed, and the decoy file must be readable. Sandboxed, the
+provider port must connect over the same raw socket call. Only against that
+contrast is `ECONNREFUSED` from the decoy listener taken as this platform's
+observed sandbox denial, and the never-routed address must then fail with
+the same code. A failing control refuses the run. Each preflight run's raw
+output, and the verdict, are written before judging. (As first drafted, this
+version wrote in the decoy home; see the write-control correction above.)
 
 In more detail:
 - **Isolation:** macOS only, from an unsandboxed shell. The probe runs
   bare-kimi and kimi under `sandbox-exec`:
   - outbound network only to the provider's own loopback port;
   - file writes only under its temp root;
-  - reads of the real native homes, and of a synthetic decoy home, denied.
+  - reads of the real native homes, and of a synthetic decoy home, denied
+    (the denial was shown on the decoy, not tested on the real paths).
 
   A preflight compares unsandboxed controls (before and after) with the
   sandboxed run. It must show:
@@ -274,15 +348,15 @@ In more detail:
   - a live decoy listener reached by the controls but refused in the
     sandbox;
   - a never-routed address refused in the same way;
-  - a write and a read in the decoy home allowed unsandboxed and refused in
-    the sandbox;
+  - a write in the write-control directory and a read of the decoy file
+    allowed unsandboxed and refused in the sandbox;
   - an owned process group.
 
   Otherwise the probe refuses before kimi is launched.
-- **Custody:** two directories are created in the system temp dir and left
-  for inspection: the temp root (runs, raw output, report) and the decoy
-  home (one non-secret file). The report lists the real homes it denied by
-  absolute path, so it must stay private.
+- **Custody:** three directories are created in the system temp dir and
+  left for inspection: the temp root (runs, raw output, report), the decoy
+  home (one non-secret file), and the write-control directory. The report
+  lists the real homes it denied by absolute path, so it must stay private.
 - **Setup:** a synthetic `openai`-type provider points at a loopback server
   that scripts a `Bash` tool call and records, per scenario, whether it sent
   it. It uses a temporary HOME, cwd and source home and a dummy API key,
@@ -296,6 +370,40 @@ In more detail:
 
   Each scenario also records the thinking effort as sent, the stream-json
   meta lines and the wire journals.
+
+The fourth version completed once, with exit 0, from an unsandboxed shell
+against installed kimi 2.1.0. Its preflight showed:
+- **Controls (before and after):** both loopback listeners connected, and
+  the write and the decoy read succeeded.
+- **Sandboxed:**
+  - the provider connected over HTTP and over raw TCP;
+  - the other listener and the never-routed address failed with
+    `ECONNREFUSED`, accepted on the contrast basis;
+  - the write and the decoy read failed with `EPERM`.
+
+Then all five scenarios finished with exit 0, each with version 2.1.0, a
+session id and one wire journal. No synthetic source home gained
+`sessions/`, every process group the probe owned was gone afterwards (kimi
+starts tool commands in their own groups, so descendants are not proven
+gone), and no request was unattributed.
+Findings:
+- **control:** held. The scripted call ran, and the `PreToolUse` hook fired;
+- **deny:** not enforced. No section was dropped, the call ran, and the
+  canary was created;
+- **deny-string:** the whole `[permission]` section was dropped;
+- **invalid-hook:** the whole hooks section was dropped, and the valid hook
+  did not fire though the tool ran;
+- **preload:** the marker was absent from the primer request and present in
+  the resumed request;
+- **thinking:** `"high"` was sent at `$.reasoning_effort`.
+
+The named executable was the package's `bin/kimi` link. Its real path is the
+package's `dist/main.mjs`, the same file with the same digest, not a second
+binary. Two metadata fixes followed this run without changing what it
+observed:
+- the success report and summary now name the write-control directory;
+- the source-homes finding now reads `no-sessions-observed`, because only
+  the absence of `sessions/` was checked.
 
 ### Tests
 
@@ -333,8 +441,15 @@ In more detail:
 
 - Other root-table settings of the source `config.toml` are not carried.
   Which of them matter to a headless run has not been established.
-- Whether kimi 2.1.0 enforces configured permission rules is unproven; see
-  above. Carried hooks do run.
+- Carried permission rules are not protection. In installed kimi 2.1.0
+  `-p` mode, a valid deny rule was observed not to be enforced. Carried hooks
+  do run. Containment must come from outside the process.
+- No real login has been exercised: the managed provider, OAuth, and
+  link-mode refresh and its shared lock against a real account.
+- The native probe did not exercise copy mode or temporary run homes (it
+  used kept homes), did not compare a real home before and after, did not
+  test the read denial on real home paths, and proves only that its own
+  process groups ended, not every descendant.
 - Checks and effects are not atomic against a concurrent writer to the same
   homes.
 - A copy and its source refreshed independently cannot both be kept current.
