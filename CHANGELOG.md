@@ -21,10 +21,9 @@ it. The 0.2.0 entry below was edited after the tag in these places:
   tag, so readers of the tag do not see it. 0.2.1 carries the qualification
   and marks it in the 0.2.0 entry as added after the tag. 0.2.1 also corrects
   a known-limits line that still said the probe proved its groups ended, and
-  two probe descriptions that relied on the same check. Nobody has yet
-  rechecked the groups with a typed check or replayed the probe. Kimi starts
-  tool commands in their own groups, so it is also unverified that every
-  descendant process was cleaned up.
+  two probe descriptions that relied on the same check. No typed recheck
+  or replay of the probe is recorded for this release. The inventory also
+  cannot establish cleanup of descendants outside the groups it checked.
 - **Wording.** Passages that called the release "this candidate" now name
   0.2.0 or the states before its release.
 
@@ -431,8 +430,8 @@ session id and one wire journal. No synthetic source home gained
 was unattributed. **Qualification, 16 October 2026 (UTC+00:00), added after
 the `v0.2.0` tag:** that group
 check maps every inspection error to absence; it did not establish emptiness.
-A typed recheck and replay remain owed. Kimi starts tool commands in their
-own groups, which leaves complete descendant cleanup unverified.
+A typed recheck and replay remain owed. The inventory cannot establish
+cleanup of descendants outside the groups it checked.
 Findings:
 - **control:** held. The scripted call ran, and the `PreToolUse` hook fired;
 - **deny:** not enforced. No section was dropped, the call ran, and the
