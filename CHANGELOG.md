@@ -6,8 +6,10 @@
 to the model and effort they were created with, upgrades homes kept by 0.2,
 and adopts homes kept before 0.2 on request. It also refuses the known kimi
 arguments and environment variables that would quietly replace the model,
-effort or session that bare-kimi arranged. Other arguments passed to kimi,
-such as `--agent` with an agent profile, are still not checked. Some of these changes break existing uses (see *Breaking
+effort, session, output format or prompt that bare-kimi arranged. Other
+arguments passed to kimi are still not checked, and a forwarded subcommand
+name or help or version flag can still keep the prompt from running (see
+the README). Some of these changes break existing uses (see *Breaking
 changes* below). Like earlier releases, this is a Git release and is not
 published to a package registry. Publishing it does not mean any project has
 adopted it. The README explains the behaviour in full.
@@ -29,8 +31,16 @@ adopted it. The README explains the behaviour in full.
   effort, stays on them when the source's `default_model` changes, and
   refuses another model or effort before any effect. kimi binds each session
   to the alias and effort it was created with and looks the alias up again
-  on resume, unless `--model` on the resume names another alias. A source that no longer configures the pinned alias makes the
-  home refused, not switched.
+  on resume, unless `--model` on the resume names another alias. A source
+  that no longer configures the pinned alias makes the home refused, not
+  switched.
+- **A withdrawn pinned effort.** When the source's table for a kept home's
+  model stops accepting the pinned effort, for example after a login
+  rewrote a managed model's `support_efforts`, the home refuses new sessions
+  and `continueRecent`. A resume by id still runs, keeping the pin and its
+  `[thinking]` while the model's and provider's tables follow the source. The
+  effort is then reported as `withdrawn`. Whether kimi keeps the resumed
+  session's stored effort in that case has not been observed.
 - **Routing report.** Every CLI run prints one `bare-kimi: routed to model`
   line on stderr. The line names the alias and its origin, the provider type
   and model id, and the pinned or configured effort with its support. In the
@@ -60,16 +70,24 @@ adopted it. The README explains the behaviour in full.
   stamp 0.3 has rewritten, because they read only version-1 stamps (checked
   on one synthetic home; see *Evidence*). A home that must still run under
   0.2 has to stay away from 0.3.
-- **Model and session arguments in `extraArgs`** (CLI `--kimi-arg`) are
-  refused, in every spelling that kimi 2.1.0's parser accepts: `-m`,
-  `--model`, `-S`, `--session`, `-r`, `--resume`, `-c`, `--continue` and
-  `-C`. `model`, `resume` and `continueRecent` replace them.
+- **Arguments in `extraArgs`** (CLI `--kimi-arg`) that would take over what
+  bare-kimi passes or arranges are refused, in every spelling that kimi
+  2.1.0's parser accepts: the model and session flags `-m`, `--model`,
+  `-S`, `--session`, `-r`, `--resume`, `-c`, `--continue` and `-C`; the
+  output-format and prompt flags `--output-format`, `-p` and `--prompt`;
+  `--`; and a last argument that is a flag still waiting for its value
+  (`--add-dir`, `--skills-dir`, `--agent` or `--agent-file`). `model`,
+  `resume`, `continueRecent`, `outputFormat` and `prompt` replace them.
+- **Text runs pass `--output-format text`.** bare-kimi now passes
+  `--output-format` on every run, so the child's argv changes for text
+  runs. As a result, `KIMI_MODEL_OUTPUT_FORMAT` set through `extraEnv` or the
+  spawn env no longer has any effect; `outputFormat` sets the format.
 - **Env-model variables** (any `KIMI_MODEL_*` except
-  `KIMI_MODEL_THINKING_EFFORT` and `KIMI_MODEL_THINKING_KEEP`) in `extraEnv`
-  or the spawn env are refused beside `model` or `effort`, on a
-  caller-supplied home, and in a preloaded run. Only an ephemeral launch
-  without `model` and `effort` takes them, and its `modelOverlay` names the
-  variable.
+  `KIMI_MODEL_THINKING_EFFORT`, `KIMI_MODEL_THINKING_KEEP` and
+  `KIMI_MODEL_OUTPUT_FORMAT`) in `extraEnv` or the spawn env are refused
+  beside `model` or `effort`, on a caller-supplied home, and in a preloaded
+  run. Only an ephemeral launch without `model` and `effort` takes them, and
+  its `modelOverlay` names the variable.
 - **`KIMI_MODEL_THINKING_EFFORT`** is refused beside `effort` and on a home
   pinned to an effort, because it would override every request, resumed
   sessions included.
@@ -102,9 +120,12 @@ adopted it. The README explains the behaviour in full.
 - `LaunchOptions`: `effort` and `adoptLegacyHome`. `model` now selects the
   alias the home carries.
 - `AssembledHome` reports the pinned effort (`effort`), its `effortSupport`
-  (`declared` or `undeclared`), the `configuredEffort` for new sessions, the
-  `action` (`create`, `reuse` or `adopt`), `adopted`, and `migrated` for an
-  upgraded 0.2 home.
+  (`declared`, `undeclared` or `withdrawn`), the source's refusal of a
+  withdrawn effort (`effortWithdrawn`), the `configuredEffort` for new
+  sessions, the `action` (`create`, `reuse` or `adopt`), `adopted`, and
+  `migrated` for an upgraded 0.2 home.
+- `RunHomeOptions.resumingSession`, which prepares a kept home with a
+  withdrawn pinned effort for a resume by id.
 - `KimiSubprocess.modelOverlay`, `KimiRun.assembled`.
 - New exports: `ADOPTION_RECORD`, `isModelOverlayVar`, `previewRunHome`,
   `runSourceHome`, and the types `EffortSupport`, `Migration`,
@@ -114,44 +135,52 @@ adopted it. The README explains the behaviour in full.
 
 ### Evidence
 
-The evidence below was taken on the 0.3 code at commit `a96c613`, before the
-package version was set to 0.3.0. Only documentation and the version number
-changed after it. No run is recorded against a `v0.3.0` tag.
+Each item names the code it was taken on. The runtime changed after commit
+`a96c613`, up to `6cc4e5e`. No run is recorded against a `v0.3.0` tag.
 
-- That tree passed its typecheck and test suite.
-- Homes kept by the published 0.2.0 code were upgraded by that code from
-  synthetic sources, with no kimi child or provider involved. The 0.2.0 code
-  was imported byte-identical to the tag's `src/home.ts`. Three cases were
-  run: an unchanged `config.toml` (basis `config`); `config.toml` removed,
-  with a session directory present and the source's default changed (basis
-  `digest`); and a CRLF source with comments, `[thinking]`, permission rules
-  and hooks (basis `config`). In each case the stamp's settings digest and
+- At `6cc4e5e`, the typecheck and the test suite (277 tests) passed. The
+  tests run against a fake `kimi` child, which does not model kimi's
+  precedence of `--output-format` over `KIMI_MODEL_OUTPUT_FORMAT`.
+- The changes after `a96c613` (the resume of a home whose pinned effort was
+  withdrawn, the added argument refusals, and `--output-format` on text
+  runs) were not run with an installed kimi or against the managed
+  provider. The argument refusals rest on reading kimi 2.1.0's argument
+  parser in the installed bundle.
+- At `a96c613`, homes kept by the published 0.2.0 code were upgraded by the
+  0.3 code from synthetic sources, with no kimi child or provider involved.
+  The 0.2.0 code was imported byte-identical to the tag's `src/home.ts`.
+  Three cases were run: an unchanged `config.toml` (basis `config`);
+  `config.toml` removed, with a session directory present and the source's
+  default changed (basis `digest`); and a CRLF source with comments,
+  `[thinking]`, permission rules and hooks (basis `config`). In each case the stamp's settings digest and
   the `config.toml` bytes held, and the basis survived a later reuse.
 - The same 0.2.0 code, which 0.2.1 left unchanged, was then run on the
   upgraded home from the first case. It refused the version-2 stamp as not
   one it wrote, and the stamp and `config.toml` stayed unchanged. As a
   control, it created and reused a version-1 home from the same source.
-- Loopback runs of installed kimi 2.1.0 in `-p` mode supplied the
-  observations on which the effort refusals, the resume behaviour and the
-  environment refusals rest. The argument refusals rest on a reading of the
-  installed 2.1.0 bundle's argument parser. The README summarizes the
-  observations, and `checkEffort` in `src/home.ts` states the basis of each
-  effort refusal.
-- Three real calls ran against the managed Kimi Code provider, on an
-  existing login in link mode, with installed kimi 2.1.0: kept homes created
-  at `low` and at `high` on the source's default managed alias, and a resume
-  of the first home without `--model` or `--effort`. All exited 0. kimi's
-  session binding and request metadata named the alias and the selected
-  effort, the resumed turn's metadata still named `low`, and the kept home's
-  `config.toml` did not change across the resume.
+- Loopback runs of installed kimi 2.1.0 in `-p` mode, made with the
+  optional probes, supplied the observations on which the effort refusals,
+  the resume behaviour and the environment refusals rest. The README
+  summarizes them, and `checkEffort` in `src/home.ts` states the basis of
+  each effort refusal.
+- At `a96c613`, three real calls ran against the managed Kimi Code
+  provider, on an existing login in link mode, with installed kimi 2.1.0:
+  kept homes created at `low` and at `high` on the source's default managed
+  alias, and a resume of the first home without `--model` or `--effort`.
+  All exited 0. kimi's session binding and request metadata named the alias
+  and the selected effort, the resumed turn's metadata still named `low`,
+  and the kept home's `config.toml` did not change across the resume.
 
 **Not covered by this release's evidence:** whether the provider applies the
 effort that kimi sends; a token refresh against a real account, a forced
 refresh, or a refresh race under the shared lock; other kimi versions,
 modes and output formats, the interactive UI, subagents and hidden flags;
 provider types other than `kimi` and `openai`, and models that set
-`protocol`; any consumer's adoption. The known limits of 0.2.0 still apply,
-except that ordinary calls on a real managed login have now been made.
+`protocol`; what kimi does on resuming a session whose stored effort the
+model's table no longer lists; any run of the changes after `a96c613` with
+an installed kimi; any consumer's adoption. The known limits of 0.2.0 still
+apply, except that ordinary calls on a real managed login have now been
+made.
 
 ## 0.2.1 — 16 October 2026, documentation only
 

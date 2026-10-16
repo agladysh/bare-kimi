@@ -7,12 +7,12 @@ shared. bare-kimi selects the model alias and thinking effort that a run home
 carries, and keeps a kept home on that model and effort. Before it changes
 anything, it refuses selections that kimi was observed not to honour, and
 the known kimi arguments and environment variables that would quietly
-replace the model, effort or session it arranged. Some refusals are stated
-policy where kimi's behaviour was not observed. Other arguments passed
-through to kimi are not checked; whether an agent profile chosen with
-`--agent` selects a model of its own, for example, has not been established.
-It is a Bun library first. The CLI (`bin/bare-kimi.ts`) is its worked
-example.
+replace the model, effort, session, output format or prompt it arranged.
+Some refusals are stated policy where kimi's behaviour was not observed.
+Other arguments passed through to kimi are not checked;
+[Arguments passed to kimi](#arguments-passed-to-kimi) lists what is refused
+and what a forwarded argument can still do. It is a Bun library first. The
+CLI (`bin/bare-kimi.ts`) is its worked example.
 
 **Status: 0.3.0, early (pre-1.0).** Each release is a Git tag of this
 repository. Nothing is published to a package registry. 0.3.0 adds model and
@@ -97,8 +97,11 @@ The line gives the model alias and where it came from, the provider type and
 model id, and either the pinned effort with its origin and support or the
 effort that `config.toml` gives new sessions. On a resume it also says that
 the session keeps its stored effort, and either keeps its stored alias or,
-when `--model` is given, runs on the alias that `--model` names. It names no
-path, URL or credential. `--help` lists every option and exit code.
+when `--model` is given, runs on the alias that `--model` names. For a
+pinned effort that the source no longer accepts, the line reports the effort
+as withdrawn and says that whether the resumed session keeps it is unknown
+(see [Fresh, kept and resumed runs](#fresh-kept-and-resumed-runs)). It names
+no path, URL or credential. `--help` lists every option and exit code.
 
 The library takes the same choices:
 
@@ -188,15 +191,16 @@ model that lists no `support_efforts`, is taken and reported as
 notice for it. bare-kimi does not take missing information for missing
 support.
 
-**Managed models.** For a model of the managed Kimi Code provider, kimi
-itself writes the model's table, including any `support_efforts`, from the
-provider's model catalog: at login and in the interactive UI's refresh, and
-only when the catalog lists efforts. kimi `-p` does not refresh the catalog,
-and neither does bare-kimi. bare-kimi judges the table as the source
-`config.toml` holds it and adds no declarations of its own. If a managed
-model's table lists no efforts, an effort other than `off` is refused. The
-run can then go ahead without an effort, or kimi's own refresh can update
-the table. Writing `support_efforts` into a managed model's table by hand
+**Managed models.** As read from the installed kimi 2.1.0 bundle, not
+observed: for a model of the managed Kimi Code provider, kimi itself writes
+the model's table, including any `support_efforts`, from the provider's
+model catalog, at login and in the interactive UI's and the server's
+refreshes, and only when the catalog lists efforts; no `-p` path refreshes
+the catalog. bare-kimi does not refresh it either. bare-kimi judges the
+table as the source `config.toml` holds it and adds no declarations of its
+own. If a managed model's table lists no efforts, an effort other than
+`off` is refused. The run can then go ahead without an effort, or kimi's
+own refresh can update the table. Writing `support_efforts` into a managed model's table by hand
 would declare support that the provider never stated, and kimi's next
 refresh may replace it.
 
@@ -204,15 +208,14 @@ refresh may replace it.
 
 When kimi creates a session, it stores the session's model alias and effort
 with it. In the ordinary case a resume runs on both: kimi 2.1.0 was observed
-to keep the stored effort whatever `config.toml` says later, and to look the
-stored alias up in `config.toml` again rather than follow a changed
-`default_model` (the scope of these observations is under
+to keep the stored effort whatever the `[thinking]` of `config.toml` says
+later, and to look the stored alias up in `config.toml` again rather than
+follow a changed `default_model` (the scope of these observations is under
 [What has been observed](#what-has-been-observed)). Two inputs override that
-case. A `--model` given on the
-resume switches the session to the alias it names, and a forced effort in
-the environment overrides the stored effort. bare-kimi arranges its run
-homes around this native behaviour and controls when either override can
-reach kimi.
+case. A `--model` given on the resume switches the session to the alias it
+names, and a forced effort in the environment overrides the stored effort.
+bare-kimi arranges its run homes around this native behaviour and controls
+when either override can reach kimi.
 
 - **Fresh runs.** Without `home`, every run gets a new temporary home and a
   new session on the selected or default model and effort. The home is
@@ -233,12 +236,29 @@ reach kimi.
   refuses a resume from another one. The session keeps the effort it
   stored, unless a forced effort reaches kimi (see below). bare-kimi passes
   `--model` only when `model` is given, and on a kept home only the pinned
-  alias, so a session created on the pin stays on it. On a loopback provider, kimi 2.1.0 was observed to switch a resumed
-  session to whatever alias `--model` named. A session created in a 0.2 or
-  adopted home under an earlier alias is therefore switched to the pin when
-  `model` is given. Without `model`, kimi looks up the session's own alias in
-  `config.toml`. That file carries only the pin, so kimi cannot resume such a
-  session.
+  alias, so a session created on the pin stays on it. On a loopback
+  provider, kimi 2.1.0 was observed to switch a resumed session to whatever
+  alias `--model` named. A session created in a 0.2 or adopted home under an
+  earlier alias is therefore switched to the pin when `model` is given.
+  Without `model`, kimi looks up the session's own alias in `config.toml`.
+  That file carries only the pin, so kimi cannot resume such a session.
+- **A pinned effort that the source stops accepting.** A login can rewrite a
+  managed model's table from the provider's catalog, and the new
+  `support_efforts` may no longer list the effort a kept home is pinned to.
+  Such a home then refuses every launch that could create a session,
+  `continueRecent` (`--continue`) included, because kimi starts a fresh
+  session when the working directory has none to continue. A resume by id
+  (`resume`, CLI `--resume`) still runs: as read from the 2.1.0 bundle, kimi
+  fails rather than create a session for an unknown id. That resume keeps
+  the pinned alias, the pinned effort and its `[thinking]` in the home's
+  `config.toml`, while the model's and provider's tables follow the source,
+  as on any reuse. `assembled.effortSupport` is then `withdrawn`, and
+  `assembled.effortWithdrawn` gives the reason the source now refuses the
+  effort. Whether kimi keeps the resumed session's stored effort against the
+  changed table, or normalizes it again, has not been observed, and neither
+  has `--model` on such a resume. A refusal leaves the home's `config.toml`
+  and stamp unchanged. Once the source lists the effort again, the home takes
+  new sessions and reports the effort as `declared`.
 - **Preload.** `--preload` and `runPreloaded` start a fresh session in a
   primer run, append the preloaded files to its journal, and resume it with
   the call to action. Both runs use the same home, so they share its model
@@ -289,7 +309,8 @@ home must keep that home away from 0.3.
 Other changes that can break a 0.2 consumer are listed in
 [CHANGELOG.md](CHANGELOG.md): the model pin itself, arguments refused in
 `extraArgs`, environment variables refused in `extraEnv`, newly scrubbed
-variables, and the routing line on stderr.
+variables, the `--output-format` flag now passed on text runs, and the
+routing line on stderr.
 
 ## Adopting a home kept before 0.2
 
@@ -337,7 +358,8 @@ The child inherits the parent environment, unless `noProcessEnv`
   would move the managed provider's endpoints and with them the credential
   slot;
 - `KIMI_DISABLE_OAUTH_LOCK`, which would opt out of the shared refresh lock;
-- every `KIMI_MODEL_*` variable, including the thinking-effort overrides;
+- every `KIMI_MODEL_*` variable, including the thinking-effort overrides
+  and `KIMI_MODEL_OUTPUT_FORMAT`;
 - every `KIMI_SECONDARY_*` variable, the secondary (subagent) model and
   effort overrides;
 - any `KIMI_CODE_HOME`.
@@ -361,14 +383,20 @@ the `env` of Bun's spawn options, can, with these limits:
 - **`KIMI_MODEL_THINKING_KEEP`** is taken on any launch. In kimi 2.1.0 it
   did not switch the model, and on a `kimi`-type provider it reached the
   request as `thinking.keep`.
+- **`KIMI_MODEL_OUTPUT_FORMAT`** is taken on any launch and has no effect.
+  bare-kimi always passes `--output-format`, and kimi, as read from the 2.1.0
+  bundle, reads the variable only when that flag is absent.
 - **Any other `KIMI_MODEL_*` variable** can feed kimi's env-model overlay,
   which replaces the configured model with an environment-defined one. A
   non-blank `KIMI_MODEL_NAME`, with a base URL and key, was observed to switch
-  a new session to that model and to send no configured effort. Such
-  variables are taken only by an ephemeral launch without `model` and
-  `effort`, and never by preload. That launch's `modelOverlay` names the
-  variable, and `assembled` then does not establish which model kimi runs.
-  Every other use is refused before any effect.
+  a new session to that model and to send no configured effort. As read from
+  the 2.1.0 bundle, both readers of the overlay require a non-blank
+  `KIMI_MODEL_NAME`, so the other variables matter only beside it. bare-kimi
+  nevertheless treats each of them, blank or not, as an env-model variable,
+  as policy. Such variables are taken only by an ephemeral launch without
+  `model` and `effort`, and never by preload. That launch's `modelOverlay`
+  names the variable, and `assembled` then does not establish which model
+  kimi runs. Every other use is refused before any effect.
 - **`KIMI_SECONDARY_MODEL` and `KIMI_SECONDARY_EFFORT`** can be set again on
   purpose. Their effect in `-p` without a `[secondary_model]` table has not
   been established beyond one tool-free turn, in which they changed nothing
@@ -377,20 +405,54 @@ the `env` of Bun's spawn options, can, with these limits:
 ## Arguments passed to kimi
 
 `extraArgs` (CLI `--kimi-arg`, repeatable) are passed to kimi verbatim,
-before `-p`. Arguments that kimi 2.1.0's parser reads as selecting a model or
-a session are refused: `-m`, `--model`, `-S`, `--session`, `-r`, `--resume`,
-`-c`, `--continue` and `-C`, in every spelling that parser accepts, such as
-`--model=X`, `-mX` or a cluster like `-yc`. A model belongs in `model`, so
-that the run home carries it. A session belongs in `resume` or
-`continueRecent`, so that their exclusivity and preload's fresh session
-hold. An argument meant as the value of the one before it is read the same
-way, so a value that looks like one of these flags is refused too. Other
-arguments are not checked. bare-kimi does not check whether they conflict
-with its own `-p` and `--output-format`, or whether an agent profile chosen
-through `--agent` selects a model.
+after bare-kimi's own flags and just before its `-p`. bare-kimi always
+passes `--output-format`, for `text` too, and passes the prompt last, with
+`-p`. As read from kimi 2.1.0's argument parser, a repeated flag keeps its
+last value; a flag that requires a value takes the next argument as that
+value, whatever it looks like; a cluster of short flags that take no value
+is read flag by flag, and an unknown option is rejected; and `--` ends
+option parsing. bare-kimi's checks follow from those rules. It refuses, in
+every spelling that parser accepts, such as `--model=X`, `-mX` or a cluster
+like `-yc` or `-yp`:
 
-The prompt, and the preload primer, may not start with `-`, because kimi
-could read it as a flag.
+- a model or session selection: `-m`, `--model`, `-S`, `--session`, `-r`,
+  `--resume`, `-c`, `--continue` and `-C`. A model belongs in `model`, so
+  that the run home carries it. A session belongs in `resume` or
+  `continueRecent`, so that their exclusivity and preload's fresh session
+  hold;
+- `--output-format`, `-p` and `--prompt`, which bare-kimi passes itself. A
+  forwarded output format would replace the one that `runKimi` parses, and
+  bare-kimi's own trailing `-p` would silently replace a forwarded prompt.
+  The output format belongs in `outputFormat`;
+- `--`, after which kimi would read no flag, bare-kimi's `-p` included;
+- a last argument that is a flag still waiting for its value: `--add-dir`,
+  `--skills-dir`, `--agent` or `--agent-file`. kimi would take bare-kimi's
+  `-p` as that value.
+
+An argument meant as the value of the one before it is checked the same
+way, so a value that looks like a refused flag is refused too. Otherwise a
+flag that takes a value takes the forwarded argument after it, and that
+pairing is the caller's.
+
+Other arguments are not checked. Two kinds can still keep the prompt from
+running, and bare-kimi does not refuse them:
+
+- a bare word that names a kimi subcommand, such as `login` or `server`,
+  dispatches that subcommand, and every argument after it, bare-kimi's `-p`
+  and the prompt included, goes to the subcommand. Most subcommands reject
+  `-p`, and kimi exits non-zero before doing anything. The deprecated
+  `server` and `server kill` accept unknown options and run;
+- `-h`, `--help`, `-V` or `--version` makes kimi print and exit 0 without
+  running the prompt. `runKimi` then reports exit code 0 and no session.
+
+`--agent` and `--agent-file` are passed through. As read from the 2.1.0
+bundle, an agent file has no model field, so it cannot select a model, and
+kimi refuses either flag beside `--session` or `--continue`. A forwarded
+agent on a resumed run therefore fails in kimi, not in bare-kimi's checks.
+
+bare-kimi refuses a prompt, and a preload primer, that starts with `-`. This
+refusal is conservative policy, not a requirement of kimi: kimi's parser
+takes the argument after `-p` as its value, whatever it looks like.
 
 ## What a run touches
 
@@ -467,7 +529,7 @@ probes observed:
 - on a `kimi`-type provider, kimi sent a listed effort, replaced an unlisted
   one with a listed one, sent no level for a model that lists no
   `support_efforts`, and sent a disabled thinking type for `off`;
-- a session kept its stored effort over a later `config.toml` on both
+- a session kept its stored effort over a later `[thinking]` on both
   provider types, and its stored alias over a changed `default_model` on the
   `openai` type. `--model` on a resume switched the request to the named
   alias;
@@ -476,9 +538,21 @@ probes observed:
   [Environment](#environment);
 - a schema-valid deny rule did not stop a tool call, and carried hooks fired.
 
-**Upgrading and downgrading 0.2 homes.** The 0.3 code at commit `a96c613`,
-before its package version was set to 0.3.0, upgraded homes made by the
-published 0.2.0 `src/home.ts`, which 0.2.1 left unchanged. The homes and
+**Which code each observation covers.** The upgrade, downgrade and
+managed-login observations below were made on the 0.3 code at commit
+`a96c613`. The runtime changed after that commit, up to `6cc4e5e`: that
+change added the resume of a home whose pinned effort was withdrawn, the
+refusal of forwarded output-format, prompt, `--` and trailing value-flag
+arguments, and the `--output-format` flag on text runs. The typecheck and
+the test suite passed at `6cc4e5e`, against a fake `kimi` child. The changes
+since `a96c613` were not run with an installed kimi or against the managed
+provider. The new argument refusals rest on reading kimi 2.1.0's argument
+parser, and the fake child does not model kimi's precedence of
+`--output-format` over `KIMI_MODEL_OUTPUT_FORMAT`.
+
+**Upgrading and downgrading 0.2 homes.** The 0.3 code at commit `a96c613`
+upgraded homes made by the published 0.2.0 `src/home.ts`, which 0.2.1 left
+unchanged. The homes and
 sources were synthetic, and no kimi child or provider was involved. Three
 cases were run: an unchanged `config.toml` (basis `config`); `config.toml`
 removed, with a session directory present and the source's default changed
@@ -493,7 +567,8 @@ a version-1 home from the same source.
 **A real managed login.** The 0.3 code at the same commit was also run
 against the managed Kimi Code provider, on an existing login in link mode,
 with installed kimi 2.1.0. The model was the source's default managed
-alias, of the `kimi` type, whose table listed both `low` and `high`. Three calls were made. One kept
+alias, of the `kimi` type, whose table listed both `low` and `high`. Three
+calls were made. One kept
 home was created with `--model` naming that alias and `--effort low`, and
 another with `--effort high`. Each answered its prompt and exited 0. The
 first home's session was then resumed without `--model` or `--effort`. It
@@ -513,6 +588,9 @@ not change across the resume.
   subagents and hidden flags;
 - provider types other than `kimi` and `openai`, and models that set
   `protocol`;
+- what kimi does on resuming a session whose stored effort the model's
+  table no longer lists, with or without `--model`;
+- any run of the changes since `a96c613` with an installed kimi;
 - whether any consumer has adopted 0.3.0.
 
 A nested bare-kimi, started from a hook or tool inside a run, donates from
