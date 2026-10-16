@@ -74,7 +74,11 @@ Model and effort:
                         never the source's other models or providers. A
                         kept --home is pinned to its model: it stays on it
                         when the source's default changes, and refuses
-                        another, since its sessions are bound to it.
+                        another, since kimi binds each session to the
+                        alias it was created with. A home kept by 0.2 or
+                        adopted is pinned to the alias its config.toml
+                        named then; sessions it created under an earlier
+                        alias are not covered.
   --effort EFFORT       Thinking effort for sessions the run home creates:
                         one of the model's support_efforts, or off. Written
                         into the run home's [thinking] and pinned like the
@@ -127,11 +131,14 @@ fully bare run use a cwd with no AGENTS.md up its git root.
 Environment: the child inherits this environment (unless --no-process-env)
 minus KIMI_CODE_BASE_URL, KIMI_CODE_OAUTH_HOST, KIMI_OAUTH_HOST,
 KIMI_DISABLE_OAUTH_LOCK, every KIMI_MODEL_* variable (including the
-thinking-effort overrides; use --effort) and any KIMI_CODE_HOME. bare-kimi
+thinking-effort overrides; use --effort), every KIMI_SECONDARY_* variable
+(subagent model and effort overrides) and any KIMI_CODE_HOME. bare-kimi
 then sets KIMI_CODE_HOME to the run home and KIMI_CODE_HOME_SOURCE to the
 source home, and KIMI_DISABLE_TELEMETRY=1 and KIMI_CODE_NO_AUTO_UPDATE=1
 unless already set. A dropped variable cannot be restored from the CLI (the
-library's extraEnv can, except KIMI_CODE_HOME).
+library's extraEnv can, except KIMI_CODE_HOME, and a KIMI_MODEL_* variable
+that may switch kimi to its env model only on an ephemeral run without a
+model).
 
 Permissions: -p forces kimi's native auto permission mode; -y/--yolo,
 --auto and --plan conflict with -p and cannot be used. bare-kimi passes no

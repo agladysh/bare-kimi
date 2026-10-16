@@ -10,6 +10,7 @@ import {
   buildArgv,
   buildEnv,
   checkLaunchOptions,
+  isModelOverlayVar,
   isScrubbedEnvVar,
   prepareRunHome,
   runKimi,
@@ -124,6 +125,8 @@ describe('isScrubbedEnvVar', () => {
       'KIMI_DISABLE_OAUTH_LOCK',
       'KIMI_MODEL_NAME',
       'KIMI_MODEL_TEMPERATURE',
+      'KIMI_SECONDARY_MODEL',
+      'KIMI_SECONDARY_EFFORT',
     ]) {
       expect(isScrubbedEnvVar(name)).toBe(true);
     }
@@ -486,8 +489,10 @@ describe('model and effort through the fake child', () => {
     expect(readFileSync(join(home, 'config.toml'), 'utf-8')).toBe(config);
     expect(readFileSync(join(home, HOME_STAMP), 'utf-8')).toBe(stamp);
 
-    // Controls: without the variable, or with an empty one (kimi reads it as
-    // unset), the pinned effort is the one every request uses.
+    // Controls: without the variable, or with a blank one (taken as unset, as
+    // kimi's env-model overlay reads its variables; that kimi's binding of
+    // this one does too is not established), the pinned effort is the one
+    // every request uses.
     const plain = await runKimi({ ...options, extraEnv: { FAKE_KIMI_SESSION_OUT: out } });
     const empty = await runKimi({ ...options, extraEnv: { KIMI_MODEL_THINKING_EFFORT: ' ', FAKE_KIMI_SESSION_OUT: out } });
     expect([plain.code, empty.code]).toEqual([0, 0]);
@@ -562,6 +567,121 @@ describe('model and effort through the fake child', () => {
       storedEffort: 'medium',
       effectiveEffort: 'max',
     });
+  });
+});
+
+describe('env-model overlay variables', () => {
+  test('every KIMI_MODEL_* counts except the forced effort; the secondary overrides are only scrubbed', () => {
+    for (const name of ['KIMI_MODEL_NAME', 'KIMI_MODEL_PROVIDER_TYPE', 'KIMI_MODEL_THINKING_KEEP']) {
+      expect(isModelOverlayVar(name)).toBe(true);
+    }
+    for (const name of ['KIMI_MODEL_THINKING_EFFORT', 'KIMI_SECONDARY_MODEL', 'KIMI_CODE_BASE_URL']) {
+      expect(isModelOverlayVar(name)).toBe(false);
+    }
+  });
+
+  test('refused on a kept home, from extraEnv (even empty) or the spawn env, before any effect on it', async () => {
+    const root = temp('bare-kimi-sdk-');
+    const src = makeSourceHome(root);
+    const home = join(root, 'run-home');
+    const missing = join(root, 'missing-home');
+    const out = join(root, 'sessions.ndjson');
+    prepareRunHome(src, home);
+    const config = readFileSync(join(home, 'config.toml'), 'utf-8');
+    const stamp = readFileSync(join(home, HOME_STAMP), 'utf-8');
+    // No model here: the home alone makes the launch kept.
+    const options = { prompt: 'x', home, srcHome: src, kimiBin: FAKE_KIMI };
+
+    const overlays: ReadonlyArray<Record<string, string>> = [{ KIMI_MODEL_NAME: 'env-model' }, { KIMI_MODEL_NAME: '' }, { KIMI_MODEL_THINKING_KEEP: 'all' }];
+    for (const extra of overlays) {
+      await expect(runKimi({ ...options, extraEnv: { ...extra, FAKE_KIMI_SESSION_OUT: out } })).rejects.toThrow(
+        'in extraEnv may switch kimi to its env model',
+      );
+    }
+    expect(() =>
+      spawnKimi({ ...options, extraEnv: { FAKE_KIMI_SESSION_OUT: out } }, { env: { KIMI_MODEL_NAME: 'env-model' } }),
+    ).toThrow('KIMI_MODEL_NAME in the spawn env may switch kimi to its env model');
+    await expect(
+      runKimi({ ...options, home: missing, extraEnv: { KIMI_MODEL_NAME: 'env-model', FAKE_KIMI_SESSION_OUT: out } }),
+    ).rejects.toThrow('refused on a kept run home');
+
+    expect(readSessionReports(out)).toEqual([]);
+    expect(existsSync(missing)).toBe(false);
+    expect(existsSync(join(home, 'sessions'))).toBe(false);
+    expect(readFileSync(join(home, 'config.toml'), 'utf-8')).toBe(config);
+    expect(readFileSync(join(home, HOME_STAMP), 'utf-8')).toBe(stamp);
+  });
+
+  test('refused beside model on an ephemeral launch, by checkLaunchOptions too', () => {
+    const root = temp('bare-kimi-sdk-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const out = join(root, 'sessions.ndjson');
+    const options = { prompt: 'x', srcHome: src, model: 'kimi-code/k3-thinking', kimiBin: FAKE_KIMI };
+
+    expect(() => checkLaunchOptions({ ...options, extraEnv: { KIMI_MODEL_NAME: 'env-model' } })).toThrow(
+      'refused beside model "kimi-code/k3-thinking"',
+    );
+    expect(() =>
+      spawnKimi({ ...options, extraEnv: { FAKE_KIMI_SESSION_OUT: out } }, { env: { KIMI_MODEL_NAME: 'env-model' } }),
+    ).toThrow('KIMI_MODEL_NAME in the spawn env may switch kimi to its env model');
+    expect(readSessionReports(out)).toEqual([]);
+  });
+
+  test('a preloaded run refuses it, ephemeral or kept, before its child', async () => {
+    const root = temp('bare-kimi-sdk-');
+    const src = makeSourceHome(root);
+    const home = join(root, 'run-home');
+    const out = join(root, 'sessions.ndjson');
+
+    for (const launchHome of [undefined, home]) {
+      await expect(
+        runPreloaded(
+          {
+            prompt: 'x',
+            home: launchHome,
+            srcHome: src,
+            kimiBin: FAKE_KIMI,
+            extraEnv: { KIMI_MODEL_NAME: 'env-model', FAKE_KIMI_SESSION_OUT: out },
+          },
+          [{ path: 'fact.md', content: 'x' }],
+        ),
+      ).rejects.toThrow('may switch kimi to its env model');
+    }
+
+    expect(readSessionReports(out)).toEqual([]);
+    expect(existsSync(home)).toBe(false);
+  });
+
+  test('controls: an ephemeral launch without model takes it and names it; a spawn-env undefined deletes it', async () => {
+    const root = temp('bare-kimi-sdk-');
+    const src = makeSourceHome(root);
+    const envOut = join(root, 'env.json');
+
+    const ephemeral = spawnKimi(
+      {
+        prompt: 'x',
+        srcHome: src,
+        kimiBin: FAKE_KIMI,
+        extraEnv: { KIMI_MODEL_NAME: 'env-model', FAKE_KIMI_ENV_OUT: envOut, FAKE_KIMI_ENV_KEYS: 'KIMI_MODEL_NAME' },
+      },
+      { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' },
+    );
+    const code = await ephemeral.subprocess.exited;
+    await ephemeral.dispose();
+
+    expect(code).toBe(0);
+    expect(ephemeral.ephemeral).toBe(true);
+    expect(ephemeral.modelOverlay).toBe('KIMI_MODEL_NAME');
+    expect(JSON.parse(readFileSync(envOut, 'utf-8'))).toEqual({ KIMI_MODEL_NAME: 'env-model' });
+
+    const kept = spawnKimi(
+      { prompt: 'x', home: join(root, 'run-home'), srcHome: src, kimiBin: FAKE_KIMI },
+      { env: { KIMI_MODEL_NAME: undefined }, stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' },
+    );
+    expect(await kept.subprocess.exited).toBe(0);
+    await kept.dispose();
+    expect(kept.modelOverlay).toBeNull();
   });
 });
 

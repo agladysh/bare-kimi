@@ -550,10 +550,11 @@ describe('run-home ownership', () => {
     const root = temp('bare-kimi-home-');
     const src = makeSourceHome(root);
     const dst = join(root, 'run-home');
-    assembleHome(src, dst);
+    expect(assembleHome(src, dst).migrated).toBeNull();
 
-    // Exactly these fields: no `adopted` for a home assembled from scratch,
-    // and a null effort for one that carries the source's own [thinking].
+    // Exactly these fields: no `adopted` or `migrated` for a home assembled
+    // from scratch, and a null effort for one that carries the source's own
+    // [thinking].
     expect(JSON.parse(readFileSync(join(dst, HOME_STAMP), 'utf-8'))).toStrictEqual({
       version: 2,
       source: realpathSync(src),
@@ -646,6 +647,13 @@ describe('run-home ownership', () => {
       { version: 2, source, config },
       { version: 2, source, config, model: 'kimi-code/k3', effort: 3 },
       { version: 3, source, config, model: 'kimi-code/k3', effort: null },
+      // A `migrated` record that does not read as one this version wrote.
+      { version: 2, source, config, model: 'kimi-code/k3', effort: null, migrated: 'config' },
+      { version: 2, source, config, model: 'kimi-code/k3', effort: null, migrated: { from: 2, basis: 'config' } },
+      { version: 2, source, config, model: 'kimi-code/k3', effort: null, migrated: { from: 1, basis: 'guess' } },
+      { version: 2, source, config, model: 'kimi-code/k3', effort: null, migrated: { from: 1 } },
+      // An adopted home had no stamp to upgrade.
+      { version: 2, source, config, model: 'kimi-code/k3', effort: null, adopted: true, migrated: { from: 1, basis: 'config' } },
     ]) {
       writeFileSync(join(dst, HOME_STAMP), `${JSON.stringify(stamp)}\n`);
       expect(() => prepareRunHome(src, dst)).toThrow('is not a stamp');
@@ -1464,7 +1472,13 @@ describe('version-1 stamps (bare-kimi 0.2)', () => {
 
     const reused = prepareRunHome(src, kept);
 
-    expect(reused).toMatchObject({ action: 'reuse', modelAlias: 'kimi-code/k3', effort: null, adopted: false });
+    expect(reused).toMatchObject({
+      action: 'reuse',
+      modelAlias: 'kimi-code/k3',
+      effort: null,
+      adopted: false,
+      migrated: { from: 1, basis: 'config' },
+    });
     expect(readFileSync(join(kept, 'config.toml'), 'utf-8')).toBe(config);
     expect(readStampJson(kept)).toStrictEqual({
       version: 2,
@@ -1472,6 +1486,7 @@ describe('version-1 stamps (bare-kimi 0.2)', () => {
       model: 'kimi-code/k3',
       effort: null,
       config: digest,
+      migrated: { from: 1, basis: 'config' },
     });
   });
 
@@ -1487,7 +1502,36 @@ describe('version-1 stamps (bare-kimi 0.2)', () => {
     expect(prepareRunHome(src, kept).modelAlias).toBe('kimi-code/k3');
 
     expect(parseToml(readFileSync(join(kept, 'config.toml'), 'utf-8'))['default_model']).toBe('kimi-code/k3');
-    expect(readStampJson(kept)).toMatchObject({ version: 2, model: 'kimi-code/k3', effort: null });
+    expect(readStampJson(kept)).toMatchObject({
+      version: 2,
+      model: 'kimi-code/k3',
+      effort: null,
+      migrated: { from: 1, basis: 'config' },
+    });
+  });
+
+  test('the basis survives later rewrites of config.toml and the stamp, and preview reports it', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const kept = join(root, 'kept');
+    prepareRunHome(src, kept);
+    addSession(kept);
+    downgradeStampToV1(kept);
+    rmSync(join(kept, 'config.toml'));
+    // No alias reproduces the stamp's digest: the caller names it.
+    editConfig(src, (text) => `${text}\n[[permission.rules]]\ndecision = "deny"\npattern = "Bash(rm *)"\n`);
+    expect(prepareRunHome(src, kept, 'link', { model: 'kimi-code/k3' }).migrated).toEqual({ from: 1, basis: 'caller' });
+    const upgraded = readStampJson(kept);
+
+    // The source changes again: config.toml and the stamp's digest are rewritten, the basis is kept.
+    editConfig(src, (text) => text.replace('pattern = "Bash(rm *)"', 'pattern = "Bash(curl *)"'));
+    expect(previewRunHome(src, kept).migrated).toEqual({ from: 1, basis: 'caller' });
+    expect(prepareRunHome(src, kept)).toMatchObject({ modelAlias: 'kimi-code/k3', migrated: { from: 1, basis: 'caller' } });
+    const rewritten = readStampJson(kept);
+    expect(rewritten['config']).not.toBe(upgraded['config']);
+    expect(rewritten).toMatchObject({ version: 2, model: 'kimi-code/k3', migrated: { from: 1, basis: 'caller' } });
+    expect(readFileSync(join(kept, 'config.toml'), 'utf-8')).toContain('pattern = "Bash(curl *)"');
   });
 
   test('a 0.2 home refuses another alias, an effort, and a source that dropped its alias; its stamp stays version 1', () => {
@@ -1532,7 +1576,12 @@ describe('version-1 stamps (bare-kimi 0.2)', () => {
     const config = readFileSync(join(kept, 'config.toml'), 'utf-8');
     downgradeStampToV1(kept, 'f'.repeat(64));
 
-    expect(previewRunHome(src, kept)).toMatchObject({ action: 'reuse', modelAlias: 'kimi-code/k3' });
+    // The pin is the source's default, which the file agrees with; the stamp proves nothing here.
+    expect(previewRunHome(src, kept)).toMatchObject({
+      action: 'reuse',
+      modelAlias: 'kimi-code/k3',
+      migrated: { from: 1, basis: 'source-default' },
+    });
     setSourceDefault(src, 'kimi-code/k3-thinking');
     expect(() => prepareRunHome(src, kept)).toThrow('edited since bare-kimi wrote it');
     expect(readFileSync(join(kept, 'config.toml'), 'utf-8')).toBe(config);
@@ -1553,9 +1602,19 @@ describe('version-1 stamps (bare-kimi 0.2)', () => {
     const reused = prepareRunHome(src, kept);
 
     // The stamp's digest covers the default_model 0.2 wrote; only k3's config reproduces it.
-    expect(reused).toMatchObject({ action: 'reuse', modelAlias: 'kimi-code/k3', effort: null });
+    expect(reused).toMatchObject({
+      action: 'reuse',
+      modelAlias: 'kimi-code/k3',
+      effort: null,
+      migrated: { from: 1, basis: 'digest' },
+    });
     expect(parseToml(readFileSync(join(kept, 'config.toml'), 'utf-8'))['default_model']).toBe('kimi-code/k3');
-    expect(readStampJson(kept)).toMatchObject({ version: 2, model: 'kimi-code/k3', effort: null });
+    expect(readStampJson(kept)).toMatchObject({
+      version: 2,
+      model: 'kimi-code/k3',
+      effort: null,
+      migrated: { from: 1, basis: 'digest' },
+    });
   });
 
   test('a 0.2 home without config.toml whose alias cannot be proven: refused with sessions unless named; followed without', () => {
@@ -1574,17 +1633,30 @@ describe('version-1 stamps (bare-kimi 0.2)', () => {
     editConfig(src, (text) => `${text}\n[[permission.rules]]\ndecision = "deny"\npattern = "Bash(rm *)"\n`);
     setSourceDefault(src, 'kimi-code/k3-thinking');
 
-    expect(() => prepareRunHome(src, withSessions)).toThrow('the model alias its sessions are bound to is unknown');
+    expect(() => prepareRunHome(src, withSessions)).toThrow('the model alias the home last configured is unknown');
     expect(existsSync(join(withSessions, 'config.toml'))).toBe(false);
     expect(readFileSync(join(withSessions, HOME_STAMP), 'utf-8')).toBe(v1);
+    // The caller's name is recorded as the caller's, not as proof.
     expect(prepareRunHome(src, withSessions, 'link', { model: 'kimi-code/k3' })).toMatchObject({
       action: 'reuse',
       modelAlias: 'kimi-code/k3',
+      migrated: { from: 1, basis: 'caller' },
     });
-    expect(readStampJson(withSessions)).toMatchObject({ version: 2, model: 'kimi-code/k3' });
+    expect(readStampJson(withSessions)).toMatchObject({
+      version: 2,
+      model: 'kimi-code/k3',
+      migrated: { from: 1, basis: 'caller' },
+    });
 
     // No session is bound to any alias: the home follows the source's default.
-    expect(prepareRunHome(src, withoutSessions).modelAlias).toBe('kimi-code/k3-thinking');
+    expect(prepareRunHome(src, withoutSessions)).toMatchObject({
+      modelAlias: 'kimi-code/k3-thinking',
+      migrated: { from: 1, basis: 'source-default' },
+    });
+    expect(readStampJson(withoutSessions)).toMatchObject({
+      model: 'kimi-code/k3-thinking',
+      migrated: { from: 1, basis: 'source-default' },
+    });
   });
 });
 
@@ -1655,7 +1727,7 @@ describe('adopting a home kept before 0.2', () => {
 
     const adopted = prepareRunHome(src, home, 'link', { adoptLegacyHome: true });
 
-    expect(adopted).toMatchObject({ action: 'adopt', adopted: true, modelAlias: 'kimi-code/k3', effort: null });
+    expect(adopted).toMatchObject({ action: 'adopt', adopted: true, modelAlias: 'kimi-code/k3', effort: null, migrated: null });
     expect(readFileSync(join(home, ADOPTION_RECORD, 'config.toml'))).toEqual(preimage);
     const manifest = JSON.parse(readFileSync(join(home, ADOPTION_RECORD, 'manifest.json'), 'utf-8'));
     expect(manifest).toMatchObject({
@@ -1697,7 +1769,7 @@ describe('adopting a home kept before 0.2', () => {
       'its config.toml configures effort "low" for new sessions',
     );
     expect(() => prepareRunHome(src, home, 'link', { adoptLegacyHome: true, model: 'kimi-code/k3' })).toThrow(
-      'its sessions are bound to model "kimi-code/k3-thinking"',
+      'its config.toml names model "kimi-code/k3-thinking" for new sessions',
     );
     expect(existsSync(join(home, HOME_STAMP))).toBe(false);
 

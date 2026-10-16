@@ -141,7 +141,41 @@ export interface AssembledHome {
   readonly action: 'create' | 'reuse' | 'adopt';
   /** The home was adopted from a home kept before 0.2, now or earlier. */
   readonly adopted: boolean;
+  /**
+   * For a home kept by bare-kimi 0.2 (a version-1 stamp): how its model alias
+   * was established when this version upgraded the stamp, now or earlier.
+   * Null for any other home. See {@link MigrationBasis}.
+   */
+  readonly migrated: Migration | null;
 }
+
+/**
+ * How the model alias of a home kept by bare-kimi 0.2 was established when
+ * its version-1 stamp was upgraded. 0.2 pinned no alias: the home followed the
+ * source's default_model, so sessions it created under an earlier alias stay
+ * bound to that one. No basis establishes the alias of every session; each
+ * says only where the pin came from:
+ * - `config`: the default_model of the home's config.toml, which still held
+ *   the settings the stamp records, i.e. what 0.2 last wrote;
+ * - `digest`: config.toml was missing; the one alias whose config, as the
+ *   source yields it at upgrade, reproduces the stamp's settings digest;
+ * - `caller`: config.toml was missing, no alias reproduced the digest, and
+ *   the caller named the alias. That is the caller's assertion, not evidence
+ *   from the home;
+ * - `source-default`: the source's default_model at upgrade, either because
+ *   config.toml held other settings than the stamp records but exactly what
+ *   the source yields for that alias, or because config.toml was missing from
+ *   a home with no sessions.
+ */
+export type MigrationBasis = 'config' | 'digest' | 'caller' | 'source-default';
+
+/** The upgrade of a version-1 stamp, as the version-2 stamp records it. */
+export interface Migration {
+  readonly from: 1;
+  readonly basis: MigrationBasis;
+}
+
+const MIGRATION_BASES: readonly MigrationBasis[] = ['config', 'digest', 'caller', 'source-default'];
 
 /**
  * Choices for {@link prepareRunHome}. Every one is checked before the first
@@ -1008,14 +1042,17 @@ function planEnsure(src: string, dst: string, mode: AuthMode): Donation | undefi
  * config.toml it last wrote. Version 2 since bare-kimi 0.3; a version-1
  * stamp (0.2) is read, taken as pinned to the alias its config.toml holds
  * (see {@link pinnedSelection} for a missing config.toml), and upgraded on
- * the next write. bare-kimi 0.2 refuses a version-2 stamp.
+ * the next write. The upgraded stamp records how that alias was established
+ * (`migrated`, see {@link MigrationBasis}), and every later write keeps it.
+ * A `migrated` record that does not read as one refuses the stamp. bare-kimi
+ * 0.2 refuses a version-2 stamp.
  */
 export const HOME_STAMP = '.bare-kimi-home';
 
 /**
  * Directory an adopted home keeps as evidence of what it was before
  * adoption: `config.toml`, byte for byte as found, and `manifest.json` (the
- * source, the model alias its sessions are bound to, the effort its
+ * source, the model alias its config.toml names, the effort its
  * config.toml configured for new sessions, how its credentials were held,
  * and the SHA-256 of every file under `sessions/` at adoption). Adoption
  * never changes `sessions/`.
@@ -1037,14 +1074,20 @@ export const HOME_STAMP = '.bare-kimi-home';
  *   (below).
  *
  * The home is pinned to its `default_model`: native kimi binds each session
- * to its alias. When its `[thinking]` differs from the source's, it is also
- * pinned to the effort that table names, and that effort is checked like a
- * selected one. That pin is the effort the home's config.toml gave new
- * sessions when it was found. It says nothing about the effort its existing
- * sessions ran at: each stored its own when created, perhaps under an
- * earlier config.toml, and a `kimi`-type provider may have replaced an
+ * to the alias it was created with. That is the alias the found config.toml
+ * names; sessions created under an earlier one are not established, and, as
+ * read from kimi 2.1.0, such a session cannot be resumed once the rewritten
+ * config.toml no longer configures its alias. When its `[thinking]` differs from the source's, it
+ * is also pinned to the effort that table names, and that effort is checked
+ * like a selected one. That pin is the effort the home's config.toml gave
+ * new sessions when it was found. It says nothing about the effort its
+ * existing sessions ran at: each stored its own when created, perhaps under
+ * an earlier config.toml, and a `kimi`-type provider may have replaced an
  * effort the model did not list. A resume keeps each session's stored
- * effort whatever the pin says.
+ * effort whatever the pin says. A `[thinking]` that differs from the
+ * source's but names no effort (`enabled = true` alone) pins nothing: the
+ * rewritten config.toml carries the source's `[thinking]`, which may give
+ * new sessions another effort than the found file did.
  *
  * Effects, in order: the record is written into a temporary directory and
  * renamed into place; the stamp is written, recording the found settings as
@@ -1068,6 +1111,8 @@ interface HomeStamp {
   /** The pinned effort; null follows the source's `[thinking]`. */
   readonly effort: string | null;
   readonly adopted: boolean;
+  /** How a version-2 stamp upgraded from version 1 got its alias; null otherwise, and for a version-1 stamp. */
+  readonly migrated: Migration | null;
 }
 
 /** What a written stamp records; always version 2. */
@@ -1077,6 +1122,16 @@ interface StampFields {
   readonly effort: string | null;
   readonly config: string;
   readonly adopted: boolean;
+  readonly migrated: Migration | null;
+}
+
+/** A stamp's `migrated` record: null when absent, undefined when it does not read as one. */
+function readMigration(value: unknown): Migration | null | undefined {
+  if (value === undefined) return null;
+  if (!isTable(value) || value['from'] !== 1) return undefined;
+  const recorded = value['basis'];
+  const basis = MIGRATION_BASES.find((item) => item === recorded);
+  return basis === undefined ? undefined : { from: 1, basis };
 }
 
 /** The home's stamp; undefined when there is none. A stamp that does not read as one is refused. */
@@ -1092,16 +1147,22 @@ function readHomeStamp(home: string): HomeStamp | undefined {
     parsed = undefined;
   }
   const stamp: TomlTable = isTable(parsed) ? parsed : {};
-  const { version, source, config, model, effort, adopted } = stamp;
+  const { version, source, config, model, effort, adopted, migrated } = stamp;
   if (typeof source === 'string' && typeof config === 'string') {
-    if (version === 1) return { version: 1, source, config, model: undefined, effort: null, adopted: false };
+    if (version === 1) {
+      return { version: 1, source, config, model: undefined, effort: null, adopted: false, migrated: null };
+    }
+    const migration = readMigration(migrated);
     if (
       version === 2 &&
       typeof model === 'string' &&
       (typeof effort === 'string' || effort === null) &&
-      (adopted === undefined || typeof adopted === 'boolean')
+      (adopted === undefined || typeof adopted === 'boolean') &&
+      migration !== undefined &&
+      // An adopted home had no stamp to upgrade; this library writes no stamp with both.
+      !(adopted === true && migration !== null)
     ) {
-      return { version: 2, source, config, model, effort, adopted: adopted === true };
+      return { version: 2, source, config, model, effort, adopted: adopted === true, migrated: migration };
     }
   }
   throw new Error(`${path} is not a stamp this version of bare-kimi wrote; refusing`);
@@ -1122,6 +1183,7 @@ function writeHomeStamp(home: string, stamp: StampFields): void {
     effort: stamp.effort,
     config: stamp.config,
     ...(stamp.adopted ? { adopted: true } : {}),
+    ...(stamp.migrated !== null ? { migrated: stamp.migrated } : {}),
   };
   writeFileAtomic(join(home, HOME_STAMP), `${JSON.stringify(record)}\n`);
 }
@@ -1131,7 +1193,11 @@ interface AdoptionManifest {
   readonly version: 1;
   readonly at: string;
   readonly source: string;
-  /** The alias the found config.toml names: the one its sessions are bound to. */
+  /**
+   * The alias the found config.toml names, which new sessions were created
+   * on while it held. Sessions created under an earlier alias are not
+   * established.
+   */
   readonly model: string;
   /**
    * The effort the found config.toml configured for new sessions, when it
@@ -1165,6 +1231,8 @@ interface RunHomePlan {
   readonly create: boolean;
   /** The home's stamp as found; undefined for a new, empty or adopted home. */
   readonly stamp: HomeStamp | undefined;
+  /** See {@link AssembledHome.migrated}: decided now for a version-1 stamp, else as the stamp records. */
+  readonly migrated: Migration | null;
   readonly config: MinimalConfig;
   readonly writeConfig: boolean;
   readonly adoption: AdoptionPlan | undefined;
@@ -1201,21 +1269,26 @@ function aliasYielding(sourceText: string, source: TomlTable, sourceWhere: strin
 }
 
 /**
- * The model and effort a stamped home is pinned to. A version-1 stamp (0.2)
- * pinned nothing: that home followed the source's default_model and carried
- * the source's `[thinking]`, so its effort pin is null. Its alias is:
+ * The model and effort a stamped home is pinned to, and for a version-1
+ * stamp how its alias is established (see {@link MigrationBasis}). A
+ * version-1 stamp (0.2) pinned nothing: that home followed the source's
+ * default_model and carried the source's `[thinking]`, so its effort pin is
+ * null. Its alias is:
  * - with config.toml present: the default_model there, while it holds what
- *   0.2 last wrote; otherwise the source's default_model, and an edited file
- *   is then refused unless it equals what the source yields for that alias;
+ *   0.2 last wrote (`config`); otherwise the source's default_model
+ *   (`source-default`), and an edited file is then refused unless it equals
+ *   what the source yields for that alias;
  * - with config.toml missing: the alias whose config, as the source yields it
- *   now, has the stamp's digest. The digest covers the default_model that
- *   0.2 wrote, so a match proves that alias. That rests on 0.2 and this
- *   version computing the same digest, which one reuse of a home assembled
- *   by 0.2 showed. A digest that disagrees proves nothing, and the steps
- *   below apply. Without a match, the caller's
- *   `model` is taken. A home without sessions follows the source's
- *   default_model, since no session is bound to an alias. Anything else is
- *   refused: the alias its sessions are bound to cannot be read.
+ *   now, has the stamp's digest (`digest`). The digest covers the
+ *   default_model that 0.2 wrote, so a match proves that alias was the one
+ *   0.2 last wrote. That rests on 0.2 and this version computing the same
+ *   digest, which one reuse of a home assembled by 0.2 showed. A digest that
+ *   disagrees proves nothing, and the steps below apply. Without a match,
+ *   the caller's `model` is taken (`caller`). A home without sessions
+ *   follows the source's default_model (`source-default`), since no session
+ *   is bound to an alias. Anything else is refused: which alias the home last
+ *   configured cannot be read.
+ * No basis establishes the alias of sessions created under an earlier one.
  */
 function pinnedSelection(
   stamp: HomeStamp,
@@ -1226,27 +1299,35 @@ function pinnedSelection(
   sourceText: string,
   source: TomlTable,
   sourceWhere: string,
-): { readonly model: string; readonly effort: string | null } {
-  if (stamp.model !== undefined) return { model: stamp.model, effort: stamp.effort };
-  const followed = (): { model: string; effort: null } => {
+): Pin {
+  if (stamp.model !== undefined) return { model: stamp.model, effort: stamp.effort, migrated: stamp.migrated };
+  const upgraded = (model: string, basis: MigrationBasis): Pin => ({ model, effort: null, migrated: { from: 1, basis } });
+  const followed = (): Pin => {
     const model = source['default_model'];
     if (typeof model !== 'string') throw new Error(`no default_model in the root table of ${sourceWhere}`);
-    return { model, effort: null };
+    return upgraded(model, 'source-default');
   };
   if (current !== undefined) {
     const written = current['default_model'];
-    if (digest === stamp.config && typeof written === 'string') return { model: written, effort: null };
+    if (digest === stamp.config && typeof written === 'string') return upgraded(written, 'config');
     return followed();
   }
   const proven = aliasYielding(sourceText, source, sourceWhere, stamp.config);
-  if (proven !== undefined) return { model: proven, effort: null };
-  if (request.model !== undefined) return { model: request.model, effort: null };
+  if (proven !== undefined) return upgraded(proven, 'digest');
+  if (request.model !== undefined) return upgraded(request.model, 'caller');
   if (!holdsSessions(home)) return followed();
   throw new Error(
     `run home ${home} has a bare-kimi 0.2 stamp but no config.toml, and the source no longer yields the ` +
-      'settings that stamp records, so the model alias its sessions are bound to is unknown; ' +
-      'name it explicitly (model, CLI --model)',
+      'settings that stamp records, so the model alias the home last configured is unknown; ' +
+      'name it explicitly (model, CLI --model); that names the pin, it does not prove what its sessions use',
   );
+}
+
+/** See {@link pinnedSelection}. */
+interface Pin {
+  readonly model: string;
+  readonly effort: string | null;
+  readonly migrated: Migration | null;
 }
 
 /**
@@ -1259,8 +1340,9 @@ function pinnedSelection(
  * - a stamped home from another source;
  * - a model or effort other than the one a stamped home is pinned to, and a
  *   source that no longer configures the pinned model;
- * - a 0.2-stamped home with sessions but no config.toml, whose alias neither
- *   the stamp nor the caller establishes (see {@link pinnedSelection});
+ * - a 0.2-stamped home with sessions but no config.toml, whose alias the
+ *   stamp does not prove and the caller does not name (see
+ *   {@link pinnedSelection});
  * - a config.toml that is not a regular file, or no longer parses;
  * - a config.toml whose settings differ both from what was last written
  *   (it was edited) and from what the source yields now.
@@ -1286,6 +1368,7 @@ function planRunHome(
     action: 'create',
     create,
     stamp: undefined,
+    migrated: null,
     config: minimalConfig(sourceText, parsed, sourceWhere, { model: request.model, effort: request.effort ?? null }),
     writeConfig: true,
     adoption: undefined,
@@ -1316,8 +1399,8 @@ function planRunHome(
   const pinned = pinnedSelection(stamp, home, currentTable, digest, request, sourceText, parsed, sourceWhere);
   if (request.model !== undefined && request.model !== pinned.model) {
     throw new Error(
-      `run home ${home} is pinned to model "${pinned.model}", the alias its sessions are bound to; ` +
-        `refusing model "${request.model}" (use another home for it)`,
+      `run home ${home} is pinned to model "${pinned.model}", the alias its config.toml names for new ` +
+        `sessions; refusing model "${request.model}" (use another home for it)`,
     );
   }
   if (request.effort !== undefined && request.effort !== pinned.effort) {
@@ -1329,7 +1412,7 @@ function planRunHome(
   if (!configuresModel(parsed, pinned.model)) {
     throw new Error(
       `run home ${home} is pinned to model "${pinned.model}", which ${sourceWhere} no longer configures; ` +
-        'its sessions are bound to that alias, so the home is refused rather than switched',
+        'sessions created on that alias look it up again on resume, so the home is refused rather than switched',
     );
   }
   const config = minimalConfig(sourceText, parsed, sourceWhere, pinned);
@@ -1339,7 +1422,16 @@ function planRunHome(
         'and they differ from what the source home now yields',
     );
   }
-  return { home, action: 'reuse', create: false, stamp, config, writeConfig: digest !== config.digest, adoption: undefined };
+  return {
+    home,
+    action: 'reuse',
+    create: false,
+    stamp,
+    migrated: pinned.migrated,
+    config,
+    writeConfig: digest !== config.digest,
+    adoption: undefined,
+  };
 }
 
 /** Plan the adoption of an unstamped home; see {@link ADOPTION_RECORD} for what is required. */
@@ -1375,7 +1467,7 @@ function planAdoption(
   if (!isTable(legacyProvider)) throw refusal(`${configPath} has no [providers."${provider}"]`);
   const sourceModels = parsed['models'];
   const sourceModel = isTable(sourceModels) ? sourceModels[model] : undefined;
-  if (!isTable(sourceModel)) throw refusal(`its sessions use model "${model}", which ${sourceWhere} does not configure`);
+  if (!isTable(sourceModel)) throw refusal(`its config.toml names model "${model}", which ${sourceWhere} does not configure`);
   if (sourceModel['provider'] !== provider) throw refusal(`${sourceWhere} configures model "${model}" on another provider`);
   const sourceProviders = parsed['providers'];
   const sourceProvider = isTable(sourceProviders) ? sourceProviders[provider] : undefined;
@@ -1393,7 +1485,10 @@ function planAdoption(
       ? thinkingEffort(legacy['thinking'])
       : null;
   if (request.model !== undefined && request.model !== model) {
-    throw refusal(`its sessions are bound to model "${model}"; refusing model "${request.model}"`);
+    throw refusal(
+      `its config.toml names model "${model}" for new sessions (any created under an earlier alias are not ` +
+        `established); refusing model "${request.model}"`,
+    );
   }
   if (request.effort !== undefined && request.effort !== effort) {
     throw refusal(
@@ -1449,6 +1544,7 @@ function planAdoption(
     action: 'adopt',
     create: false,
     stamp: undefined,
+    migrated: null,
     config,
     writeConfig: legacyDigest !== config.digest,
     adoption: {
@@ -1556,6 +1652,7 @@ function describeHome(dst: string, source: string, plan: RunHomePlan): Assembled
     source,
     action: plan.action,
     adopted: plan.adoption !== undefined || plan.stamp?.adopted === true,
+    migrated: plan.migrated,
   };
 }
 
@@ -1596,6 +1693,7 @@ export function prepareRunHome(
     effort: config.effort,
     config: digest,
     adopted: adoption !== undefined || plan.stamp?.adopted === true,
+    migrated: plan.migrated,
   });
 
   // Effects start here; every refusal above left both homes untouched.

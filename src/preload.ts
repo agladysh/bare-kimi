@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path';
 import {
   assertSafePrompt,
   checkLaunchOptions,
+  isModelOverlayVar,
   makeEphemeralHome,
   removeHome,
   runKimi,
@@ -140,6 +141,10 @@ export const DEFAULT_PRIME = 'Acknowledged.';
 export function checkPreloadOptions(options: LaunchOptions, prime?: string): void {
   checkLaunchOptions(options);
   assertSafePrompt(prime ?? DEFAULT_PRIME);
+  const overlay = Object.keys(options.extraEnv ?? {}).find(isModelOverlayVar);
+  if (overlay !== undefined) {
+    throw new Error(`${overlay} in extraEnv may switch kimi to its env model; preload needs one pinned model for its primer and resume`);
+  }
   if (options.resume !== undefined || options.continueRecent === true) {
     throw new Error('preload starts a fresh session; it cannot be combined with resume or continue');
   }

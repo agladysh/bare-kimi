@@ -37,6 +37,8 @@ export {
   type AssembledHome,
   type AuthMode,
   type EffortSupport,
+  type Migration,
+  type MigrationBasis,
   type RunHomeOptions,
 } from './home.ts';
 export {
@@ -109,10 +111,13 @@ export interface LaunchOptions {
    * provider are carried, never the source's other models or providers,
    * whose tables may hold keys. Omitted: the alias a kept home is pinned to,
    * else the source's default_model. A kept home is pinned to the alias it
-   * was first assembled with, because native kimi binds every session to its
-   * alias and looks the alias up again on resume: the home stays on it when
+   * was assembled with, or, for a home kept by bare-kimi 0.2 or adopted, the
+   * alias its config.toml named then (see {@link AssembledHome.migrated}),
+   * because native kimi binds every session to the alias it was created
+   * with and looks the alias up again on resume: the home stays on it when
    * the source's default_model changes, and a different alias is refused
-   * before any effect (use another home).
+   * before any effect (use another home). Sessions such a home created under
+   * an earlier alias are not covered by the pin.
    */
   readonly model?: string;
   /**
@@ -181,7 +186,13 @@ export interface LaunchOptions {
    * scrubbed variable explicitly, and may override the telemetry/auto-update
    * defaults; may NOT override `KIMI_CODE_HOME`. A non-empty
    * `KIMI_MODEL_THINKING_EFFORT` (here or in the spawn env) is refused
-   * beside `effort` and on a run home pinned to an effort.
+   * beside `effort` and on a run home pinned to an effort. Any other
+   * `KIMI_MODEL_*` variable, here or in the spawn env and even empty, may
+   * switch kimi to its env model (see {@link isModelOverlayVar}): it is
+   * refused before any effect beside `model`, with a caller-supplied `home`,
+   * and in a preloaded run. Only an ephemeral launch without `model` takes
+   * it; {@link KimiSubprocess.modelOverlay} then names it, and
+   * `assembled.modelAlias` is not established as the model kimi runs.
    */
   readonly extraEnv?: Record<string, string>;
   /**
@@ -207,7 +218,9 @@ interface ForcedEffort {
 /**
  * The forced effort the child's environment will carry, by the layering of
  * {@link buildEnv}: the inherited value is scrubbed, `extraEnv` wins over the
- * spawn env, and kimi 2.1.0 trims the value and takes an empty one as unset.
+ * spawn env, and a blank value is taken as unset. That last reading comes
+ * from kimi 2.1.0's env-model overlay (`trimmed$2`); whether the separate
+ * binding of this variable (`envBindings`) trims it too is not established.
  */
 function forcedEffort(
   extraEnv: Record<string, string> | undefined,
@@ -226,6 +239,60 @@ function forcedEffortConflict(layer: string): Error {
   );
 }
 
+/**
+ * Whether `name` may feed kimi 2.1.0's env-model overlay. When active, the
+ * overlay adds a provider `__kimi_env__` and a model `__kimi_env_model__`
+ * built from `KIMI_MODEL_*` variables and makes that model the default, so
+ * a new session runs it instead of the run home's alias and is bound to it.
+ * Which variable activates the overlay is not in the bundle excerpts read,
+ * so every `KIMI_MODEL_*` name counts except {@link FORCED_EFFORT_ENV},
+ * which kimi binds separately and {@link spawnKimi} checks on its own.
+ * `KIMI_MODEL_THINKING_KEEP` counts: the overlay collects it as a model
+ * override.
+ */
+export function isModelOverlayVar(name: string): boolean {
+  return name.startsWith('KIMI_MODEL_') && name !== FORCED_EFFORT_ENV;
+}
+
+/** A variable the child will see, and the layer that sets it. */
+interface ChildVariable {
+  readonly name: string;
+  readonly layer: string;
+}
+
+/**
+ * The first variable that may feed the env-model overlay and that the
+ * child's environment will carry, by the layering of {@link buildEnv}: the
+ * inherited layer is scrubbed, a name `extraEnv` sets is decided there, and
+ * a spawn-env value of `undefined` deletes. An empty value counts: how kimi
+ * reads the activating variable is not established.
+ */
+function modelOverlay(
+  extraEnv: Record<string, string> | undefined,
+  spawnEnv: Record<string, string | undefined> | undefined,
+): ChildVariable | undefined {
+  const fromExtra = Object.keys(extraEnv ?? {}).find(isModelOverlayVar);
+  if (fromExtra !== undefined) return { name: fromExtra, layer: 'extraEnv' };
+  const fromSpawn = Object.entries(spawnEnv ?? {}).find(([name, value]) => value !== undefined && isModelOverlayVar(name));
+  return fromSpawn === undefined ? undefined : { name: fromSpawn[0], layer: 'the spawn env' };
+}
+
+/**
+ * Refuse, before any effect, an env-model variable beside `model` or on a
+ * caller-supplied (kept) home: a new session there could run another model
+ * than the one asked for or pinned, and be bound to `__kimi_env_model__`,
+ * which a later run without the variable could not resume.
+ */
+function checkModelOverlay(variable: ChildVariable | undefined, model: string | undefined, kept: boolean): void {
+  if (variable === undefined) return;
+  const why = model !== undefined ? `beside model "${model}"` : kept ? 'on a kept run home' : undefined;
+  if (why === undefined) return;
+  throw new Error(
+    `${variable.name} in ${variable.layer} may switch kimi to its env model (__kimi_env_model__) instead of ` +
+      `the run home's alias; refused ${why} (only an ephemeral launch without model may set it)`,
+  );
+}
+
 export function LaunchConfig(o: LaunchOptions): LaunchConfig {
   if (o.resume !== undefined && o.continueRecent === true) {
     throw new Error('resume and continueRecent are mutually exclusive');
@@ -235,6 +302,7 @@ export function LaunchConfig(o: LaunchOptions): LaunchConfig {
   if (o.effort !== undefined && forcedEffort(o.extraEnv, undefined) !== undefined) {
     throw forcedEffortConflict('extraEnv');
   }
+  checkModelOverlay(modelOverlay(o.extraEnv, undefined), o.model, o.home !== undefined && o.home.length > 0);
   if ((o.extraArgs ?? []).some((arg) => arg === '--model' || arg === '-m' || arg.startsWith('--model='))) {
     throw new Error('pass the model as the model option, not in extraArgs: the run home must carry it');
   }
@@ -279,8 +347,9 @@ export function assertSafePrompt(prompt: string): void {
 /**
  * Every check on launch options that needs no filesystem: prompt shape,
  * option conflicts, and the selection checks that need no config (an empty
- * model or effort, an effort beside a forced one in `extraEnv`, a model in
- * `extraArgs`, adoption without a home). spawnKimi runs it first; a caller
+ * model or effort, an effort beside a forced one in `extraEnv`, an env-model
+ * variable in `extraEnv` beside `model` or a `home`, a model in `extraArgs`,
+ * adoption without a home). spawnKimi runs it first; a caller
  * that does its own setup (the CLI's --keep-home) runs it before that setup.
  * Checks against the source config are {@link previewRunHome}'s.
  */
@@ -326,8 +395,15 @@ export function buildArgv(config: LaunchConfig, kimiBin: string): string[] {
  *   (kimi 2.1.0 env-only overrides of the thinking effort and keep), so an
  *   ambient value cannot silently replace the `[thinking]` table the run
  *   home carries.
+ * - `KIMI_SECONDARY_*` — kimi 2.1.0 reads `KIMI_SECONDARY_MODEL` and
+ *   `KIMI_SECONDARY_EFFORT` as overrides of the secondary (subagent) model
+ *   and its effort. The run home carries no `[secondary_model]`; what the
+ *   variables do in `-p` without it is not established.
  *
- * All of these can be re-added deliberately via {@link LaunchOptions.extraEnv}.
+ * All of these can be re-added deliberately via {@link LaunchOptions.extraEnv},
+ * except that a `KIMI_MODEL_*` variable that may switch kimi to its env model
+ * ({@link isModelOverlayVar}) is taken only by an ephemeral launch without
+ * `model`, and refused before any effect otherwise.
  * To choose an effort, use {@link LaunchOptions.effort}: it is written into
  * the run home and stored with each new session. `KIMI_MODEL_THINKING_EFFORT`
  * in `extraEnv` instead forces an effort on every request of that process,
@@ -345,7 +421,8 @@ export function isScrubbedEnvVar(name: string): boolean {
     name === 'KIMI_CODE_OAUTH_HOST' ||
     name === 'KIMI_OAUTH_HOST' ||
     name === 'KIMI_DISABLE_OAUTH_LOCK' ||
-    name.startsWith('KIMI_MODEL_')
+    name.startsWith('KIMI_MODEL_') ||
+    name.startsWith('KIMI_SECONDARY_')
   );
 }
 
@@ -425,6 +502,12 @@ export interface KimiSubprocess<
   readonly home: string;
   /** The run home as prepared: its model, effort, source, and whether it was created, reused or adopted. */
   readonly assembled: AssembledHome;
+  /**
+   * The env-model variable the child sees (see {@link isModelOverlayVar}),
+   * which only an ephemeral launch without `model` may set; else null. When
+   * set, kimi may run its env model rather than `assembled.modelAlias`.
+   */
+  readonly modelOverlay: string | null;
   /** Whether spawnKimi created the home (and dispose will remove it). */
   readonly ephemeral: boolean;
   /** Working directory the child runs in. */
@@ -502,6 +585,9 @@ export class KimiCustodyError extends Error {
  * `KIMI_MODEL_THINKING_EFFORT` that the child would see (from `extraEnv` or
  * `spawnOptions.env`) is refused beside `effort` before anything is made. On a
  * run home pinned to an effort it is refused before that home is prepared.
+ * Another `KIMI_MODEL_*` variable the child would see is refused beside
+ * `model` and on a caller-supplied `home` before anything is made (see
+ * {@link LaunchOptions.extraEnv}).
  *
  * @throws {KimiSpawnError} when the binary cannot be executed. Home-assembly
  *   and option errors throw plain Errors before the child starts; a failed
@@ -518,9 +604,11 @@ export function spawnKimi<
   const config = checkLaunchOptions(launchOptions); // before any filesystem work
   const forced = forcedEffort(config.extraEnv, spawnOptions.env);
   if (config.effort !== undefined && forced !== undefined) throw forcedEffortConflict(forced.layer);
+  const ephemeral = config.home.length === 0;
+  const overlay = modelOverlay(config.extraEnv, spawnOptions.env);
+  checkModelOverlay(overlay, config.model, !ephemeral);
 
   const cwd = config.cwd.length > 0 ? config.cwd : (spawnOptions.cwd ?? process.cwd());
-  const ephemeral = config.home.length === 0;
   // Absolute before anything else sees it: the child runs in `cwd` and would
   // read a relative KIMI_CODE_HOME against that directory instead.
   const home = ephemeral ? makeEphemeralHome() : resolvePath(config.home);
@@ -578,6 +666,7 @@ export function spawnKimi<
       subprocess,
       home,
       assembled,
+      modelOverlay: overlay?.name ?? null,
       ephemeral,
       cwd,
       dispose: async () => {
