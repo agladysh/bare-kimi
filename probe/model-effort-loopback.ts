@@ -49,7 +49,27 @@
  *   derives `__secondary__` from) and an unconfigured one.
  * - n8-always (N8): `[thinking] enabled = false` on a model with the field
  *   `always_thinking = true` against the capability string
- *   `"always_thinking"`.
+ *   `"always_thinking"`, with no off effort declared. Its off control may
+ *   fail before any request, which leaves the comparison unknown.
+ * - n8b-off (N8): the same comparison against a working off control, a
+ *   thinking model declaring `off_effort = "none"`; and `off` on models
+ *   declaring thinking by capability only, by `support_efforts` only, or not
+ *   at all, none declaring an off effort. Open: what `off` sends once an off
+ *   effort is declared; whether the field and the capability string differ
+ *   from that control; which declarations make kimi fail before sending; and
+ *   how that failure ends (the capability-only step has the one long
+ *   deadline; the other no-off steps are short and show only kimi's first
+ *   retry reports).
+ * - n2-kimi-undeclared (N2): efforts `high` and `max` on a kimi-type model
+ *   declaring thinking but no `support_efforts`, natively and through
+ *   bare-kimi (which takes it as `undeclared`). Open: whether strict
+ *   validation sends either as configured.
+ *
+ * A turn with thinking off counts as off honored when it sent no effort, or
+ * only the off effort that same step's config declared. kimi's own
+ * `turn.step.retrying` reports, in a step that sent no request of any kind,
+ * are read as a client-side failure observed before the step ended; the
+ * answer says whether a deadline cut it short and claims no exit not seen.
  * - ctl-openai, ctl-kimi: controls showing the configured effort on the
  *   wire for each provider type. A case that depends on one runs it first,
  *   also when only that case is selected; its effort answers are `unknown`
@@ -169,7 +189,7 @@ import {
 } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { parseArgs } from 'node:util';
-import { isMetaSessionResumeHint, isMetaSystemVersion, parseStreamJson } from '../src/events.ts';
+import { isMetaSessionResumeHint, isMetaSystemVersion, isMetaTurnStepRetrying, parseStreamJson } from '../src/events.ts';
 import { DELEGATION_EXEC, DELEGATION_MACH, EXEC_CONTROL, PREFLIGHT, droppedSections, judgeIsolation, sandboxProfile } from './isolation.ts';
 
 const SCHEMA = 'bare-kimi/model-effort-loopback/1';
@@ -848,6 +868,8 @@ interface NativeStep extends StepBase {
   readonly print?: boolean;
   /** Added to the child's environment; `{PORT}` is replaced by the provider port. */
   readonly env?: Readonly<Record<string, string>>;
+  /** This step's deadline, when not STEP_DEADLINE_MS. */
+  readonly deadlineMs?: number;
 }
 
 interface LibraryStep extends StepBase {
@@ -889,6 +911,25 @@ const FORCED_VALUES: readonly (readonly [string, string])[] = [
   ['space', ' '],
 ];
 const N8_BASE = ['capabilities = ["thinking"]', 'support_efforts = ["high"]'];
+/**
+ * The off effort as config.toml spells it. kimi 2.1.0's model schema field is
+ * `offEffort` (`ModelBaseSchema`), and its own error asks to "Declare
+ * offEffort (for example 'none')". config.toml keys reach that schema through
+ * `modelsFromToml`, the path that turned `support_efforts` into the
+ * `supportEfforts` N3 showed honored, so the TOML key is `off_effort`. The
+ * converter's body (`transformPlainObject`) is not in the excerpts read; the
+ * n8b-off control checks the spelling natively, since a key kimi ignored
+ * would leave the off control failing as before.
+ */
+const OFF_NONE = 'off_effort = "none"';
+const N8B_DECLARED = [...N8_BASE, OFF_NONE];
+/** Long enough for kimi's off retries (10 attempts, delays reaching about 39 s) to end on their own. */
+const TERMINAL_RETRY_DEADLINE_MS = 300_000;
+/**
+ * Ten times the 1-3 s an ordinary turn took in the extended run: enough for a
+ * request, or for kimi's first retry reports; not for their terminal exit.
+ */
+const SHORT_DEADLINE_MS = 30_000;
 const N5_HOME = cfg('openai', [A()], effortOn('high'));
 
 export const CASES: readonly CaseDef[] = [
@@ -1336,21 +1377,125 @@ export const CASES: readonly CaseDef[] = [
     ],
     judge: (j) => {
       const on = requireEffort(j.step('on'), 'high');
-      const off = effortRead(j.step('off'));
-      const offWhy =
-        'why' in off
-          ? U(off.why)
-          : 'exited' in off
-            ? U(`control off: kimi exited ${off.exited}`)
-            : off.fields.length > 0
-              ? U(`thinking off still sent ${fieldsText(off.fields)}`)
-              : undefined;
-      const blocked = on ?? offWhy;
-      const choice = { high: 'thinks despite off', '': 'off honored' };
+      const offControl = offAnswer(j.step('off'), null);
+      const blocked = on ?? (offControl.startsWith('off honored') ? undefined : U(`the off control was not honored: ${offControl}`));
       return {
-        'control: off sends no effort': blocked ?? 'yes',
-        'always_thinking = true (model field), thinking off': blocked ?? effortChoice(j.step('field'), choice),
-        'capability "always_thinking", thinking off': blocked ?? effortChoice(j.step('string'), choice),
+        'control: thinking off, no off_effort': offControl,
+        'always_thinking = true (model field), thinking off': blocked ?? offAnswer(j.step('field'), null),
+        'capability "always_thinking", thinking off': blocked ?? offAnswer(j.step('string'), null),
+      };
+    },
+  },
+  {
+    id: 'n8b-off',
+    question: 'N8',
+    title: 'thinking off with a declared off_effort, against always-thinking declarations and models declaring none',
+    dependsOn: [],
+    steps: [
+      {
+        kind: 'native',
+        id: 'on',
+        purpose: 'control: thinking on, "high", off_effort declared',
+        config: cfg('openai', [A(N8B_DECLARED)], effortOn('high')),
+        deadlineMs: SHORT_DEADLINE_MS,
+      },
+      {
+        kind: 'native',
+        id: 'off',
+        purpose: 'control: thinking off, off_effort "none" declared',
+        config: cfg('openai', [A(N8B_DECLARED)], OFF),
+        deadlineMs: SHORT_DEADLINE_MS,
+      },
+      {
+        kind: 'native',
+        id: 'field',
+        purpose: 'the off control plus always_thinking = true',
+        config: cfg('openai', [A([...N8B_DECLARED, 'always_thinking = true'])], OFF),
+        deadlineMs: SHORT_DEADLINE_MS,
+      },
+      {
+        kind: 'native',
+        id: 'string',
+        purpose: 'capabilities ["thinking", "always_thinking"], support_efforts, off_effort "none", off',
+        config: cfg('openai', [A(['capabilities = ["thinking", "always_thinking"]', 'support_efforts = ["high"]', OFF_NONE])], OFF),
+        deadlineMs: SHORT_DEADLINE_MS,
+      },
+      {
+        kind: 'native',
+        id: 'caps-only',
+        purpose: 'capabilities ["thinking"] only, no off_effort, off; the one long step, to see how the retries end',
+        config: cfg('openai', [A(['capabilities = ["thinking"]'])], OFF),
+        deadlineMs: TERMINAL_RETRY_DEADLINE_MS,
+      },
+      {
+        kind: 'native',
+        id: 'efforts-only',
+        purpose: 'support_efforts ["high"] only, no off_effort, off',
+        config: cfg('openai', [A(['support_efforts = ["high"]'])], OFF),
+        deadlineMs: SHORT_DEADLINE_MS,
+      },
+      {
+        kind: 'native',
+        id: 'bare',
+        purpose: "no thinking metadata, off (bare-kimi's undeclared off)",
+        config: cfg('openai', [A([])], OFF),
+        deadlineMs: SHORT_DEADLINE_MS,
+      },
+    ],
+    judge: (j) => {
+      const on = requireEffort(j.step('on'), 'high');
+      const offControl = offAnswer(j.step('off'), 'none');
+      // The declared off effort must work before an always-thinking declaration can be compared with it.
+      const offBlocked = on ?? (offControl.startsWith('off honored') ? undefined : U(`the off control with off_effort "none" was not honored: ${offControl}`));
+      return {
+        'control: thinking on, "high"': on ?? 'sent "high"',
+        'control: thinking off, off_effort "none"': offControl,
+        'always_thinking = true (model field), off_effort "none", off': offBlocked ?? offAnswer(j.step('field'), 'none'),
+        'capability "always_thinking", off_effort "none", off': offBlocked ?? offAnswer(j.step('string'), 'none'),
+        'capabilities ["thinking"] only, no off_effort, off': on ?? offAnswer(j.step('caps-only'), null),
+        'support_efforts ["high"] only, no off_effort, off': on ?? offAnswer(j.step('efforts-only'), null),
+        'no thinking metadata, off': on ?? offAnswer(j.step('bare'), null),
+      };
+    },
+  },
+  {
+    id: 'n2-kimi-undeclared',
+    question: 'N2',
+    title: 'kimi type (strict validation): efforts "high" and "max" on a model declaring thinking but no support_efforts',
+    dependsOn: ['ctl-kimi'],
+    steps: [
+      {
+        kind: 'native',
+        id: 'high',
+        purpose: 'kimi, [thinking] effort "high"',
+        config: cfg('kimi', [A(['capabilities = ["thinking"]'])], effortOn('high')),
+        deadlineMs: SHORT_DEADLINE_MS,
+      },
+      {
+        kind: 'native',
+        id: 'max',
+        purpose: 'kimi, [thinking] effort "max"',
+        config: cfg('kimi', [A(['capabilities = ["thinking"]'])], effortOn('max')),
+        deadlineMs: SHORT_DEADLINE_MS,
+      },
+      {
+        kind: 'library',
+        id: 'w-max',
+        purpose: 'bare-kimi effort "max" (expected: undeclared)',
+        expect: 'launched',
+        source: cfg('kimi', [A(['capabilities = ["thinking"]'])], null),
+        effort: 'max',
+      },
+    ],
+    judge: (j) => {
+      const g = gate(j, 'ctl-kimi');
+      const high = j.step('high');
+      const max = j.step('max');
+      return {
+        'effort "high", kimi type, no support_efforts': g ?? effortAnswer(high),
+        'effort "max", kimi type, no support_efforts': g ?? effortAnswer(max),
+        'effort "max" through bare-kimi': g ?? effortAnswer(j.step('w-max')),
+        'high/max contrast': g ?? strictContrast(high, max),
       };
     },
   },
@@ -1380,6 +1525,21 @@ export interface WrapperResult {
   readonly configAfter?: unknown;
 }
 
+export interface RetryError {
+  readonly name: string | null;
+  readonly message: string;
+  /** Present when the failure carried an HTTP status, i.e. came from a response. */
+  readonly statusCode: number | null;
+  count: number;
+}
+
+export interface RetrySummary {
+  readonly events: number;
+  readonly lastFailedAttempt: number;
+  readonly maxAttempts: number;
+  readonly errors: RetryError[];
+}
+
 export interface StepRecord {
   readonly id: string;
   readonly via: 'native' | 'library';
@@ -1400,6 +1560,10 @@ export interface StepRecord {
   sessionId?: string;
   systemVersion?: string;
   chats: ChatSummary[];
+  /** Every request attributed to the step, of any kind. */
+  requests: number;
+  /** kimi's own retry reports from its stream-json, when it made any. */
+  retrying: RetrySummary | null;
   /** `/models` requests during the step: a catalog refresh may have changed what the config declares. */
   catalogRequests: number;
   /** Requests of the step that could not be written to the request log. */
@@ -1448,12 +1612,48 @@ export function usable(s: StepRecord): string | undefined {
     return `${s.id} was stopped (by ${String(s.process.stoppedBy ?? 'the deadline or members left in its group')})`;
   }
   if (s.via === 'library' && s.wrapper?.phase === 'refused') return `${s.id}: bare-kimi refused, kimi did not run`;
+  return evidenceFault(s);
+}
+
+/** A fault in what the step's evidence can show, whatever kimi did. */
+function evidenceFault(s: StepRecord): string | undefined {
   if (s.droppedSections.length > 0) return `${s.id}: kimi dropped config section(s) ${s.droppedSections.join(', ')}`;
   if (s.logFaults > 0) return `${s.id}: ${s.logFaults} request(s) could not be logged`;
   if (s.credentialFaults > 0) return `${s.id}: ${s.credentialFaults} request(s) carried an unexpected credential`;
   if (s.catalogRequests > 0) return `${s.id}: ${s.catalogRequests} catalog request(s); a refresh may have changed the declared thinking`;
   if (s.configChange !== null) return `${s.id}: ${s.configChange}`;
   return undefined;
+}
+
+/**
+ * kimi's own report of a failure before it sent anything, when that is all
+ * the step can show: it ran, no request of any kind reached the loopback
+ * provider, kimi's stream-json reported `turn.step.retrying` with errors that
+ * carry no HTTP status, nothing in them or in stderr looks like the
+ * sandbox's, and the step's evidence has no fault. It is read from what kimi
+ * reported before the step ended, so a deadline or stop does not void it;
+ * the text says how the step ended and claims no exit it did not see. No
+ * provider is blamed: none was reached. Undefined otherwise.
+ */
+export function clientFailure(s: StepRecord): string | undefined {
+  const retrying = s.retrying;
+  if (s.status !== 'ran' || retrying === null || s.requests > 0) return undefined;
+  if (s.via === 'library' && s.wrapper?.phase === 'refused') return undefined;
+  if (evidenceFault(s) !== undefined || sandboxLike(s) !== undefined) return undefined;
+  if (retrying.errors.some((error) => error.statusCode !== null || SANDBOX_LIKE.test(error.message))) return undefined;
+  const first = retrying.errors[0];
+  if (first === undefined) return undefined;
+  const others = retrying.errors.length > 1 ? ` (+${retrying.errors.length - 1} other error text(s))` : '';
+  const ended =
+    s.process?.deadlineHit === true
+      ? 'the step deadline stopped it; no exit observed'
+      : s.process?.stop !== null && s.process?.stop !== undefined
+        ? 'the step was stopped; no exit observed'
+        : `kimi exited ${String(childExit(s))}`;
+  return (
+    `client-side failure before any request: ${String(first.name)}: ${short(first.message, 300)}${others}; ` +
+    `${retrying.events} retry report(s), last failed attempt ${retrying.lastFailedAttempt} of ${retrying.maxAttempts}; ${ended}`
+  );
 }
 
 /** kimi's own exit: the native child's, or what bare-kimi's subprocess reported. */
@@ -1506,8 +1706,14 @@ function noTurn(s: StepRecord): NoTurn {
   return { exited: exit, stderr: lastLine(s.stderrTail) };
 }
 
-function isEffortField(field: Field): boolean {
-  return typeof field.value === 'string' && (EFFORT_NAMES.has(field.value) || field.value.trim().length === 0);
+/**
+ * A known effort value: a known effort name, blank, or one of `declared`, the
+ * values the step's own config declared (its `off_effort`). A value is never
+ * recognized because some other step declared it.
+ */
+function isEffortField(field: Field, declared: readonly string[]): boolean {
+  if (typeof field.value !== 'string') return false;
+  return EFFORT_NAMES.has(field.value) || declared.includes(field.value) || field.value.trim().length === 0;
 }
 
 /** The field's own key: the last path segment, without array indexes. */
@@ -1515,25 +1721,31 @@ function lastSegment(path: string): string {
   return path.replaceAll(/\[\d+\]/g, '').split('.').at(-1) ?? '';
 }
 
-export type EffortRead = { readonly fields: readonly Field[] } | NoTurn;
+export type EffortRead = { readonly fields: readonly Field[] } | { readonly client: string } | NoTurn;
 
 /**
- * The effort values of the step's own turn; or kimi's failing exit without
- * one; or why neither is known. A value under an effort key that is not a
- * known effort name (nor blank) is not taken as "not sent": what it means is
- * not established, so the answer is unknown.
+ * The effort values of the step's own turn; kimi's client-side failure
+ * before any request (see clientFailure); kimi's failing exit without a
+ * request; or why none of these is known. A value under an effort key that
+ * is neither a known effort name, blank, nor one of `declared` (the step's
+ * own declared off effort) is not taken as "not sent": what it means is not
+ * established, so the answer is unknown.
  */
-export function effortRead(s: StepRecord): EffortRead {
+export function effortRead(s: StepRecord, declared: readonly string[] = []): EffortRead {
+  const client = clientFailure(s);
+  if (client !== undefined) return { client };
   const turn = turnOf(s);
   if ('why' in turn) return turn;
   if ('none' in turn) return noTurn(s);
-  const strange = turn.chat.fields.filter((field) => /effort/i.test(lastSegment(field.path)) && !isEffortField(field));
+  const known = (field: Field): boolean => isEffortField(field, declared);
+  const strange = turn.chat.fields.filter((field) => /effort/i.test(lastSegment(field.path)) && !known(field));
   if (strange.length > 0) return { why: `${s.id}: unrecognized effort value ${fieldsText(strange)}` };
-  return { fields: turn.chat.fields.filter(isEffortField) };
+  return { fields: turn.chat.fields.filter(known) };
 }
 
 export function effortAnswer(s: StepRecord): string {
   const read = effortRead(s);
+  if ('client' in read) return read.client;
   if ('why' in read) return U(read.why);
   if ('exited' in read) return `no request; kimi exited ${read.exited}: ${read.stderr}`;
   if (read.fields.length > 0) return `sent ${fieldsText(read.fields)}`;
@@ -1543,6 +1755,7 @@ export function effortAnswer(s: StepRecord): string {
 /** Undefined when `s` sent `effort`; otherwise why the step cannot serve as that control. */
 export function requireEffort(s: StepRecord, effort: string): string | undefined {
   const read = effortRead(s);
+  if ('client' in read) return U(`${s.id}: ${read.client}`);
   if ('why' in read) return U(read.why);
   if ('exited' in read) return U(`${s.id}: kimi exited ${read.exited}`);
   return read.fields.some((field) => field.value === effort) ? undefined : U(`${s.id} did not send "${effort}" (${fieldsText(read.fields)})`);
@@ -1551,12 +1764,46 @@ export function requireEffort(s: StepRecord, effort: string): string | undefined
 /** Name the effort the turn sent by `labels` (key '' for none sent). */
 export function effortChoice(s: StepRecord, labels: Record<string, string>): string {
   const read = effortRead(s);
+  if ('client' in read) return read.client;
   if ('why' in read) return U(read.why);
   if ('exited' in read) return `no request; kimi exited ${read.exited}: ${read.stderr}`;
   const values = [...new Set(read.fields.map((field) => String(field.value)))];
   const key = values.length === 0 ? '' : values.length === 1 ? (values[0] ?? '') : undefined;
   const label = key === undefined ? undefined : labels[key];
   return `${label ?? 'other'}: ${values.length === 0 ? 'no effort sent' : `sent ${fieldsText(read.fields)}`}`;
+}
+
+/**
+ * What a turn configured with thinking off sent. `off honored` when it sent
+ * no effort value, or only the step's own declared off effort (`declaredOff`,
+ * null when the step declares none); `thinks despite off` when it sent any
+ * other known effort. A client-side failure or a failing exit is reported as
+ * observed; anything else not established is unknown.
+ */
+export function offAnswer(s: StepRecord, declaredOff: string | null): string {
+  const read = effortRead(s, declaredOff === null ? [] : [declaredOff]);
+  if ('client' in read) return read.client;
+  if ('why' in read) return U(read.why);
+  if ('exited' in read) return `no request; kimi exited ${read.exited}: ${read.stderr}`;
+  if (read.fields.length === 0) return 'off honored: no effort sent';
+  if (read.fields.every((field) => field.value === declaredOff)) return `off honored: sent the declared off effort ${fieldsText(read.fields)}`;
+  return `thinks despite off: sent ${fieldsText(read.fields)}`;
+}
+
+/**
+ * Two turns configured with "high" and "max" on the same undeclared model:
+ * which of them sent its configured value. Only captured turns are compared.
+ */
+export function strictContrast(high: StepRecord, max: StepRecord): string {
+  const a = effortRead(high);
+  const b = effortRead(max);
+  if (!('fields' in a) || !('fields' in b)) return U('one of the pair has no captured turn to compare');
+  const highSent = a.fields.some((field) => field.value === 'high');
+  const maxSent = b.fields.some((field) => field.value === 'max');
+  const detail = `(high: ${fieldsText(a.fields)}; max: ${fieldsText(b.fields)})`;
+  if (highSent && maxSent) return `both sent as configured ${detail}`;
+  if (!highSent && !maxSent) return `neither sent as configured ${detail}`;
+  return `only "${highSent ? 'high' : 'max'}" sent as configured ${detail}`;
 }
 
 /** Whether the step's turn carried the keep value, anywhere among its thinking fields. */
@@ -1704,6 +1951,10 @@ function describeStep(s: StepRecord): string {
   const turn = turnOf(s);
   if ('chat' in turn) parts.push(`model ${String(turn.chat.model)}`, `thinking fields ${fieldsText(turn.chat.fields)}`);
   else if ('why' in turn) parts.push(`turn not usable: ${turn.why}`);
+  if (s.retrying !== null) {
+    const first = s.retrying.errors[0];
+    parts.push(`${s.retrying.events} retry report(s) up to attempt ${s.retrying.lastFailedAttempt}/${s.retrying.maxAttempts}${first ? `: ${short(first.message, 160)}` : ''}`);
+  }
   if (s.catalogRequests > 0) parts.push(`${s.catalogRequests} catalog request(s)`);
   if (s.configChange !== null) parts.push(s.configChange);
   if (s.logFaults > 0) parts.push(`${s.logFaults} unlogged request(s)`);
@@ -2083,7 +2334,8 @@ async function runStep(d: Dispatch, def: CaseDef, step: Step, record: StepRecord
   const driverErr = step.kind === 'native' ? stderrPath : join(dir, 'driver.stderr.txt');
   let processRecord: ProcessRecord;
   try {
-    processRecord = await runOwned(d.lc, `${def.id}/${step.id}`, cmd, env, work, STEP_DEADLINE_MS, driverOut, driverErr);
+    const deadline = step.kind === 'native' ? (step.deadlineMs ?? STEP_DEADLINE_MS) : STEP_DEADLINE_MS;
+    processRecord = await runOwned(d.lc, `${def.id}/${step.id}`, cmd, env, work, deadline, driverOut, driverErr);
   } finally {
     active = null;
     record.endedAt = now();
@@ -2115,6 +2367,8 @@ async function runStep(d: Dispatch, def: CaseDef, step: Step, record: StepRecord
   if (step.kind === 'native' && step.print === false) record.helpFlags = helpFlags(`${stdout}\n${stderr}`);
   const mine = attributed.filter((entry) => entry.caseId === def.id && entry.step === step.id);
   record.chats = mine.flatMap((entry) => (entry.chat === null ? [] : [entry.chat]));
+  record.requests = mine.length;
+  record.retrying = summarizeRetries(events);
   record.catalogRequests = mine.filter((entry) => entry.kind === 'models').length;
   record.credentialFaults = mine.filter((entry) => entry.unexpectedCredentials.length > 0).length;
   record.logFaults = logFailures.filter((failure) => failure.caseId === def.id && failure.step === step.id).length;
@@ -2150,6 +2404,27 @@ function configChange(watched: { path: string; sha256: string } | undefined, wra
   return changes.length === 0 ? null : changes.join('; ');
 }
 
+/** kimi's `turn.step.retrying` meta lines, condensed: how far it got, and each distinct error once. */
+function summarizeRetries(events: readonly unknown[]): RetrySummary | null {
+  const retries = events.filter(isMetaTurnStepRetrying);
+  if (retries.length === 0) return null;
+  const errors: RetryError[] = [];
+  for (const retry of retries) {
+    const name = retry.error_name ?? null;
+    const text = retry.error_message ?? '';
+    const statusCode = retry.status_code ?? null;
+    const seen = errors.find((error) => error.name === name && error.message === text && error.statusCode === statusCode);
+    if (seen === undefined) errors.push({ name, message: text, statusCode, count: 1 });
+    else seen.count += 1;
+  }
+  return {
+    events: retries.length,
+    lastFailedAttempt: Math.max(...retries.map((retry) => retry.failed_attempt)),
+    maxAttempts: Math.max(...retries.map((retry) => retry.max_attempts)),
+    errors,
+  };
+}
+
 function newRecord(step: Step): StepRecord {
   return {
     id: step.id,
@@ -2157,6 +2432,8 @@ function newRecord(step: Step): StepRecord {
     purpose: step.purpose,
     status: 'not-run',
     chats: [],
+    requests: 0,
+    retrying: null,
     catalogRequests: 0,
     logFaults: 0,
     credentialFaults: 0,

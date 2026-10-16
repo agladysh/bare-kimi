@@ -6,13 +6,16 @@ import {
   effortAnswer,
   effortChoice,
   modelAnswer,
+  offAnswer,
   redactHeaders,
   requireEffort,
+  strictContrast,
   type CaseResult,
   type ChatSummary,
   type Field,
   type Judging,
   type ProcessRecord,
+  type RetrySummary,
   type StepRecord,
 } from './model-effort-loopback.ts';
 
@@ -49,6 +52,8 @@ function step(over: Partial<StepRecord> = {}): StepRecord {
     status: 'ran',
     process: RAN,
     chats: [],
+    requests: 0,
+    retrying: null,
     catalogRequests: 0,
     logFaults: 0,
     credentialFaults: 0,
@@ -173,6 +178,103 @@ describe('steps that cannot answer for kimi', () => {
       expect(effortAnswer(step({ ...answered, ...over }))).toStartWith('unknown:');
     });
   }
+});
+
+const NO_OFF = "Model 'probe-model-a' reasons by default but declares no off effort, so thinking cannot be turned off.";
+
+function retries(message: string, statusCode: number | null = null): RetrySummary {
+  return { events: 6, lastFailedAttempt: 6, maxAttempts: 10, errors: [{ name: 'ChatProviderError', message, statusCode, count: 6 }] };
+}
+
+/** kimi retrying before any request until the step deadline stopped it. */
+const cutShort = (over: Partial<StepRecord> = {}): StepRecord =>
+  step({ process: { ...RAN, exitCode: null, signalCode: 'SIGTERM', deadlineHit: true, stop: { signal: 'SIGTERM' } }, retrying: retries(NO_OFF), ...over });
+
+describe('thinking off', () => {
+  const sent = (value: string) => step({ chats: [chat(1, 'probe-model-a', [effort(value)])] });
+
+  test("the step's own declared off effort is off honored; undeclared, the same value stays unknown", () => {
+    expect(offAnswer(sent('none'), 'none')).toBe('off honored: sent the declared off effort $.reasoning_effort="none"');
+    expect(offAnswer(sent('none'), null)).toStartWith('unknown:');
+    expect(effortAnswer(sent('none'))).toStartWith('unknown:');
+  });
+
+  test('no effort is off honored; any other known effort is thinking despite off, declared off effort or not', () => {
+    expect(offAnswer(step({ chats: [chat(1, 'probe-model-a', [])] }), null)).toBe('off honored: no effort sent');
+    expect(offAnswer(sent('high'), 'none')).toStartWith('thinks despite off');
+    expect(offAnswer(sent('minimal'), 'none')).toStartWith('thinks despite off');
+  });
+});
+
+describe('a client-side failure before any request', () => {
+  test('is observed when kimi reported it, even though the deadline cut the step short, and claims no exit', () => {
+    const answer = offAnswer(cutShort(), null);
+    expect(answer).toStartWith('client-side failure before any request: ChatProviderError:');
+    expect(answer).toContain('last failed attempt 6 of 10');
+    expect(answer).toContain('no exit observed');
+    expect(answer).not.toContain('kimi exited');
+  });
+
+  test('names the exit when kimi ended on its own', () => {
+    const exited = step({ process: { ...RAN, exitCode: 1 }, retrying: retries(NO_OFF) });
+    expect(offAnswer(exited, null)).toContain('kimi exited 1');
+  });
+
+  test('is not a client-side failure once a request was made, a response status was reported, or it looks like the sandbox', () => {
+    expect(offAnswer(cutShort({ requests: 1 }), null)).toStartWith('unknown:');
+    expect(offAnswer(cutShort({ retrying: retries(NO_OFF, 400) }), null)).toStartWith('unknown:');
+    expect(offAnswer(cutShort({ retrying: retries('EPERM: operation not permitted, connect') }), null)).toStartWith('unknown:');
+    expect(offAnswer(cutShort({ catalogRequests: 1 }), null)).toStartWith('unknown:');
+  });
+
+  test('cannot serve as a control that must send an effort', () => {
+    expect(requireEffort(cutShort(), 'high')).toStartWith('unknown:');
+  });
+});
+
+describe('n8b-off', () => {
+  const n8b = CASES.find((def) => def.id === 'n8b-off');
+  const judge = (steps: Record<string, StepRecord>): Record<string, string> => {
+    if (n8b === undefined) throw new Error('n8b-off is not defined');
+    return n8b.judge({
+      step: (id) => steps[id] ?? step({ id, status: 'not-run', notRunReason: 'not in this test' }),
+      control: () => undefined,
+    });
+  };
+  const turn = (id: string, fields: Field[]) => step({ id, chats: [chat(1, 'probe-model-a', fields)] });
+  const on = turn('on', [effort('high')]);
+
+  test('an off control that fails as before (off_effort not taken) leaves the always-thinking comparison unknown', () => {
+    const facts = judge({ on, off: cutShort({ id: 'off' }), field: turn('field', []), string: turn('string', [effort('high')]) });
+    expect(facts['control: thinking off, off_effort "none"']).toStartWith('client-side failure');
+    expect(facts['always_thinking = true (model field), off_effort "none", off']).toStartWith('unknown: the off control');
+    expect(facts['capability "always_thinking", off_effort "none", off']).toStartWith('unknown: the off control');
+  });
+
+  test('against a working off control, the field and the string are each judged on their own wire', () => {
+    const facts = judge({
+      on,
+      off: turn('off', [effort('none')]),
+      field: turn('field', [effort('none')]),
+      string: turn('string', [effort('high')]),
+      'caps-only': cutShort({ id: 'caps-only' }),
+      bare: turn('bare', []),
+    });
+    expect(facts['always_thinking = true (model field), off_effort "none", off']).toStartWith('off honored');
+    expect(facts['capability "always_thinking", off_effort "none", off']).toStartWith('thinks despite off');
+    expect(facts['capabilities ["thinking"] only, no off_effort, off']).toStartWith('client-side failure');
+    expect(facts['no thinking metadata, off']).toBe('off honored: no effort sent');
+    expect(facts['support_efforts ["high"] only, no off_effort, off']).toStartWith('unknown:');
+  });
+});
+
+describe('strict high/max contrast', () => {
+  test('reports which configured value each captured turn sent, and nothing without both turns', () => {
+    const high = step({ chats: [chat(1, 'probe-model-a', [effort('enabled', '$.thinking.type'), effort('high', '$.thinking.effort')])] });
+    const max = step({ chats: [chat(2, 'probe-model-a', [effort('enabled', '$.thinking.type')])] });
+    expect(strictContrast(high, max)).toStartWith('only "high" sent as configured');
+    expect(strictContrast(high, cutShort())).toStartWith('unknown:');
+  });
 });
 
 describe('redactHeaders', () => {
