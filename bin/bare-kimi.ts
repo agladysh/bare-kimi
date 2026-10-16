@@ -101,7 +101,12 @@ Model and effort:
                         listing no support_efforts is taken unchecked and
                         a notice says so; kimi decides at run time. With
                         --preload no notice is printed. A resumed session
-                        keeps the effort it was created with.
+                        keeps the effort it was created with. When the
+                        source's table for a kept home's model stops
+                        accepting its pinned effort (a login may rewrite a
+                        managed model's support_efforts), only --resume ID
+                        still runs there; the routing line reports the
+                        effort as withdrawn.
   Every run prints one "routed to model" line on stderr: the alias, its
   provider type and model id, the effort pinned or configured for new
   sessions and its support, and where each came from (selected, the
@@ -123,11 +128,18 @@ Run shape:
   --kimi-bin PATH       kimi binary (default: $KIMI_BIN ?? kimi on PATH).
                         A relative PATH resolves against the current
                         directory.
-  --kimi-arg ARG        Forward ARG verbatim to kimi (repeatable). Refused
+  --kimi-arg ARG        Forward ARG verbatim to kimi (repeatable), after
+                        bare-kimi's own flags and before its -p. Refused
                         when kimi would read it as selecting a model or a
                         session (-m, --model, -S, --session, -r, --resume,
-                        -c, --continue, -C, also as -mX, --model=X or in a
-                        cluster such as -yc): use -m, --resume, --continue.
+                        -c, --continue, -C), as setting the output format
+                        or the prompt (--output-format, -p, --prompt), in
+                        any spelling (-mX, --model=X, a cluster such as
+                        -yc), or when it is --: use -m, --resume,
+                        --continue, --output-format and the prompt itself.
+                        The last ARG may not be a flag still waiting for
+                        its value (--add-dir, --skills-dir, --agent,
+                        --agent-file): kimi would take bare-kimi's -p.
                         --skills-dir, --add-dir and --kimi-arg go to kimi
                         verbatim; kimi resolves relative paths in --cwd.
   --no-process-env      Do not inherit the parent environment.
@@ -156,8 +168,10 @@ then sets KIMI_CODE_HOME to the run home and KIMI_CODE_HOME_SOURCE to the
 source home, and KIMI_DISABLE_TELEMETRY=1 and KIMI_CODE_NO_AUTO_UPDATE=1
 unless already set. A dropped variable cannot be restored from the CLI (the
 library's extraEnv can, except KIMI_CODE_HOME; an env-model variable, any
-KIMI_MODEL_* but KIMI_MODEL_THINKING_EFFORT and KIMI_MODEL_THINKING_KEEP,
-only on an ephemeral run without a model or effort).
+KIMI_MODEL_* but KIMI_MODEL_THINKING_EFFORT, KIMI_MODEL_THINKING_KEEP and
+KIMI_MODEL_OUTPUT_FORMAT, only on an ephemeral run without a model or
+effort). bare-kimi always passes --output-format, which kimi takes over
+KIMI_MODEL_OUTPUT_FORMAT.
 
 Permissions: -p forces kimi's native auto permission mode; -y/--yolo,
 --auto and --plan conflict with -p and cannot be used. bare-kimi passes no
@@ -445,7 +459,9 @@ const MIGRATION_ORIGIN: Readonly<Record<MigrationBasis, string>> = {
  * provider type and model id, and the effort pinned or configured for new
  * sessions with its support. It names no path, credential, URL or key. A
  * resumed session keeps the effort it stored (observed in kimi 2.1.0 -p);
- * --model makes it run on the named alias, else it keeps its own.
+ * --model makes it run on the named alias, else it keeps its own. For a
+ * pinned effort the source no longer accepts (`withdrawn`), it says so, and
+ * that whether the resumed session keeps that effort is unknown.
  */
 function describeRouting(assembled: AssembledHome, options: LaunchOptions, run: 'new' | 'resume' | 'preload'): string {
   const pinned = assembled.adopted ? 'pinned when the home was adopted' : 'pinned by the home';
@@ -470,15 +486,22 @@ function describeRouting(assembled: AssembledHome, options: LaunchOptions, run: 
         : assembled.action === 'reuse'
           ? pinned
           : 'selected';
-    effort = `effort "${assembled.effort}" (${effortOrigin}, ${assembled.effortSupport ?? 'unchecked'})`;
+    effort =
+      assembled.effortSupport === 'withdrawn'
+        ? `effort "${assembled.effort}" (${effortOrigin}, withdrawn: the source's declaration for this alias no ` +
+          'longer accepts it; kept only to resume a session)'
+        : `effort "${assembled.effort}" (${effortOrigin}, ${assembled.effortSupport ?? 'unchecked'})`;
   } else {
     const configured =
       assembled.configuredEffort === null ? "the model's default effort" : `effort "${assembled.configuredEffort}"`;
     effort = `no effort pinned; config.toml gives new sessions ${configured} from the source's [thinking]`;
   }
-  const kept = `keeps the effort it stored and ${
-    options.model === undefined ? 'the alias it stored' : 'runs on this alias, which --model names'
-  }`;
+  const alias = options.model === undefined ? 'the alias it stored' : 'runs on this alias, which --model names';
+  // Observed: a resume keeps its stored effort over a changed [thinking]. Not observed: over a changed model table.
+  const kept =
+    assembled.effortSupport === 'withdrawn'
+      ? `keeps ${alias}; whether kimi keeps its stored effort, now that the model's table no longer lists it, is unknown`
+      : `keeps the effort it stored and ${alias}`;
   const resume =
     run === 'resume'
       ? `; this run resumes a session, which ${kept}`

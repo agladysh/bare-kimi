@@ -111,8 +111,10 @@ describe('buildArgv', () => {
     expect(skilled.join(' ')).toContain('--add-dir /c');
   });
 
-  test('text output format emits no --output-format flag', () => {
-    expect(buildArgv(base, 'kimi')).not.toContain('--output-format');
+  test('the output format is passed for text too, before the forwarded arguments and the prompt', () => {
+    // kimi takes the flag over KIMI_MODEL_OUTPUT_FORMAT, and keeps a repeated flag's last value.
+    const argv = buildArgv(LaunchConfig({ prompt: 'x', extraArgs: ['--agent', 'reviewer'] }), 'kimi');
+    expect(argv).toEqual(['kimi', '--output-format', 'text', '--agent', 'reviewer', '-p', 'x']);
   });
 });
 
@@ -283,8 +285,31 @@ describe('option checks before any work', () => {
       expect(() => checkPreloadOptions({ prompt: 'x', extraArgs })).toThrow('selects a session');
     }
     // Controls: flags that select neither, and a value that is not a flag.
-    for (const extraArgs of [['--verbose-native'], ['-y'], ['--agent', 'reviewer'], ['--add-dir', 'cache'], ['-p-like']]) {
+    for (const extraArgs of [['--verbose-native'], ['-y'], ['--agent', 'reviewer'], ['--add-dir', 'cache']]) {
       expect(() => checkLaunchOptions({ prompt: 'x', extraArgs })).not.toThrow();
+    }
+  });
+
+  test('extraArgs that would take over the output format or the prompt, or end option parsing, are refused', () => {
+    const outputs = [['--output-format', 'text'], ['--output-format=stream-json']];
+    // kimi's parser reads -px and -yp as -p with a value: a forwarded prompt bare-kimi's own -p would replace.
+    const prompts = [['-p', 'other'], ['--prompt', 'other'], ['--prompt=other'], ['-pother'], ['-p-like'], ['-yp', 'other']];
+    for (const extraArgs of outputs) {
+      expect(() => checkLaunchOptions({ prompt: 'x', extraArgs })).toThrow('sets the output format');
+    }
+    for (const extraArgs of prompts) {
+      expect(() => checkLaunchOptions({ prompt: 'x', extraArgs })).toThrow('sets the prompt');
+    }
+    expect(() => checkLaunchOptions({ prompt: 'x', extraArgs: ['--', 'y'] })).toThrow("ends kimi's options");
+    expect(() => checkPreloadOptions({ prompt: 'x', extraArgs: ['--output-format=text'] })).toThrow('sets the output format');
+  });
+
+  test('extraArgs may not end in a flag that waits for a value, which would take bare-kimi\'s -p', () => {
+    for (const flag of ['--add-dir', '--skills-dir', '--agent', '--agent-file']) {
+      expect(() => checkLaunchOptions({ prompt: 'x', extraArgs: ['-y', flag] })).toThrow(`ends with "${flag}"`);
+      // With its value, or the value attached, the flag stays usable.
+      expect(() => checkLaunchOptions({ prompt: 'x', extraArgs: [flag, 'v'] })).not.toThrow();
+      expect(() => checkLaunchOptions({ prompt: 'x', extraArgs: [`${flag}=v`] })).not.toThrow();
     }
   });
 
@@ -438,6 +463,38 @@ describe('model and effort through the fake child', () => {
       configuredEffort: 'high',
     });
     expect(fresh).toMatchObject({ resumed: false, storedEffort: 'high' });
+  });
+
+  test('a resume by id outlives a pinned effort the source stops listing; a new session and --continue are refused', async () => {
+    const root = temp('bare-kimi-sdk-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const out = join(root, 'sessions.ndjson');
+    const options = { home: join(root, 'run-home'), srcHome: src, kimiBin: FAKE_KIMI, extraEnv: { FAKE_KIMI_SESSION_OUT: out } };
+    const first = await runKimi({
+      ...options,
+      prompt: 'x',
+      model: 'kimi-code/k3-thinking',
+      effort: 'high',
+      outputFormat: 'stream-json',
+    });
+    expect(first.code).toBe(0);
+    if (!first.sessionId) throw new Error('the creating run did not report a session id');
+    editSourceConfig(src, (text) => text.replace('support_efforts = ["low", "medium", "high"]', 'support_efforts = ["low", "medium"]'));
+
+    await expect(runKimi({ ...options, prompt: 'y' })).rejects.toThrow('can still be resumed by its id');
+    // --continue may start a fresh session in kimi 2.1.0, so it gets no such exception.
+    await expect(runKimi({ ...options, prompt: 'y', continueRecent: true })).rejects.toThrow('now refuses');
+    const resumed = await runKimi({ ...options, prompt: 'z', resume: first.sessionId });
+
+    expect(resumed.code).toBe(0);
+    expect(resumed.assembled).toMatchObject({ modelAlias: 'kimi-code/k3-thinking', effort: 'high', effortSupport: 'withdrawn' });
+    // Only the creating run and the resume reached the child. (The fake keeps the stored effort;
+    // what kimi does with it against the changed table was not observed.)
+    expect(readSessionReports(out).map((report) => [report.sessionId, report.resumed])).toEqual([
+      [first.sessionId, false],
+      [first.sessionId, true],
+    ]);
   });
 
   test('a resume after the source default changed still finds its alias in the kept home', async () => {
@@ -600,13 +657,50 @@ describe('model and effort through the fake child', () => {
 });
 
 describe('env-model overlay variables', () => {
-  test('every KIMI_MODEL_* counts except the forced effort and keep; the secondary overrides are only scrubbed', () => {
+  test('every KIMI_MODEL_* counts except the forced effort, keep and output format; the secondary overrides are only scrubbed', () => {
     for (const name of ['KIMI_MODEL_NAME', 'KIMI_MODEL_BASE_URL', 'KIMI_MODEL_PROVIDER_TYPE']) {
       expect(isModelOverlayVar(name)).toBe(true);
     }
-    for (const name of ['KIMI_MODEL_THINKING_EFFORT', 'KIMI_MODEL_THINKING_KEEP', 'KIMI_SECONDARY_MODEL', 'KIMI_CODE_BASE_URL']) {
+    for (const name of [
+      'KIMI_MODEL_THINKING_EFFORT',
+      'KIMI_MODEL_THINKING_KEEP',
+      'KIMI_MODEL_OUTPUT_FORMAT',
+      'KIMI_SECONDARY_MODEL',
+      'KIMI_CODE_BASE_URL',
+    ]) {
       expect(isModelOverlayVar(name)).toBe(false);
     }
+    // Still scrubbed from the inherited environment.
+    expect(isScrubbedEnvVar('KIMI_MODEL_OUTPUT_FORMAT')).toBe(true);
+  });
+
+  test('KIMI_MODEL_OUTPUT_FORMAT is no env-model variable: taken on a kept home and beside an effort, effort fields kept, the flag passed', async () => {
+    // As read from kimi 2.1.0 (resolveOutputFormat), the flag wins over the variable, which feeds no overlay.
+    const root = temp('bare-kimi-sdk-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const home = join(root, 'run-home');
+    const out = join(root, 'sessions.ndjson');
+
+    const launched = spawnKimi(
+      {
+        prompt: 'x',
+        home,
+        srcHome: src,
+        model: 'kimi-code/k3-thinking',
+        effort: 'high',
+        kimiBin: FAKE_KIMI,
+        extraEnv: { KIMI_MODEL_OUTPUT_FORMAT: 'stream-json', FAKE_KIMI_SESSION_OUT: out },
+      },
+      { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' },
+    );
+    const code = await launched.subprocess.exited;
+    await launched.dispose();
+
+    expect(code).toBe(0);
+    expect(launched.modelOverlay).toBeNull();
+    expect(launched.assembled).toMatchObject({ effort: 'high', effortSupport: 'declared', configuredEffort: 'high' });
+    expect(hasFlag(readSessionReports(out)[0]!.argv, '--output-format', 'text')).toBe(true);
   });
 
   test('refused on a kept home before any effect on it: a non-blank name as observed, anything else as policy', async () => {

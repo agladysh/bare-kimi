@@ -171,7 +171,11 @@ export interface LaunchOptions {
   readonly adoptLegacyHome?: boolean;
   /**
    * Session id to resume (`--session`). The native CLI refuses a cross-cwd
-   * resume, so `cwd` must match the session's own cwd.
+   * resume, so `cwd` must match the session's own cwd. On a kept home pinned
+   * to an effort that the source's declaration for the model has since
+   * stopped accepting, only a resume by id is prepared; the effort is then
+   * reported `withdrawn` (see {@link RunHomeOptions.resumingSession}), and a
+   * launch without `resume`, `continueRecent` included, is refused.
    */
   readonly resume?: string;
   /** Resume the most recent session for this cwd (`--continue`). Mutually exclusive with `resume`. */
@@ -209,7 +213,9 @@ export interface LaunchOptions {
    * beside `effort` and on a run home pinned to an effort.
    * `KIMI_MODEL_THINKING_KEEP` is taken on any launch: in kimi 2.1.0 it did
    * not switch the model, and on a `kimi`-type provider it reached the
-   * request as `thinking.keep`. Any other `KIMI_MODEL_*` variable, here or in
+   * request as `thinking.keep`. `KIMI_MODEL_OUTPUT_FORMAT` is taken too, and
+   * has no effect: bare-kimi always passes `--output-format`, which kimi
+   * takes over it. Any other `KIMI_MODEL_*` variable, here or in
    * the spawn env and even blank, is an env-model variable (see
    * {@link isModelOverlayVar}): it is refused before any effect beside
    * `model` or `effort`, with a caller-supplied `home`, and in a preloaded
@@ -220,14 +226,24 @@ export interface LaunchOptions {
    */
   readonly extraEnv?: Record<string, string>;
   /**
-   * Extra arguments forwarded verbatim to kimi, just before `-p`. They may
-   * not select a model or a session, which kimi 2.1.0's `createProgram`
-   * reads from `-m`/`--model`, `-S`/`--session`, the hidden
-   * `-r`/`--resume`, `-c`/`--continue` and the hidden `-C`, in any spelling
-   * its parser takes (`--model=x`, `-mx`, a cluster such as `-yc`): use
-   * `model`, so the run home carries it, and `resume` or `continueRecent`,
-   * so their exclusivity and preload's fresh session hold. See
-   * {@link selectingArg}.
+   * Extra arguments forwarded verbatim to kimi, after bare-kimi's own flags
+   * and just before its `-p`. Refused (see {@link reservedArg}), in any
+   * spelling kimi 2.1.0's parser takes (`--model=x`, `-mx`, a cluster such
+   * as `-yc`):
+   * - a model or session selection (`-m`/`--model`, `-S`/`--session`, the
+   *   hidden `-r`/`--resume`, `-c`/`--continue`, the hidden `-C`): use
+   *   `model`, so the run home carries it, and `resume` or `continueRecent`,
+   *   so their exclusivity and preload's fresh session hold;
+   * - `--output-format` and `-p`/`--prompt`, which bare-kimi passes itself:
+   *   kimi keeps the last value of a flag, so a forwarded one would replace
+   *   the output format `runKimi` parses, and bare-kimi's trailing `-p` would
+   *   silently drop a forwarded prompt;
+   * - `--`, after which kimi reads no flag, bare-kimi's `-p` included;
+   * - a last argument that is a flag taking a value (`--add-dir`,
+   *   `--skills-dir`, `--agent`, `--agent-file`): kimi's parser would take
+   *   bare-kimi's `-p` as that value.
+   * A flag taking a value earlier in the list takes the forwarded argument
+   * after it, whatever it looks like; that pairing is the caller's.
    */
   readonly extraArgs?: string[];
 }
@@ -276,6 +292,15 @@ const ENV_MODEL_NAME = 'KIMI_MODEL_NAME';
 const THINKING_KEEP_ENV = 'KIMI_MODEL_THINKING_KEEP';
 
 /**
+ * kimi 2.1.0's `-p` output format variable. As read from the bundle
+ * (`resolveOutputFormat`), kimi reads it only in prompt mode and only when
+ * no `--output-format` flag is given, and it is no part of the env-model
+ * overlay. bare-kimi always passes the flag (see {@link buildArgv}), so the
+ * variable has no effect on a bare-kimi run.
+ */
+const OUTPUT_FORMAT_ENV = 'KIMI_MODEL_OUTPUT_FORMAT';
+
+/**
  * Whether bare-kimi treats `name` as feeding kimi 2.1.0's env-model overlay,
  * which adds a provider `__kimi_env__` and a model `__kimi_env_model__` and
  * makes that model the default.
@@ -291,13 +316,19 @@ const THINKING_KEEP_ENV = 'KIMI_MODEL_THINKING_KEEP';
  *
  * Policy: which other variables feed the overlay is read from the bundle,
  * not observed, so every `KIMI_MODEL_*` name counts, whatever its value,
- * except two that kimi was observed to treat otherwise:
- * {@link FORCED_EFFORT_ENV}, which {@link spawnKimi} checks on its own, and
- * `KIMI_MODEL_THINKING_KEEP`, which alone left the model unchanged and
- * reached a `kimi`-type request as `thinking.keep`.
+ * except three: {@link FORCED_EFFORT_ENV}, which {@link spawnKimi} checks on
+ * its own; `KIMI_MODEL_THINKING_KEEP`, which alone left the model unchanged
+ * and reached a `kimi`-type request as `thinking.keep`; and
+ * `KIMI_MODEL_OUTPUT_FORMAT`, which kimi reads only for the output format
+ * (see {@link OUTPUT_FORMAT_ENV}).
  */
 export function isModelOverlayVar(name: string): boolean {
-  return name.startsWith('KIMI_MODEL_') && name !== FORCED_EFFORT_ENV && name !== THINKING_KEEP_ENV;
+  return (
+    name.startsWith('KIMI_MODEL_') &&
+    name !== FORCED_EFFORT_ENV &&
+    name !== THINKING_KEEP_ENV &&
+    name !== OUTPUT_FORMAT_ENV
+  );
 }
 
 /** An env-model variable the child will see, and the layer that sets it. */
@@ -379,30 +410,56 @@ function checkModelOverlay(
 const CHAINABLE_SHORT_FLAGS = new Set(['c', 'C', 'y', 'h', 'V']);
 
 /**
- * Whether `arg` selects the model or a session, as kimi 2.1.0's
- * command-line parser (`createProgram`, commander) reads an option argument:
- * `--model`, `--session`, `--resume` or `--continue`, alone or with
- * `=value`; or `-m`, `-S`, `-r`, `-c` or `-C`, alone, with a value attached
- * (`-mx`), or reached through a cluster of flags that take no value (`-yc`).
- * A cluster stops at any other letter: a flag that takes a value ends it,
- * and kimi rejects an unknown one. An argument meant as the value of the one
- * before it is read the same way, so such a value is refused when it looks
- * like one of these flags.
+ * kimi 2.1.0's long flags that require a value and are not otherwise
+ * reserved (`createProgram`). kimi's parser (commander) takes the next
+ * argument as a required value whatever it looks like.
  */
-function selectingArg(arg: string): 'model' | 'session' | undefined {
+const VALUE_LONG_FLAGS = new Set(['--add-dir', '--skills-dir', '--agent', '--agent-file']);
+
+/** What a reserved forwarded argument would take over; see {@link reservedArg}. */
+type ReservedArg = 'model' | 'session' | 'output format' | 'prompt' | 'end of options';
+
+/**
+ * Whether `arg` would take over something bare-kimi passes or arranges
+ * itself, as kimi 2.1.0's command-line parser (`createProgram`, commander)
+ * reads an option argument: `--model`, `--session`, `--resume`,
+ * `--continue`, `--output-format` or `--prompt`, alone or with `=value`;
+ * `-m`, `-S`, `-r`, `-c`, `-C` or `-p`, alone, with a value attached
+ * (`-mx`, `-px`), or reached through a cluster of flags that take no value
+ * (`-yc`, `-yp`); or `--`, which ends option parsing. A cluster stops at any
+ * other letter: kimi rejects an unknown one. An argument meant as the value
+ * of the one before it is read the same way, so such a value is refused when
+ * it looks like one of these flags.
+ */
+function reservedArg(arg: string): ReservedArg | undefined {
+  if (arg === '--') return 'end of options';
   if (arg.startsWith('--')) {
     const name = arg.slice(2).split('=', 1)[0];
     if (name === 'model') return 'model';
+    if (name === 'output-format') return 'output format';
+    if (name === 'prompt') return 'prompt';
     return name === 'session' || name === 'resume' || name === 'continue' ? 'session' : undefined;
   }
   if (!arg.startsWith('-')) return undefined;
   for (const flag of arg.slice(1)) {
     if (flag === 'm') return 'model';
+    if (flag === 'p') return 'prompt';
     if (flag === 'S' || flag === 'r' || flag === 'c' || flag === 'C') return 'session';
     if (!CHAINABLE_SHORT_FLAGS.has(flag)) return undefined;
   }
   return undefined;
 }
+
+/** What a forwarded argument of each {@link ReservedArg} kind does, why it is refused, and what to use instead. */
+const RESERVED_ARGS: Readonly<Record<ReservedArg, string>> = {
+  model: 'selects a model; pass it as the model option: the run home must carry it',
+  session: 'selects a session; pass it as resume or continueRecent, which are exclusive and which a preloaded run refuses',
+  'output format':
+    'sets the output format; pass it as the outputFormat option: bare-kimi passes --output-format itself, kimi ' +
+    'keeps the last value, and runKimi parses the format it asked for',
+  prompt: "sets the prompt; pass it as the prompt option: bare-kimi's own -p comes last, so kimi would drop this one",
+  'end of options': "ends kimi's options: kimi would read no flag after it, bare-kimi's own -p included",
+};
 
 export function LaunchConfig(o: LaunchOptions): LaunchConfig {
   if (o.resume !== undefined && o.continueRecent === true) {
@@ -414,17 +471,17 @@ export function LaunchConfig(o: LaunchOptions): LaunchConfig {
     throw forcedEffortConflict('extraEnv');
   }
   checkModelOverlay(modelOverlay(o.extraEnv, undefined), o.model, o.effort, o.home !== undefined && o.home.length > 0);
-  for (const arg of o.extraArgs ?? []) {
-    const selects = selectingArg(arg);
-    if (selects === 'model') {
-      throw new Error(`extraArgs ${JSON.stringify(arg)} selects a model; pass it as the model option: the run home must carry it`);
-    }
-    if (selects === 'session') {
-      throw new Error(
-        `extraArgs ${JSON.stringify(arg)} selects a session; pass it as resume or continueRecent, which are ` +
-          'exclusive and which a preloaded run refuses',
-      );
-    }
+  const extraArgs = o.extraArgs ?? [];
+  for (const arg of extraArgs) {
+    const reserved = reservedArg(arg);
+    if (reserved !== undefined) throw new Error(`extraArgs ${JSON.stringify(arg)} ${RESERVED_ARGS[reserved]}`);
+  }
+  const last = extraArgs.at(-1);
+  if (last !== undefined && VALUE_LONG_FLAGS.has(last)) {
+    throw new Error(
+      `extraArgs ends with ${JSON.stringify(last)}, which takes a value: kimi would take bare-kimi's own -p ` +
+        `as that value and lose the prompt; give the value too (${last} VALUE or ${last}=VALUE)`,
+    );
   }
   if (o.adoptLegacyHome === true && (o.home === undefined || o.home.length === 0)) {
     throw new Error('adoptLegacyHome needs a caller-supplied home');
@@ -468,7 +525,8 @@ export function assertSafePrompt(prompt: string): void {
  * Every check on launch options that needs no filesystem: prompt shape,
  * option conflicts, and the selection checks that need no config (an empty
  * model or effort, an effort beside a forced one in `extraEnv`, an env-model
- * variable in `extraEnv` beside `model`, `effort` or a `home`, a model in `extraArgs`,
+ * variable in `extraEnv` beside `model`, `effort` or a `home`, a reserved or
+ * value-less trailing argument in `extraArgs` (see {@link LaunchOptions.extraArgs}),
  * adoption without a home). spawnKimi runs it first; a caller
  * that does its own setup (the CLI's --keep-home) runs it before that setup.
  * Checks against the source config are {@link previewRunHome}'s.
@@ -479,13 +537,20 @@ export function checkLaunchOptions(options: LaunchOptions): LaunchConfig {
 }
 
 /**
- * The command vector handed to Bun.spawn. `-p <prompt>` is always last:
- * kimi's flag parser accepts flags after the prompt, but keeping the prompt
- * terminal means a prompt that looks like a value can never be swallowed by
- * a trailing flag. Flags as read from the installed kimi 2.1.0 bundle's
- * `createProgram`: `-m/--model <model>`, `-S/--session [id]`,
- * `-c/--continue`, repeatable `--skills-dir <dir>` and `--add-dir <dir>`,
- * `--output-format <text|stream-json>`, `-p/--prompt <prompt>`.
+ * The command vector handed to Bun.spawn. Flags as read from the installed
+ * kimi 2.1.0 bundle's `createProgram`: `-m/--model <model>`,
+ * `-S/--session [id]`, `-c/--continue`, repeatable `--skills-dir <dir>` and
+ * `--add-dir <dir>`, `--output-format <text|stream-json>`,
+ * `-p/--prompt <prompt>`.
+ *
+ * `--output-format` is passed for `text` too: kimi takes the flag over its
+ * `KIMI_MODEL_OUTPUT_FORMAT` environment variable (`resolveOutputFormat`),
+ * so the format `runKimi` parses is the one asked for. `-p <prompt>` is
+ * last. kimi's parser keeps the last value of a repeated flag and takes the
+ * argument after a flag that requires a value, whatever it looks like, so
+ * the prompt stays bare-kimi's only because {@link LaunchConfig} refuses
+ * forwarded arguments that would take it over or end in such a flag (see
+ * {@link LaunchOptions.extraArgs}).
  */
 export function buildArgv(config: LaunchConfig, kimiBin: string): string[] {
   const argv: string[] = [kimiBin];
@@ -494,7 +559,7 @@ export function buildArgv(config: LaunchConfig, kimiBin: string): string[] {
   if (config.continueRecent) argv.push('--continue');
   for (const dir of config.skillsDir) argv.push('--skills-dir', dir);
   for (const dir of config.addDir) argv.push('--add-dir', dir);
-  if (config.outputFormat === 'stream-json') argv.push('--output-format', 'stream-json');
+  argv.push('--output-format', config.outputFormat);
   argv.push(...config.extraArgs);
   argv.push('-p', config.prompt);
   return argv;
@@ -517,7 +582,8 @@ export function buildArgv(config: LaunchConfig, kimiBin: string): string[] {
  *   `KIMI_MODEL_THINKING_EFFORT` and `KIMI_MODEL_THINKING_KEEP` (kimi 2.1.0
  *   env-only overrides of the thinking effort and keep, which do not switch
  *   the model), so an ambient value cannot silently replace the `[thinking]`
- *   table the run home carries.
+ *   table the run home carries, and `KIMI_MODEL_OUTPUT_FORMAT`, which kimi
+ *   reads only when no `--output-format` flag is given (bare-kimi gives one).
  * - `KIMI_SECONDARY_*` — kimi 2.1.0 reads `KIMI_SECONDARY_MODEL` and
  *   `KIMI_SECONDARY_EFFORT` as overrides of the secondary (subagent) model
  *   and its effort. The run home carries no `[secondary_model]`; what the
@@ -755,6 +821,8 @@ export function spawnKimi<
       model: config.model,
       effort: config.effort,
       adoptLegacyHome: config.adoptLegacyHome,
+      // Only a resume by id: kimi's --continue may start a fresh session.
+      resumingSession: config.resume !== undefined,
     };
     if (forced !== undefined) {
       // The pin may come from the home's stamp, not this launch: look before any effect.
@@ -798,7 +866,9 @@ export function spawnKimi<
       subprocess,
       home,
       assembled:
-        overlay === undefined ? assembled : { ...assembled, effort: null, effortSupport: null, configuredEffort: null },
+        overlay === undefined
+          ? assembled
+          : { ...assembled, effort: null, effortSupport: null, effortWithdrawn: null, configuredEffort: null },
       modelOverlay: overlay?.name ?? null,
       ephemeral,
       cwd,

@@ -781,6 +781,58 @@ describe('model, effort and source identity', () => {
     expect(line).not.toContain('https://');
   });
 
+  test('--resume outlives a pinned effort the source stops listing and says it is withdrawn; a new run is refused', async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const home = join(root, 'kept-home');
+    const out = join(root, 'sessions.ndjson');
+    const env = { srcHome: src, env: { FAKE_KIMI_SESSION_OUT: out } };
+
+    expect((await runCli(['--home', home, '--model', 'kimi-code/k3-thinking', '--effort', 'high', '--', 'x'], env)).code).toBe(0);
+    const sessionId = readSessionReports(out)[0]!.sessionId;
+    // As a login may rewrite a managed model's table from the provider's catalog.
+    const configPath = join(src, 'config.toml');
+    writeFileSync(
+      configPath,
+      readFileSync(configPath, 'utf-8').replace('support_efforts = ["low", "medium", "high"]', 'support_efforts = ["low", "medium"]'),
+    );
+
+    const fresh = await runCli(['--home', home, '--', 'y'], env);
+    const resumed = await runCli(['--home', home, '--resume', sessionId, '--', 'z'], env);
+
+    expect([fresh.code, resumed.code]).toEqual([2, 0]);
+    expect(fresh.stderr).toContain('can still be resumed by its id (resume, CLI --resume)');
+    expect(resumed.stderr).toContain(
+      'effort "high" (pinned by the home, withdrawn: the source\'s declaration for this alias no longer accepts it; ' +
+        'kept only to resume a session)',
+    );
+    expect(resumed.stderr).toContain(
+      "whether kimi keeps its stored effort, now that the model's table no longer lists it, is unknown",
+    );
+    expect(resumed.stderr).not.toContain('keeps the effort it stored');
+    expect(readSessionReports(out).map((report) => [report.sessionId, report.resumed])).toEqual([
+      [sessionId, false],
+      [sessionId, true],
+    ]);
+  });
+
+  test('the output format is always passed to kimi, text included', async () => {
+    const root = temp('bare-kimi-test-');
+    const src = makeSourceHome(root);
+    const out = join(root, 'sessions.ndjson');
+    const env = { srcHome: src, env: { FAKE_KIMI_SESSION_OUT: out } };
+
+    const text = await runCli(['--home', join(root, 'text'), '--', 'x'], env);
+    const json = await runCli(['--home', join(root, 'json'), '--json', '--', 'x'], env);
+
+    expect([text.code, json.code]).toEqual([0, 0]);
+    const [textRun, jsonRun] = readSessionReports(out);
+    expect(hasFlag(textRun!.argv, '--output-format', 'text')).toBe(true);
+    expect(hasFlag(jsonRun!.argv, '--output-format', 'stream-json')).toBe(true);
+    expect(json.stdout).toContain('session.resume_hint');
+  });
+
   test("a bare-kimi 0.2 home's upgrade names how its alias was established, including a caller's assertion", async () => {
     const root = temp('bare-kimi-test-');
     const src = makeSourceHome(root);
@@ -839,6 +891,11 @@ describe('model, effort and source identity', () => {
     ['--kimi-arg=--model=kimi-code/k3-thinking', 'selects a model'],
     ['--kimi-arg=-yc', 'selects a session'],
     ['--kimi-arg=--session=session_a', 'selects a session'],
+    ['--kimi-arg=--output-format=text', 'sets the output format'],
+    ['--kimi-arg=-pother', 'sets the prompt'],
+    ['--kimi-arg=--prompt=other', 'sets the prompt'],
+    ['--kimi-arg=--', "ends kimi's options"],
+    ['--kimi-arg=--add-dir', 'ends with "--add-dir", which takes a value'],
   ])('%s is refused before any home or kimi', async (arg, message) => {
     const root = temp('bare-kimi-test-');
     const src = makeSourceHome(root);

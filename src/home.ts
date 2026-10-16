@@ -128,9 +128,21 @@ export interface AssembledHome {
    *   it is unknown. On another provider type, or for a model that sets
    *   `protocol`, what kimi sends is not established. Never reported for a
    *   non-`off` effort on a `kimi`-type provider whose model sets no
-   *   `protocol`: that is refused.
+   *   `protocol`: that is refused;
+   * - `withdrawn`: a kept home's pinned effort that the source's current
+   *   declaration for the model refuses, carried only for a launch that
+   *   resumes a session (see {@link RunHomeOptions.resumingSession}). The
+   *   home's config.toml still configures the pin, while the model's table
+   *   there no longer accepts it. Whether kimi keeps the resumed session's
+   *   stored effort against the changed table, or normalizes it again, was
+   *   not observed.
    */
   readonly effortSupport: EffortSupport | null;
+  /**
+   * When {@link AssembledHome.effortSupport} is `withdrawn`: the refusal the
+   * source's current declaration gives the pinned effort. Else null.
+   */
+  readonly effortWithdrawn: string | null;
   /**
    * The effort the home's config.toml gives a new session: the pinned
    * effort, else the source `[thinking]`'s (`off` when it disables
@@ -219,6 +231,23 @@ export interface RunHomeOptions {
    * {@link ADOPTION_RECORD}). No effect on a missing, empty or stamped home.
    */
   readonly adoptLegacyHome?: boolean;
+  /**
+   * The home is prepared for a launch that resumes a session by its id
+   * (kimi `--session`). As read from the 2.1.0 bundle, such a launch fails
+   * rather than create a session when the id is unknown
+   * (`resolveNativeSession`). Not for `--continue`, which, as read from the
+   * same function, starts a fresh session when the cwd has none to continue.
+   *
+   * It matters only for a kept home pinned to an effort that the source's
+   * current declaration for the model refuses, for example after a login
+   * rewrote a managed model's `support_efforts` from the provider's catalog
+   * without it. Such a home is otherwise refused, since its new sessions
+   * would not run the pinned effort. With this set it is prepared as any
+   * reuse is: the pinned model and the pinned effort's `[thinking]` are
+   * kept, the model's and provider's tables follow the source, and the
+   * effort is reported `withdrawn` (see {@link AssembledHome.effortWithdrawn}).
+   */
+  readonly resumingSession?: boolean;
 }
 
 /**
@@ -408,6 +437,8 @@ interface MinimalConfig {
   readonly effort: string | null;
   /** See {@link AssembledHome.effortSupport}. */
   readonly effortSupport: EffortSupport | null;
+  /** See {@link AssembledHome.effortWithdrawn}. */
+  readonly effortWithdrawn: string | null;
   /** See {@link AssembledHome.configuredEffort}. */
   readonly configuredEffort: string | null;
   /** {@link settingsDigest} of `text`. */
@@ -418,6 +449,12 @@ interface MinimalConfig {
 interface Selection {
   readonly model?: string | undefined;
   readonly effort: string | null;
+  /**
+   * Carry the effort even when the source's declaration for the model now
+   * refuses it, reporting it `withdrawn`: a kept home's pin, for a launch
+   * that resumes a session (see {@link RunHomeOptions.resumingSession}).
+   */
+  readonly keepWithdrawn?: boolean;
 }
 
 /**
@@ -448,7 +485,15 @@ function configuresModel(source: TomlTable, alias: string): boolean {
 const EFFORT_NAME = /^[a-z0-9][a-z0-9_-]*$/;
 
 /** See {@link AssembledHome.effortSupport}. */
-export type EffortSupport = 'declared' | 'undeclared';
+export type EffortSupport = 'declared' | 'undeclared' | 'withdrawn';
+
+/** {@link checkEffort}'s refusal of an effort, as distinct from any other refusal while planning. */
+class EffortRefusal extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'EffortRefusal';
+  }
+}
 
 /**
  * Which native observations of kimi 2.1.0 a model's effort handling rests
@@ -545,7 +590,7 @@ function unobservedWhere(providerType: unknown, model: TomlTable): string {
  */
 function checkEffort(effort: string, alias: string, model: TomlTable, providerType: unknown): EffortSupport {
   if (!EFFORT_NAME.test(effort)) {
-    throw new Error(`effort ${JSON.stringify(effort)} is not a lowercase effort name; refusing`);
+    throw new EffortRefusal(`effort ${JSON.stringify(effort)} is not a lowercase effort name; refusing`);
   }
   const evidence = effortEvidence(providerType, model);
   const capabilities = model['capabilities'];
@@ -563,7 +608,7 @@ function checkEffort(effort: string, alias: string, model: TomlTable, providerTy
     capabilities !== undefined || efforts.length > 0 || typeof model['adaptive_thinking'] === 'boolean';
   if (effort === 'off') {
     if (always) {
-      throw new Error(
+      throw new EffortRefusal(
         `model "${alias}" lists the capability "always_thinking": with thinking off, kimi 2.1.0 was observed ` +
           'to send an effort on an openai-type provider' +
           (evidence === 'openai'
@@ -574,7 +619,7 @@ function checkEffort(effort: string, alias: string, model: TomlTable, providerTy
       );
     }
     if (evidence !== 'kimi' && efforts.length > 0 && !(typeof offEffort === 'string' && offEffort.trim().length > 0)) {
-      throw new Error(
+      throw new EffortRefusal(
         `model "${alias}" lists support_efforts but no off_effort: with thinking off, kimi 2.1.0 on an ` +
           'openai-type provider failed such a model before sending any request, and exited 1 ' +
           '(observed for support_efforts = ["high"] and ["low", "high"])' +
@@ -587,7 +632,7 @@ function checkEffort(effort: string, alias: string, model: TomlTable, providerTy
     return declaresThinking ? 'declared' : 'undeclared';
   }
   if (declaresThinking && !thinks) {
-    throw new Error(
+    throw new EffortRefusal(
       `model "${alias}" is declared without thinking (it declares no thinking capability and lists no ` +
         `support_efforts); bare-kimi refuses effort "${effort}" there as policy. kimi 2.1.0 was observed to ` +
         'send such an effort on an openai-type provider; whether a provider applies it is unknown',
@@ -595,7 +640,7 @@ function checkEffort(effort: string, alias: string, model: TomlTable, providerTy
   }
   if (efforts.length === 0) {
     if (evidence !== 'kimi') return 'undeclared';
-    throw new Error(
+    throw new EffortRefusal(
       `model "${alias}" lists no support_efforts, and on a kimi-type provider kimi 2.1.0 was observed to ` +
         `send no effort for such a model (thinking enabled, no level); refusing effort "${effort}" ` +
         '(choose no effort). kimi -p reads the efforts from config.toml alone. For a managed model only kimi ' +
@@ -604,7 +649,7 @@ function checkEffort(effort: string, alias: string, model: TomlTable, providerTy
     );
   }
   if (!efforts.includes(effort)) {
-    throw new Error(
+    throw new EffortRefusal(
       `effort "${effort}" is not one of model "${alias}"'s support_efforts (${efforts.join(', ')}); refusing`,
     );
   }
@@ -699,8 +744,17 @@ function minimalConfig(configText: string, source: TomlTable, where: string, sel
   const providerTable = isTable(providers) ? providers[provider] : undefined;
   if (!isTable(providerTable)) throw new Error(`no [providers."${provider}"] in ${where}`);
   const { effort } = selection;
-  const effortSupport =
-    effort === null ? null : checkEffort(effort, modelAlias, effectiveModel(model), providerTable['type']);
+  let effortSupport: EffortSupport | null = null;
+  let effortWithdrawn: string | null = null;
+  if (effort !== null) {
+    try {
+      effortSupport = checkEffort(effort, modelAlias, effectiveModel(model), providerTable['type']);
+    } catch (error) {
+      if (!(error instanceof EffortRefusal) || selection.keepWithdrawn !== true) throw error;
+      effortSupport = 'withdrawn';
+      effortWithdrawn = error.message;
+    }
+  }
 
   const prefixes: (readonly string[])[] = [
     ['providers', provider],
@@ -748,6 +802,7 @@ function minimalConfig(configText: string, source: TomlTable, where: string, sel
     modelId: typeof modelId === 'string' ? modelId : undefined,
     effort,
     effortSupport,
+    effortWithdrawn,
     configuredEffort: thinkingEffort(expected['thinking']),
     digest: settingsDigest(carried),
   };
@@ -1525,7 +1580,21 @@ function planRunHome(
         'sessions created on that alias look it up again on resume, so the home is refused rather than switched',
     );
   }
-  const config = minimalConfig(sourceText, parsed, sourceWhere, pinned);
+  let config: MinimalConfig;
+  try {
+    config = minimalConfig(sourceText, parsed, sourceWhere, {
+      model: pinned.model,
+      effort: pinned.effort,
+      keepWithdrawn: request.resumingSession === true,
+    });
+  } catch (error) {
+    if (!(error instanceof EffortRefusal) || pinned.effort === null) throw error;
+    throw new Error(
+      `run home ${home} is pinned to effort "${pinned.effort}", which the source's declaration for model ` +
+        `"${pinned.model}" now refuses (${error.message}). New sessions there are refused; a session the home ` +
+        'already holds can still be resumed by its id (resume, CLI --resume), keeping the pin',
+    );
+  }
   if (digest !== undefined && digest !== config.digest && digest !== stamp.config) {
     throw new Error(
       `refusing to use ${configPath}: its settings were edited since bare-kimi wrote it, ` +
@@ -1758,6 +1827,7 @@ function describeHome(dst: string, source: string, plan: RunHomePlan): Assembled
     modelId: config.modelId,
     effort: config.effort,
     effortSupport: config.effortSupport,
+    effortWithdrawn: config.effortWithdrawn,
     configuredEffort: config.configuredEffort,
     source,
     action: plan.action,

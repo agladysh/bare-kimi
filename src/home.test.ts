@@ -1341,6 +1341,60 @@ describe('effort selection', () => {
     // Even the effort config.toml now names: earlier sessions were created with another.
     expect(() => prepareRunHome(src, kept, 'link', { effort: 'high' })).toThrow("pinned to the source's [thinking]");
   });
+
+  test('a pinned effort the source stops listing: new sessions refused, naming resume; a resume by id is prepared, withdrawn', () => {
+    const root = temp('bare-kimi-home-');
+    const src = makeSourceHome(root);
+    addSelectableModels(src);
+    const kept = join(root, 'kept');
+    prepareRunHome(src, kept, 'link', { model: 'kimi-code/k3-thinking', effort: 'high' });
+    addSession(kept);
+    // As a login may rewrite a managed model's table from the provider's catalog.
+    const listed = 'support_efforts = ["low", "medium", "high"]';
+    editConfig(src, (text) => text.replace(listed, 'support_efforts = ["low", "medium"]'));
+    const configPath = join(kept, 'config.toml');
+    const config = readFileSync(configPath, 'utf-8');
+    const stamp = readFileSync(join(kept, HOME_STAMP), 'utf-8');
+
+    // A launch that may create a session: refused before any effect, pointing at resume.
+    for (const options of [{}, { effort: 'high' }, { model: 'kimi-code/k3-thinking' }] as RunHomeOptions[]) {
+      expect(() => prepareRunHome(src, kept, 'link', options)).toThrow(
+        'pinned to effort "high", which the source\'s declaration for model "kimi-code/k3-thinking" now refuses',
+      );
+    }
+    expect(() => previewRunHome(src, kept)).toThrow('can still be resumed by its id (resume, CLI --resume)');
+    expect(readFileSync(configPath, 'utf-8')).toBe(config);
+    expect(readFileSync(join(kept, HOME_STAMP), 'utf-8')).toBe(stamp);
+
+    const resumed = prepareRunHome(src, kept, 'link', { resumingSession: true });
+
+    expect(resumed).toMatchObject({
+      action: 'reuse',
+      modelAlias: 'kimi-code/k3-thinking',
+      effort: 'high',
+      effortSupport: 'withdrawn',
+      configuredEffort: 'high',
+    });
+    expect(resumed.effortWithdrawn).toContain('is not one of model "kimi-code/k3-thinking"\'s support_efforts (low, medium)');
+    // The pin and its [thinking] are kept; the model's table follows the source, as on any reuse.
+    const written = parseToml(readFileSync(configPath, 'utf-8'));
+    expect(written['thinking']).toEqual({ enabled: true, effort: 'high' });
+    expect(written).toMatchObject({ models: { 'kimi-code/k3-thinking': { support_efforts: ['low', 'medium'] } } });
+    expect(readStampJson(kept)).toMatchObject({ model: 'kimi-code/k3-thinking', effort: 'high' });
+    // A later launch that may create a session is still refused; another resume is prepared again.
+    expect(() => prepareRunHome(src, kept)).toThrow('now refuses');
+    expect(previewRunHome(src, kept, 'link', { resumingSession: true }).effortSupport).toBe('withdrawn');
+    // Resume intent does not extend to a new home, or to another effort.
+    expect(() =>
+      prepareRunHome(src, join(root, 'fresh'), 'link', { model: 'kimi-code/k3-thinking', effort: 'high', resumingSession: true }),
+    ).toThrow('support_efforts (low, medium)');
+    expect(existsSync(join(root, 'fresh'))).toBe(false);
+    expect(() => prepareRunHome(src, kept, 'link', { effort: 'low', resumingSession: true })).toThrow('pinned to effort "high"');
+
+    // Control: listed again, the pin is declared again.
+    editConfig(src, (text) => text.replace('support_efforts = ["low", "medium"]', listed));
+    expect(prepareRunHome(src, kept)).toMatchObject({ effortSupport: 'declared', effortWithdrawn: null });
+  });
 });
 
 /**
