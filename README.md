@@ -40,6 +40,39 @@ versions, modes or the interactive UI. A run is contained only from outside,
 by an OS sandbox, a container or a restricted account. A fix for the rules
 themselves belongs in kimi, not in this wrapper.
 
+### Choosing a login for an application
+
+An application with several provider accounts should resolve the intended
+account's source home and pass `srcHome` explicitly. A model alias, run-home
+name or subscription tier does not identify the account. The generic default
+source is not an account-selection policy. If a job pins an account, check that
+binding before reusing its saved runtime; keep the old runtime and its result
+available rather than retargeting a live credential link.
+
+Run-home isolation and provider-login isolation are different. Link mode shares
+the source credential and its refresh lock on the same filesystem. Copy mode
+copies a credential, not a separate provider authorization. On the same machine
+or another, a copy has its own refresh lock: refreshing it can leave the source
+or another copy holding a superseded token. This follows from reading the native
+OAuth implementation; it is not a claim of an observed live-account refresh test.
+Running copies side by side needs refresh coordination beyond their local locks,
+or a separate native login. Copy mode retains its documented behavior.
+
+For a managed provider's device login, the application should retain one login
+attempt and the native process outcome. Keep its pending device URL/code in
+access-controlled application state: it is sensitive until completion or expiry.
+Afterwards, retain the outcome and verified identity as needed. Reconcile that
+attempt before generating another link after an uncertain outcome. Check the
+actual authorized identity: a browser can authorize a different account from
+the one intended. Successful login also does not prove access to the requested
+model. Verify that access before replacing a working service. Keep credentials
+and refresh tokens, including pending device URLs/codes, out of ordinary logs
+and public operation records. Give a pending link only to its intended operator.
+
+An expired access token or an old cached identity does not by itself establish
+that the refresh grant was revoked. Use the native refresh lifecycle and report
+its actual outcome; do not turn stale metadata into an unnecessary login demand.
+
 ## Installation
 
 Bun 1.3 or later and a separately installed Kimi Code CLI are required. The
